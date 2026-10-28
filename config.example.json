@@ -1,0 +1,12 @@
+{
+  "ics_url": "",
+  "user_email": "",
+  "idle_seconds": 300,
+  "countdown_seconds": 10,
+  "zoom_lookahead_minutes": 10,
+  "fresh_zoom_seconds": 120,
+  "ignore_title_substrings": ["focus time", "out of office", "lunch"],
+  "poll_seconds": 5,
+  "calendar_refresh_seconds": 60,
+  "dry_run": false
+}
