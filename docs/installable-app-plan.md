@@ -44,8 +44,7 @@ Designs: [Granola Autostart app](https://claude.ai/artifact/BuZ3FWA3LoZ8qbzzokkP
    - The uninstaller stops running processes first, then asks whether to keep settings.
 6. **`build.ps1`.** Runs the tests, then the PyInstaller build, then the installer compile. It works the same on a laptop and in CI.
 7. **GitHub Actions build** (`.github/workflows/build.yml`) on `windows-latest`, because the tests and the build need Windows (`winreg`, `ctypes.windll`).
-   - Every push and pull request runs pytest.
-   - Pushes to `main` and version tags (`v*`) run `build.ps1` and upload the installer as a workflow artifact. Artifacts are kept for 7 days.
+   - Pushes to `main`, version tags (`v*`), and pull requests run pytest, then `build.ps1`, and upload the installer as a workflow artifact. Artifacts are kept for 7 days. Building on pull requests lets an installer be tried before merging.
    - Python comes from `actions/setup-python`, pinned to the version used locally. Inno Setup is installed with `choco install innosetup` (Chocolatey is on the runner image).
    - Workflows only need the default `GITHUB_TOKEN`; no other secrets until signing.
 8. **Migration.** Run `--uninstall` on the source version, then the installer. Config and state in `%LOCALAPPDATA%\granola-autostart` carry over unchanged.

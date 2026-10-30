@@ -1,6 +1,6 @@
-# Tests on every push to main and every pull request; an installer for pushes to main, version tags,
-# and manual runs. Windows runners, because the tests and the build use winreg and ctypes.windll.
-# The repo is private, so runner time comes out of GitHub Free's monthly allowance: keep it lean.
+# Tests, then an installer, for pushes to main, version tags, pull requests, and manual runs.
+# Windows runners, because the tests and the build use winreg and ctypes.windll. The repo is private,
+# so runner time comes out of GitHub Free's monthly allowance: one Windows job each, cancelled when superseded.
 name: Build
 
 on:
@@ -32,7 +32,6 @@ jobs:
       - run: python -m pytest -q
 
   installer:
-    if: github.event_name != 'pull_request'
     needs: test
     runs-on: windows-latest
     timeout-minutes: 30
