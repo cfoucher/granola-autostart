@@ -1,4 +1,6 @@
 icalendar>=6.1.0
 pillow>=10.4.0
 pystray>=0.19.5
+pywebview>=6.2
 recurring-ical-events>=3.5.0
+windows-toasts>=1.3.1

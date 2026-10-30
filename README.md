@@ -1,83 +1,90 @@
-# Granola autostart
+# Granola Autostart
 
 Starts [Granola](https://granola.ai) when a meeting begins on this PC. A small card appears first in the top-right corner of the screen under the pointer, with the meeting title and a 10-second ring.
 
 **Cancel** leaves Granola alone. **Start now** or doing nothing opens that meeting's note and starts transcription. It does not join Zoom. The card never takes keyboard focus, so typing in another app is not interrupted (and Esc is not used).
 
-It runs in the background, so this still works when Granola was quit or crashed. The same notice is used for a calendar meeting (including one where you are in the room and not on Zoom), a Zoom join, and Granola closing mid-meeting.
+It runs in the background, so this still works when Granola was quit or crashed. The same card is used for a calendar meeting (including one where you are in the room and not on Zoom), a Zoom join, and Granola closing mid-meeting.
 
-Notes start only when the Windows session is unlocked and you have used the mouse or keyboard in the last few minutes. A locked or idle laptop does not start a recording. If you sit down after the start time, the notice appears then, until the meeting's scheduled end.
+Notes start only when the Windows session is unlocked and you have used the mouse or keyboard in the last few minutes. A locked or idle laptop does not start a recording. If you sit down after the start time, the card appears then, until the meeting's scheduled end.
 
-## Setup
+Granola Autostart is an independent tool and is not made by Granola.
 
-From this folder:
+## Install
+
+1. Get `GranolaAutostart-<version>-setup.exe` from the [releases](https://github.com/cfoucher/granola-autostart/releases), or from whoever shared it with you.
+2. Run it. It installs for your Windows user only, with no admin rights, to `%LOCALAPPDATA%\Programs\Granola Autostart`. The installer isn't signed yet, so if Windows SmartScreen appears, choose **More info**, then **Run anyway**.
+3. Setup opens. Zoom calls work straight away. For in-person and other meetings, connect a calendar:
+   - **Google Calendar:** open [Calendar settings](https://calendar.google.com/calendar/r/settings), choose your calendar under **Settings for my calendars**, then **Integrate calendar**, and copy **Secret address in iCal format**. Google Workspace admins can turn secret addresses off; they work at Shift today.
+   - **Outlook:** Settings, **Shared calendars**, **Publish a calendar**, choose **Can view all details**, then copy the **ICS** link.
+
+   Paste it, choose **Test address**, check the meetings it found, then **Finish**.
+
+It starts again whenever you sign in to Windows. Look for the green circle in the system tray.
+
+### Settings
+
+Left-click the tray icon, or right-click it and choose **Settings…**.
+
+- **Calendars:** add, test, and remove calendars. Each shows how many meetings it has in the next day, or why its downloads are failing. Secret addresses are encrypted for your Windows user (DPAPI) and never written to the log.
+- **Declined meetings** are skipped. The address comes from your calendar (a Google calendar is named after its account); add another address for aliases or Outlook calendars.
+- **Starting notes:** countdown length (with **Preview**), how recently you must have used the PC, and words that skip a meeting (`focus time`, `out of office`, and `lunch` to start with). All-day events are always skipped.
+- **About:** version, whether it's running, the last time it started Granola, and the log folder.
+
+Changes save as you make them, and the running app picks them up within a few seconds.
+
+To start notes for only some meetings on another calendar, without blocking time on your main calendar, create a calendar such as "Granola watch" in your own account and add its secret address. Then put each meeting you care about on it: invite the calendar's address (`…@group.calendar.google.com`, under Integrate calendar) if you can edit the meeting, or create your own event there with the same title and time, marked Free. The same meeting on two calendars only prompts once.
+
+Calendars are downloaded every 5 minutes while you are at the PC, and again when you come back. A meeting added a few minutes before it starts can take that long to appear.
+
+### Tray and notifications
+
+- **Pause for 1 hour** or **Pause for today** — no new cards, and a countdown already on screen will not start Granola. A Zoom join during the pause is not asked about later. The icon turns grey.
+- **Resume**, **Settings…**, **Open log folder**, **About**, **Quit** (it starts again at the next sign-in, or from the Start menu).
+
+When something needs fixing, the icon gets an orange dot and Windows shows a notification once:
+
+- **Granola didn't open** 30 seconds after a start. Granola's launch link is undocumented, so an update could break it; **Try again**, or open Granola yourself.
+- **A calendar isn't updating** after 3 failed downloads in a row.
+- **Settings couldn't be read**, after a hand edit broke `config.json`. Zoom joins still start notes meanwhile.
+
+Granola's own one-minute reminder is unchanged. Clicking that reminder still opens the video call. Turn it off in Granola's notification settings if the second popup is in the way.
+
+### Uninstall
+
+**Settings**, **Apps**, **Installed apps**, **Granola Autostart**, **Uninstall**. It stops the app and asks whether to keep your settings.
+
+Files: `%LOCALAPPDATA%\granola-autostart` holds `config.json`, `state.json`, `status.json`, and the logs (`log.txt`, `supervisor-log.txt`, `settings-log.txt`, `cli-log.txt`). Logs record meeting titles, never calendar addresses.
+
+## Development
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
-.venv\Scripts\python watcher.py --install
-```
-
-`--install` starts the watcher now and again at logon. It uses Task Scheduler when Windows allows it, including a once-a-minute restart if the watcher exits. If Task Scheduler denies the task, it uses your personal startup list instead, and a small supervisor starts the watcher again a few seconds after it exits. The tray icon is a green circle.
-
-Edit the config it creates at `%LOCALAPPDATA%\granola-autostart\config.json`. If the file has a mistake, a warning appears and the watcher runs with default settings (Zoom joins only) until it is fixed.
-
-### Calendar feed
-
-Zoom joins work without this. In-person meetings need a private ICS address:
-
-- Google Calendar: Settings, the calendar, **Integrate calendar**, **Secret address in iCal format**.
-- Outlook: calendar settings, publish or share an ICS link.
-
-Put that URL in `ics_url`. Extra calendars go in `ics_urls`. Addresses must be `https://` (`webcal://` is converted). They stay in the local config and are not written to the log. Set `user_email` as well so events you have declined are skipped.
-
-Feeds are downloaded every 5 minutes while you are at the PC (`calendar_refresh_seconds`), and again when you come back if the last download is more than a minute old. A meeting added a few minutes before it starts can take that long to appear.
-
-To be notified for only some meetings on another calendar, without blocking time on your main calendar, create a calendar such as "Granola watch" in your own account and add its secret iCal address to `ics_urls`:
-
-```json
-"ics_urls": ["https://calendar.google.com/calendar/ical/.../basic.ics"]
-```
-
-Then put each meeting you care about on that calendar. Either invite the calendar's address (`…@group.calendar.google.com`, under Integrate calendar) to the meeting, if you are allowed to edit it, or create your own event on the Granola watch calendar with the same title and time. Mark those events Free. Your main calendar stays open for other people to book.
-
-Quit the tray icon after saving the config so the watcher reloads it. The same meeting on two feeds only prompts once.
-
-All-day events are ignored. So are titles containing `focus time`, `out of office`, or `lunch` (change `ignore_title_substrings` if you want those).
-
-Google event ids are taken from the ICS UID so Granola can reopen the note it already created for that event. If a second note appears for the same meeting, say so and the id mapping can be adjusted.
-
-## Tray
-
-- **Pause for 1 hour** or **Pause for today** — no new notices, and a countdown already on screen will not start Granola. A Zoom join during the pause is not asked about later.
-- **Resume**
-- **Quit** — it starts again shortly. Use `--uninstall` to stop that.
-
-## Checks
-
-```powershell
-.venv\Scripts\python watcher.py --check
-.venv\Scripts\python watcher.py --preview-notice
-.venv\Scripts\python watcher.py --dry-run
-```
-
-`--dry-run` shows the real countdown and logs the Granola link instead of opening it. Only one watcher runs at a time, so run `--uninstall` first and `--install` afterwards.
-
-Tests:
-
-```powershell
-.venv\Scripts\pip install -r requirements-dev.txt
+.venv\Scripts\pip install -r requirements-build.txt
 .venv\Scripts\python -m pytest
 ```
 
-Logs: `%LOCALAPPDATA%\granola-autostart\log.txt` (the supervisor writes `supervisor-log.txt`, and commands such as `--check` write `cli-log.txt`). The log records meeting titles. Calendar addresses are never written to it.
-
-## Uninstall
+Running from source:
 
 ```powershell
-.venv\Scripts\python watcher.py --uninstall
+.venv\Scripts\python watcher.py --check            # presence, Zoom, and calendar status
+.venv\Scripts\python watcher.py --preview-notice   # show the card once
+.venv\Scripts\python watcher.py --dry-run          # the real watcher, logging the Granola link instead of opening it
+.venv\Scripts\python settings_app.py               # Settings (--setup for first-run setup)
 ```
 
-That removes the startup entry and any scheduled tasks, and stops the watcher.
+Only one watcher runs at a time, so stop an installed copy first (right-click the tray icon, **Quit**). `watcher.py --install` and `--uninstall` still set up a source checkout to start at sign-in, without the installer.
 
-Granola's own one-minute reminder is unchanged. Clicking that reminder still opens the video call. Turn it off in Granola's notification settings if the second popup is in the way.
+### Building the installer
+
+With the build requirements and Inno Setup 7 (6 also works) installed:
+
+```powershell
+.\build.ps1
+```
+
+It runs the tests, builds `dist\GranolaAutostart\` with PyInstaller, then `dist\GranolaAutostart-<version>-setup.exe`. One `GranolaAutostart.exe` runs every mode: the watcher, `--supervise`, `--notice`, `--settings`, `--setup`, and `--stop`.
+
+GitHub Actions runs the tests and builds the installer for pull requests, pushes to `main`, and version tags, keeping it for 7 days. A tag such as `v1.0.0` must match `app_version.py`, and also creates a GitHub release with the installer attached.
+
+The design canvas and the plan behind this are in [docs/installable-app-plan.md](docs/installable-app-plan.md).

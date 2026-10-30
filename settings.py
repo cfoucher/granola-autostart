@@ -11,8 +11,12 @@ from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from secret_box import protect, unprotect
+
 DEFAULT_IGNORE = ("focus time", "out of office", "lunch")
 MIN_CALENDAR_REFRESH_SECONDS = 60
+# Older configs, and hand edits, hold addresses in plain text under these keys.
+PLAIN_ADDRESS_KEYS = ("ics_url", "ics_urls")
 
 
 class ConfigError(Exception):
@@ -41,6 +45,10 @@ def log_path(name: str = "log.txt") -> Path:
     return app_dir() / name
 
 
+def status_path() -> Path:
+    return app_dir() / "status.json"
+
+
 @dataclass
 class Settings:
     ics_url: str = ""
@@ -54,6 +62,7 @@ class Settings:
     poll_seconds: float = 5
     calendar_refresh_seconds: int = 300
     dry_run: bool = False
+    setup_complete: bool = False
 
     def calendar_urls(self) -> list[str]:
         urls: list[str] = []
@@ -64,9 +73,9 @@ class Settings:
         return urls
 
     def to_json(self) -> dict:
+        """The file form. Calendar addresses are encrypted for this Windows user."""
         return {
-            "ics_url": self.ics_url,
-            "ics_urls": list(self.ics_urls),
+            "ics_urls_protected": [protect(url) for url in self.calendar_urls()],
             "user_email": self.user_email,
             "idle_seconds": self.idle_seconds,
             "countdown_seconds": self.countdown_seconds,
@@ -76,30 +85,44 @@ class Settings:
             "poll_seconds": self.poll_seconds,
             "calendar_refresh_seconds": self.calendar_refresh_seconds,
             "dry_run": self.dry_run,
+            "setup_complete": self.setup_complete,
         }
+
+
+def save_settings(settings: Settings) -> None:
+    """Write config.json in one step, keeping any keys this version does not know about."""
+    path = config_path()
+    try:
+        raw = _read_raw(path) if path.exists() else {}
+    except ConfigError:
+        raw = {}
+    for key in PLAIN_ADDRESS_KEYS:
+        raw.pop(key, None)
+    raw.update(settings.to_json())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
 
 
 def load_settings() -> Settings:
     path = config_path()
     if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
         settings = Settings()
-        path.write_text(json.dumps(settings.to_json(), indent=2) + "\n", encoding="utf-8")
+        save_settings(settings)
         return settings
+    raw = _read_raw(path)
     try:
-        text = path.read_text(encoding="utf-8-sig")
-    except (OSError, UnicodeDecodeError) as error:
-        raise ConfigError(f"config.json could not be read ({type(error).__name__})") from None
-    try:
-        raw = json.loads(text)
-    except json.JSONDecodeError as error:
-        raise ConfigError(f"config.json is not valid JSON at line {error.lineno}, column {error.colno}: {error.msg}") from None
-    if not isinstance(raw, dict):
-        raise ConfigError("config.json must contain a JSON object")
+        protected = tuple(unprotect(token) for token in _text_list(raw, "ics_urls_protected", ()))
+    except ValueError:
+        raise ConfigError(
+            "config.json: a calendar address could not be decrypted. It was saved by another Windows user or PC, "
+            "so add that calendar again in Settings."
+        ) from None
+    plain = tuple(url for url in (_text(raw, "ics_url"), *_text_list(raw, "ics_urls", ())) if url)
     defaults = Settings()
-    return Settings(
-        ics_url=_text(raw, "ics_url"),
-        ics_urls=_text_list(raw, "ics_urls", ()),
+    settings = Settings(
+        ics_urls=protected + plain,
         user_email=_text(raw, "user_email"),
         idle_seconds=_number(raw, "idle_seconds", defaults.idle_seconds, int, minimum=10),
         countdown_seconds=_number(raw, "countdown_seconds", defaults.countdown_seconds, int, minimum=1),
@@ -115,7 +138,30 @@ def load_settings() -> Settings:
             minimum=MIN_CALENDAR_REFRESH_SECONDS,
         ),
         dry_run=_flag(raw, "dry_run"),
+        setup_complete=_flag(raw, "setup_complete"),
     )
+    settings.ics_urls = tuple(settings.calendar_urls())
+    if plain:
+        # Addresses typed into the file by hand, or kept from before encryption, are encrypted now.
+        try:
+            save_settings(settings)
+        except OSError as error:
+            logging.getLogger("granola_autostart").warning("could not encrypt calendar addresses (%s)", type(error).__name__)
+    return settings
+
+
+def _read_raw(path: Path) -> dict:
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ConfigError(f"config.json could not be read ({type(error).__name__})") from None
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ConfigError(f"config.json is not valid JSON at line {error.lineno}, column {error.colno}: {error.msg}") from None
+    if not isinstance(raw, dict):
+        raise ConfigError("config.json must contain a JSON object")
+    return raw
 
 
 def _text(raw: dict, name: str) -> str:

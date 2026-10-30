@@ -4,30 +4,53 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import dataclasses
 import logging
+import os
 from ctypes import wintypes
 import subprocess
 import sys
 import threading
 import time
 import winreg
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Callable
 
 from PIL import Image, ImageDraw
 import pystray
 
-from calendar_feed import fetch_ics, events_between, merge_events
+from app_status import (
+    AlertBook,
+    FeedStatus,
+    LastStart,
+    Problem,
+    Status,
+    TrayView,
+    describe_error,
+    feed_id,
+    find_problems,
+    next_meeting,
+    read_status,
+    tray_view,
+    write_status,
+)
+from app_version import __version__
+from calendar_feed import fetch_ics, events_between, feed_name, feed_owner, merge_events, my_addresses
+from notify import Notifier, register_app_id
 from decide import Prompt, Snapshot, evaluate, apply_result
 from granola_launch import build_url, launch
 from presence import idle_seconds, is_present, is_unlocked
-from settings import ConfigError, Settings, load_settings, setup_logging
+from settings import ConfigError, Settings, app_dir, config_path, load_settings, setup_logging, status_path
 from state_store import load_state, save_state
 from zoom_meetings import granola_running, process_table, zoom_session, zoom_window_title
 
 log = logging.getLogger("granola_autostart")
-ROOT = Path(__file__).resolve().parent
-NOTICE = ROOT / "notice.py"
+# A PyInstaller build is one GranolaAutostart.exe that runs every mode; from source each mode is a script.
+FROZEN = bool(getattr(sys, "frozen", False))
+ROOT = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
+NOTICE = Path(__file__).resolve().parent / "notice.py"
 TASK_LOGIN = "Granola Autostart"
 TASK_WATCHDOG = "Granola Autostart Watchdog"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -46,14 +69,25 @@ _SUPERVISOR_MUTEX = None
 
 
 class Control:
-    def __init__(self) -> None:
+    """Shared by the watcher loop and the tray: the pause, the current settings, and what the tray shows."""
+
+    def __init__(self, settings: Settings | None = None, config_error: str | None = None) -> None:
         self.stop = threading.Event()
+        self.wake = threading.Event()
         self._lock = threading.Lock()
         self.pause_until: datetime | None = None
+        self.settings = settings or Settings()
+        self.config_error = config_error
+        self.force_dry_run = False
+        self.last_start: LastStart | None = None
+        self.last_payload: dict | None = None
+        self.view = TrayView("watching", "Watching for meetings", False)
+        self.on_view: Callable[[TrayView], None] | None = None
 
     def set_pause(self, until: datetime | None) -> None:
         with self._lock:
             self.pause_until = until
+        self.wake.set()
 
     def current_pause(self) -> datetime | None:
         with self._lock:
@@ -63,15 +97,77 @@ class Control:
         until = self.current_pause()
         return until is not None and now < until
 
+    def halt(self) -> None:
+        self.stop.set()
+        self.wake.set()
 
-def load_feed(url: str, now: datetime, settings: Settings) -> list:
-    return events_between(
-        fetch_ics(url),
-        now - timedelta(hours=12),
-        now + timedelta(hours=36),
-        ignore_title_substrings=settings.ignore_title_substrings,
-        user_email=settings.user_email,
-    )
+    def sleep(self, seconds: float) -> None:
+        """Wait for the next tick, or less when the tray changed something."""
+        self.wake.wait(seconds)
+        self.wake.clear()
+
+    def record_start(self, title: str, payload: dict, at: datetime) -> None:
+        with self._lock:
+            self.last_start = LastStart(title, at)
+            self.last_payload = payload
+
+    def note_launch(self, launch) -> LastStart | None:
+        """Mark the last start as opened once Granola is seen, or as failed once the launch check gave up."""
+        with self._lock:
+            last = self.last_start
+            if last is not None and launch is not None and launch.launched_at == last.at:
+                if launch.seen_running:
+                    last.granola_opened = True
+                elif launch.warned:
+                    last.granola_opened = False
+            return dataclasses.replace(last) if last else None
+
+    def show(self, view: TrayView) -> None:
+        with self._lock:
+            changed = view != self.view
+            self.view = view
+            callback = self.on_view
+        if changed and callback is not None:
+            callback(view)
+
+
+@dataclass
+class FeedLoad:
+    events: dict[str, list] = field(default_factory=dict)
+    names: dict[str, str | None] = field(default_factory=dict)
+    failures: list[tuple[int, str, Exception]] = field(default_factory=list)  # (1-based index, url, error)
+
+
+def load_feeds(urls: list[str], now: datetime, settings: Settings, owners: dict[str, str | None]) -> FeedLoad:
+    """Download every feed first, so each one's declines are checked against all of the user's addresses.
+
+    ``owners`` holds each calendar's own address and is updated in place, so a feed that fails
+    this time still lends the address it had last time.
+    """
+    texts: dict[str, str] = {}
+    result = FeedLoad()
+    for index, url in enumerate(urls, start=1):
+        try:
+            texts[url] = fetch_ics(url)
+            owners[url] = feed_owner(texts[url])
+            result.names[url] = feed_name(texts[url])
+        except Exception as error:
+            result.failures.append((index, url, error))
+    addresses = my_addresses(settings.user_email, (owners.get(url) for url in urls))
+    for index, url in enumerate(urls, start=1):
+        if url not in texts:
+            continue
+        try:
+            result.events[url] = events_between(
+                texts[url],
+                now - timedelta(hours=12),
+                now + timedelta(hours=36),
+                ignore_title_substrings=settings.ignore_title_substrings,
+                user_emails=addresses,
+            )
+        except Exception as error:
+            result.failures.append((index, url, error))
+    return result
 
 
 def lower_thread_priority() -> None:
@@ -89,6 +185,8 @@ class CalendarCache:
         self._lock = threading.Lock()
         self._events: list = []
         self._by_url: dict[str, list] = {}
+        self._owners: dict[str, str | None] = {}
+        self._status: dict[str, FeedStatus] = {}
         self._fetched_at: datetime | None = None
         self._refresh_started: float | None = None
         self._generation = 0
@@ -119,21 +217,28 @@ class CalendarCache:
             lower_thread_priority()
             now = datetime.now().astimezone()
             urls = settings.calendar_urls()
-            fresh: dict[str, list] = {}
-            failed = False
-            for index, url in enumerate(urls, start=1):
-                try:
-                    fresh[url] = load_feed(url, now, settings)
-                except Exception as error:
-                    failed = True
-                    log.error("calendar feed %s failed (%s); keeping its previous events", index, type(error).__name__)
+            with self._lock:
+                owners = dict(self._owners)
+            loaded = load_feeds(urls, now, settings, owners)
+            for index, _url, error in loaded.failures:
+                log.error("calendar feed %s failed (%s); keeping its previous events", index, describe_error(error))
             fetched_at = now
-            if failed:
+            if loaded.failures:
                 fetched_at = now - timedelta(seconds=max(0, settings.calendar_refresh_seconds - FAILED_FEED_RETRY_SECONDS))
             with self._lock:
                 if generation != self._generation:
                     return
-                self._by_url.update(fresh)
+                self._owners = owners
+                self._by_url.update(loaded.events)
+                for _index, url, error in loaded.failures:
+                    self._status.setdefault(url, FeedStatus(feed_id(url))).failed(error)
+                for url, events in loaded.events.items():
+                    self._status.setdefault(url, FeedStatus(feed_id(url))).succeeded(
+                        now,
+                        name=loaded.names.get(url),
+                        owner=owners.get(url),
+                        meetings_next_day=sum(1 for event in events if now <= event.start < now + timedelta(days=1)),
+                    )
                 merged = merge_events(*(self._by_url.get(url, []) for url in urls))
                 self._events = merged
                 self._fetched_at = fetched_at
@@ -144,6 +249,15 @@ class CalendarCache:
             with self._lock:
                 if generation == self._generation:
                     self._refresh_started = None
+
+    def invalidate(self) -> None:
+        """Download again on the next tick, because the calendars or their filters changed."""
+        with self._lock:
+            self._fetched_at = None
+
+    def feed_statuses(self, urls: list[str]) -> list[FeedStatus]:
+        with self._lock:
+            return [dataclasses.replace(self._status[url]) if url in self._status else FeedStatus(feed_id(url)) for url in urls]
 
 
 def create_mutex(name: str) -> tuple[int, int]:
@@ -174,9 +288,19 @@ def ui_python() -> str:
     return sys.executable
 
 
+def app_command(*args: str) -> list[str]:
+    """Start this app again with ``args``: the packaged exe, or pythonw with this script."""
+    if FROZEN:
+        return [sys.executable, *args]
+    return [ui_python(), str(Path(__file__).resolve()), *args]
+
+
 def notice_command(title: str, seconds: int, kind: str) -> list[str]:
     # "--title=" keeps a title that starts with "-" from being read as an option.
-    return [ui_python(), str(NOTICE), f"--title={title}", f"--seconds={max(1, seconds)}", f"--kind={kind}"]
+    options = [f"--title={title}", f"--seconds={max(1, seconds)}", f"--kind={kind}"]
+    if FROZEN:
+        return [sys.executable, "--notice", *options]
+    return [ui_python(), str(NOTICE), *options]
 
 
 def ask_notice(title: str, seconds: int, kind: str) -> bool:
@@ -195,14 +319,80 @@ def ask_notice(title: str, seconds: int, kind: str) -> bool:
     return False
 
 
-def run_loop(settings: Settings, control: Control, state_lock: threading.Lock, state) -> None:
+def config_stamp() -> tuple[int, int] | None:
+    try:
+        stat = config_path().stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+
+def reload_settings(control: Control, current: Settings, cache: CalendarCache) -> Settings:
+    """Pick up a saved config.json. A broken file keeps the last settings that worked."""
+    try:
+        fresh = load_settings()
+    except ConfigError as error:
+        log.error("%s; keeping the previous settings until it is fixed", error)
+        control.config_error = str(error)
+        return current
+    control.config_error = None
+    fresh.dry_run = fresh.dry_run or control.force_dry_run
+    if (fresh.calendar_urls(), fresh.user_email, fresh.ignore_title_substrings) != (
+        current.calendar_urls(),
+        current.user_email,
+        current.ignore_title_substrings,
+    ):
+        cache.invalidate()
+    control.settings = fresh
+    log.info("settings reloaded")
+    return fresh
+
+
+class Reporter:
+    """Each tick: write status.json, turn new problems into notifications, and update the tray."""
+
+    def __init__(self, control: Control, notifier=None) -> None:
+        self.control = control
+        self.notifier = notifier
+        self.book = AlertBook()
+
+    def tick(self, now: datetime, settings: Settings, cache: CalendarCache, events, launch) -> None:
+        control = self.control
+        feeds = cache.feed_statuses(settings.calendar_urls())
+        problems = find_problems(control.config_error, feeds, launch)
+        if self.notifier is not None:
+            for problem in self.book.fresh(problems):
+                self.notifier.show(problem)
+        upcoming = next_meeting(events, now)
+        pause = control.current_pause()
+        control.show(tray_view(now, pause, problems, upcoming))
+        write_status(
+            status_path(),
+            Status(
+                version=__version__,
+                paused_until=pause if pause is not None and now < pause else None,
+                next_meeting=(upcoming.summary, upcoming.start) if upcoming else None,
+                feeds=feeds,
+                last_start=control.note_launch(launch),
+                problems=problems,
+                config_error=control.config_error,
+            ),
+        )
+
+
+def run_loop(settings: Settings, control: Control, state_lock: threading.Lock, state, reporter: Reporter | None = None) -> None:
     cache = CalendarCache()
+    reporter = reporter or Reporter(control)
     if not settings.calendar_urls():
         log.warning("No calendar feed configured. Calendar meetings will not start notes. Zoom joins still will.")
+    stamp = config_stamp()
     was_present = False
     while not control.stop.is_set():
         try:
             now = datetime.now().astimezone()
+            if config_stamp() != stamp:
+                stamp = config_stamp()
+                settings = reload_settings(control, settings, cache)
             table = process_table()
             session_id, age = zoom_session(table)
             in_zoom = session_id is not None
@@ -230,11 +420,13 @@ def run_loop(settings: Settings, control: Control, state_lock: threading.Lock, s
                 )
                 _warn_if_launch_missing(state, now)
                 save_state(state, control.current_pause())
+                launch_now = dataclasses.replace(state.active_launch) if state.active_launch else None
+            reporter.tick(now, settings, cache, events, launch_now)
             if prompt is not None and not control.stop.is_set():
                 handle_prompt(prompt, settings, control, state_lock, state)
         except Exception:
             log.exception("watcher tick failed")
-        control.stop.wait(settings.poll_seconds)
+        control.sleep(settings.poll_seconds)
 
 
 def still_present(settings: Settings) -> bool:
@@ -265,9 +457,12 @@ def handle_prompt(prompt: Prompt, settings: Settings, control: Control, state_lo
             log.info("started Granola for %s", prompt.title)
         except Exception:
             log.exception("could not start Granola for %s", prompt.title)
+    at = datetime.now().astimezone()
     with state_lock:
-        apply_result(state, prompt, started, datetime.now().astimezone())
+        apply_result(state, prompt, started, at)
         save_state(state, control.current_pause())
+    if started:
+        control.record_start(prompt.title, prompt.payload, at)
 
 
 def _warn_if_launch_missing(state, now: datetime) -> None:
@@ -280,83 +475,181 @@ def _warn_if_launch_missing(state, now: datetime) -> None:
     log.warning("Granola was not running 30s after the launch for %s", launch.title)
 
 
-def tray_image() -> Image.Image:
-    image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+GREEN = (90, 138, 71, 255)  # the countdown ring's colour
+GREY = (124, 119, 109, 255)
+AMBER = (208, 112, 31, 255)
+WHITE = (255, 255, 255, 255)
+
+
+def tray_image(kind: str = "watching") -> Image.Image:
+    """Green circle while watching, grey with pause bars while paused, and an amber dot when something is wrong."""
+    s = 4  # drawn large, then reduced, for smooth edges
+    image = Image.new("RGBA", (64 * s, 64 * s), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    draw.ellipse((4, 4, 60, 60), fill=(125, 154, 106, 255))
-    draw.ellipse((20, 20, 44, 44), fill=(255, 255, 255, 255))
-    return image
+    draw.ellipse((4 * s, 4 * s, 60 * s, 60 * s), fill=GREY if kind == "paused" else GREEN)
+    if kind == "paused":
+        draw.rounded_rectangle((22 * s, 19 * s, 29 * s, 45 * s), radius=2 * s, fill=WHITE)
+        draw.rounded_rectangle((35 * s, 19 * s, 42 * s, 45 * s), radius=2 * s, fill=WHITE)
+    else:
+        draw.ellipse((21 * s, 21 * s, 43 * s, 43 * s), fill=WHITE)
+    if kind == "attention":
+        draw.ellipse((37 * s, 0, 64 * s, 27 * s), fill=WHITE)
+        draw.ellipse((40 * s, 3 * s, 61 * s, 24 * s), fill=AMBER)
+    return image.resize((64, 64), Image.LANCZOS)
 
 
-def warn_user(message: str) -> None:
-    """One visible warning, on its own thread so the watcher keeps running."""
+def save_app_icon() -> Path:
+    """The icons Windows shows on notifications (PNG) and on windows run from source (ICO)."""
+    folder = app_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    tray_image().save(folder / "app.ico", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64)])
+    tray_image().save(folder / "app.png")
+    return folder / "app.png"
 
-    def show() -> None:
-        mb_iconwarning, mb_setforeground, mb_topmost = 0x30, 0x10000, 0x40000
-        ctypes.windll.user32.MessageBoxW(None, message, "Granola autostart", mb_iconwarning | mb_setforeground | mb_topmost)
 
-    threading.Thread(target=show, name="config-warning", daemon=True).start()
+SETTINGS_SCRIPT = Path(__file__).resolve().parent / "settings_app.py"
 
 
-def run_tray(settings: Settings, config_error: str | None = None) -> None:
-    control = Control()
-    idle_title = "Granola autostart: config.json error" if config_error else "Granola autostart"
-    if config_error:
-        warn_user(
-            f"{config_error}\n\nUsing default settings until it is fixed, so calendar meetings will not prompt. "
-            "Zoom joins still will. Fix the file, then choose Quit from the tray icon to reload it."
-        )
+def settings_command(*args: str) -> list[str]:
+    if FROZEN:
+        return [sys.executable, "--settings", *args]
+    return [ui_python(), str(SETTINGS_SCRIPT), *args]
+
+
+def _spawn(command: list[str]) -> None:
+    try:
+        subprocess.Popen(command, cwd=str(ROOT), close_fds=True)
+    except OSError:
+        log.exception("could not start %s", command[1:2])
+
+
+def open_settings(section: str = "calendars") -> None:
+    _spawn(settings_command(f"--section={section}"))
+
+
+def open_setup() -> None:
+    _spawn(settings_command("--setup"))
+
+
+def open_log_folder() -> None:
+    os.startfile(str(app_dir()))
+
+
+def open_config_file() -> None:
+    _spawn(["notepad.exe", str(config_path())])
+
+
+def retry_launch(control: Control) -> None:
+    payload = control.last_payload
+    if payload is None:
+        return
+    log.info("trying Granola again from the notification")
+    launch(build_url(payload), dry_run=control.settings.dry_run)
+
+
+def run_tray(settings: Settings, config_error: str | None = None, *, dry_run: bool = False) -> None:
+    control = Control(settings, config_error)
+    control.force_dry_run = dry_run
+    control.last_start = LastStart.from_json(read_status(status_path()).get("last_start"))
+    logo = None
+    try:
+        logo = save_app_icon()
+        register_app_id(logo)
+    except OSError as error:
+        log.warning("could not register for notifications (%s)", type(error).__name__)
     state_lock = threading.Lock()
     state, saved_pause = load_state()
     if saved_pause is not None:
         control.set_pause(saved_pause)
+    tray: dict[str, pystray.Icon] = {}
+
+    def balloon(title: str, message: str) -> None:
+        if "icon" in tray:
+            tray["icon"].notify(message, title)
+
+    def on_notification(action: str, problem: Problem) -> None:
+        if action == "retry":
+            retry_launch(control)
+        elif action == "logs":
+            open_log_folder()
+        elif action == "config":
+            open_config_file()
+        elif action in ("settings", "open"):
+            open_settings(problem.section)
+
+    reporter = Reporter(control, Notifier(on_notification, balloon, logo=logo))
     worker = threading.Thread(
         target=run_loop,
-        args=(settings, control, state_lock, state),
+        args=(settings, control, state_lock, state, reporter),
         name="granola-autostart",
         daemon=False,
     )
     worker.start()
+    if not settings.calendar_urls() and not settings.setup_complete and config_error is None:
+        open_setup()
 
-    def pause_until(until: datetime | None, icon: pystray.Icon, label: str) -> None:
+    def pause_until(until: datetime | None, label: str) -> None:
         control.set_pause(until)
         with state_lock:
             save_state(state, control.current_pause())
-        icon.title = label
         log.info(label)
 
-    def on_hour(icon: pystray.Icon, _item) -> None:
+    def on_hour(_icon, _item) -> None:
         until = datetime.now().astimezone() + timedelta(hours=1)
-        pause_until(until, icon, f"Paused until {until:%H:%M}")
+        pause_until(until, f"Paused until {until:%H:%M}")
 
-    def on_today(icon: pystray.Icon, _item) -> None:
+    def on_today(_icon, _item) -> None:
         now = datetime.now().astimezone()
-        until = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        pause_until(until, icon, "Paused until tomorrow")
+        pause_until((now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0), "Paused until tomorrow")
 
-    def on_resume(icon: pystray.Icon, _item) -> None:
-        pause_until(None, icon, idle_title)
+    def on_resume(_icon, _item) -> None:
+        pause_until(None, "Resumed")
 
     def on_quit(icon: pystray.Icon, _item) -> None:
         log.info("quitting")
-        control.stop.set()
+        control.halt()
         icon.stop()
 
-    icon = pystray.Icon(
-        "granola-autostart",
-        tray_image(),
-        idle_title,
-        menu=pystray.Menu(
-            pystray.MenuItem("Pause for 1 hour", on_hour),
-            pystray.MenuItem("Pause for today", on_today),
-            pystray.MenuItem("Resume", on_resume),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit", on_quit),
+    def refresh(view: TrayView) -> None:
+        icon = tray["icon"]
+        icon.icon = tray_image(view.kind)
+        icon.title = view.tooltip
+        icon.update_menu()
+
+    def ready(icon: pystray.Icon) -> None:
+        icon.visible = True
+        control.on_view = refresh
+        refresh(control.view)
+
+    # Left-clicking the icon runs the first default item: Fix in Settings... when something is wrong, else Settings...
+    menu = pystray.Menu(
+        pystray.MenuItem(lambda _item: control.view.header, lambda *_: None, enabled=False),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(
+            "Fix in Settings…",
+            lambda *_: open_settings(control.view.problem_section or "calendars"),
+            default=True,
+            visible=lambda _item: control.view.kind == "attention",
         ),
+        pystray.MenuItem("Resume", on_resume, visible=lambda _item: control.view.paused),
+        pystray.MenuItem("Pause for 1 hour", on_hour, visible=lambda _item: not control.view.paused),
+        pystray.MenuItem("Pause for today", on_today),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(
+            "Settings…",
+            lambda *_: open_settings("calendars"),
+            default=True,
+            visible=lambda _item: control.view.kind != "attention",
+        ),
+        pystray.MenuItem("Open log folder", lambda *_: open_log_folder()),
+        pystray.MenuItem("About", lambda *_: open_settings("about")),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Quit", on_quit),
     )
-    icon.run()
-    control.stop.set()
-    worker.join(timeout=settings.countdown_seconds + 15)
+    tray["icon"] = pystray.Icon("granola-autostart", tray_image(control.view.kind), control.view.tooltip, menu=menu)
+    tray["icon"].run(setup=ready)
+    control.halt()
+    worker.join(timeout=control.settings.countdown_seconds + 15)
 
 
 def acquire_supervisor() -> bool:
@@ -367,8 +660,7 @@ def acquire_supervisor() -> bool:
 
 
 def quoted_command(*extra: str) -> str:
-    parts = [f'"{ui_python()}"', f'"{Path(__file__).resolve()}"', *extra]
-    return " ".join(parts)
+    return " ".join([*(f'"{part}"' for part in app_command()), *extra])
 
 
 def install_run_key() -> None:
@@ -408,11 +700,11 @@ def install_tasks() -> str:
     # The new process takes the single-instance mutex. This installer must not.
     if try_scheduled_tasks():
         remove_run_key()
-        subprocess.Popen([ui_python(), str(Path(__file__).resolve())], cwd=str(ROOT), close_fds=True)
+        subprocess.Popen(app_command(), cwd=str(ROOT), close_fds=True)
         return "tasks"
     log.warning("Task Scheduler refused the install. Starting from the user startup list instead.")
     install_run_key()
-    subprocess.Popen([ui_python(), str(Path(__file__).resolve()), "--supervise"], cwd=str(ROOT), close_fds=True)
+    subprocess.Popen(app_command("--supervise"), cwd=str(ROOT), close_fds=True)
     return "startup"
 
 
@@ -421,16 +713,28 @@ def _powershell_like(text: str) -> str:
     return escaped.replace("'", "''")
 
 
-def stop_watchers() -> None:
-    script_path = _powershell_like(str(Path(__file__).resolve()))
-    script = (
-        "$procs = Get-CimInstance Win32_Process | Where-Object { "
-        f"$_.Name -match 'python' -and $_.CommandLine -like '*{script_path}*' "
-        "-and $_.CommandLine -notlike '*--uninstall*' -and $_.CommandLine -notlike '*--install*' }; "
+def stop_script() -> str:
+    """PowerShell that stops this install's supervisor first, so it cannot restart the watcher, then the rest."""
+    if FROZEN:
+        # Only this copy of the exe, so an installer stopping the old version leaves a source checkout alone.
+        exe = str(Path(sys.executable).resolve()).replace("'", "''")
+        match = f"$_.ExecutablePath -eq '{exe}' -and $_.ProcessId -ne {os.getpid()}"
+    else:
+        script_path = _powershell_like(str(Path(__file__).resolve()))
+        match = (
+            f"$_.Name -match 'python' -and $_.CommandLine -like '*{script_path}*' "
+            "-and $_.CommandLine -notlike '*--uninstall*' -and $_.CommandLine -notlike '*--install*' "
+            "-and $_.CommandLine -notlike '*--stop*'"
+        )
+    return (
+        "$procs = Get-CimInstance Win32_Process | Where-Object { " + match + " }; "
         "$procs | Sort-Object { if ($_.CommandLine -like '*--supervise*') { 0 } else { 1 } } | "
         "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
     )
-    subprocess.call(["powershell", "-NoProfile", "-Command", script], creationflags=CREATE_NO_WINDOW)
+
+
+def stop_watchers() -> None:
+    subprocess.call(["powershell", "-NoProfile", "-Command", stop_script()], creationflags=CREATE_NO_WINDOW)
 
 
 def uninstall_tasks() -> None:
@@ -445,12 +749,11 @@ def supervise() -> int:
         log.info("supervisor already running")
         return 0
     log.info("supervisor running")
-    python = ui_python()
-    script = str(Path(__file__).resolve())
+    command = app_command()
     delay = RESTART_DELAY_SECONDS
     while True:
         started = time.monotonic()
-        completed = subprocess.run([python, script], cwd=str(ROOT))
+        completed = subprocess.run(command, cwd=str(ROOT))
         quick = time.monotonic() - started < HEALTHY_RUN_SECONDS
         if not quick:
             delay = RESTART_DELAY_SECONDS
@@ -477,13 +780,10 @@ def print_check(settings: Settings, config_error: str | None) -> None:
     if not urls:
         print("calendar: no calendar feed in config")
         return
-    loaded = []
-    for index, url in enumerate(urls, start=1):
-        try:
-            loaded.append(load_feed(url, now, settings))
-        except Exception as error:
-            print(f"calendar feed {index}: failed ({type(error).__name__})")
-    events = merge_events(*loaded)
+    loaded = load_feeds(urls, now, settings, {})
+    for index, _url, error in loaded.failures:
+        print(f"calendar feed {index}: failed ({describe_error(error)})")
+    events = merge_events(*loaded.events.values())
     upcoming = [event for event in events if event.end > now][:8]
     if not upcoming:
         print("calendar: no upcoming events in the feed")
@@ -497,12 +797,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Start Granola when a meeting begins")
     parser.add_argument("--install", action="store_true", help="start at logon and launch the watcher now")
     parser.add_argument("--uninstall", action="store_true", help="remove startup and stop the watcher")
+    parser.add_argument("--stop", action="store_true", help="stop the running watcher and supervisor")
     parser.add_argument("--supervise", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--check", action="store_true", help="print presence, Zoom, and calendar status")
     parser.add_argument("--preview-notice", action="store_true", help="show the countdown once")
     parser.add_argument("--dry-run", action="store_true", help="show countdowns but do not launch Granola")
     args = parser.parse_args()
-    watching = not (args.supervise or args.install or args.uninstall or args.check or args.preview_notice)
+    watching = not (args.supervise or args.install or args.uninstall or args.stop or args.check or args.preview_notice)
     if watching and not acquire_single_instance():
         if sys.stdout is not None:
             print("another watcher is already running; run --uninstall first to test with --dry-run")
@@ -539,13 +840,18 @@ def main() -> int:
         uninstall_tasks()
         logger.info("granola autostart removed")
         return 0
+    if args.stop:
+        # The installer runs this before replacing files and before uninstalling.
+        stop_watchers()
+        logger.info("granola autostart stopped")
+        return 0
     if args.install:
         mode = install_tasks()
         logger.info("granola autostart installed (%s)", mode)
         print(f"installed via {mode}")
         return 0
-    logger.info("granola autostart running (dry_run=%s)", settings.dry_run)
-    run_tray(settings, config_error)
+    logger.info("granola autostart %s running (dry_run=%s)", __version__, settings.dry_run)
+    run_tray(settings, config_error, dry_run=args.dry_run)
     return 0
 
 

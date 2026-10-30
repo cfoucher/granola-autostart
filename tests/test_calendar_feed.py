@@ -5,7 +5,7 @@ import pytest
 import recurring_ical_events
 from icalendar import Calendar
 
-from calendar_feed import _gunzip_capped, events_between, normalize_feed_url, prefilter_ics
+from calendar_feed import _gunzip_capped, events_between, feed_owner, my_addresses, normalize_feed_url, prefilter_ics
 
 ICS = """BEGIN:VCALENDAR
 VERSION:2.0
@@ -62,7 +62,7 @@ def test_feed_keeps_timed_meetings_and_google_instance_ids():
         start,
         end,
         ignore_title_substrings=("focus time", "out of office", "lunch"),
-        user_email="conrad@example.com",
+        user_emails=frozenset({"conrad@example.com"}),
     )
     titles = [event.summary for event in events]
     assert "Design review" in titles
@@ -96,6 +96,30 @@ def test_a_lone_moved_instance_keeps_its_google_instance_id():
     start = datetime(2026, 10, 28, 16, 0, tzinfo=timezone.utc)
     events = events_between(LONE_INSTANCE, start, start + timedelta(hours=8))
     assert [event.id for event in events] == ["shared_20261028T170000Z"]
+
+
+def test_a_main_google_calendar_is_owned_by_the_address_it_is_named_after():
+    ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nX-WR-CALNAME:Conrad.Foucher@Example.com\r\nEND:VCALENDAR\r\n"
+    assert feed_owner(ics) == "conrad.foucher@example.com"
+
+
+def test_a_folded_calendar_name_is_read_whole():
+    ics = "BEGIN:VCALENDAR\r\nX-WR-CALNAME:conrad.foucher@exa\r\n mple.com\r\nEND:VCALENDAR\r\n"
+    assert feed_owner(ics) == "conrad.foucher@example.com"
+
+
+def test_a_secondary_calendar_or_an_event_field_has_no_owner():
+    assert feed_owner("BEGIN:VCALENDAR\nX-WR-CALNAME:Granola watch\nEND:VCALENDAR\n") is None
+    in_event = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nX-WR-CALNAME:someone@example.com\nEND:VEVENT\nEND:VCALENDAR\n"
+    assert feed_owner(in_event) is None
+
+
+def test_declines_are_checked_against_the_typed_address_and_every_owner():
+    assert my_addresses(" Alias@Example.ca ", ["conrad@example.com", None, ""]) == {
+        "alias@example.ca",
+        "conrad@example.com",
+    }
+    assert my_addresses("", [None]) == frozenset()
 
 
 FAR_AWAY = ICS.replace(

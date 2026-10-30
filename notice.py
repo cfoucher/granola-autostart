@@ -26,18 +26,21 @@ RING_STEPS = 120
 START_NOW_DELAY_SECONDS = 0.75
 
 PALETTES = {
+    # The ring keeps "accent"; text and the Start button use darker greens so they reach 4.5:1.
     "light": {
         "bg": "#fbf8f1",
         "border": "#e2d9c6",
         "ink": "#2b2924",
         "muted": "#6f685b",
         "accent": "#5a8a47",
-        "accent_hover": "#4b7a3a",
+        "accent_text": "#42703a",
+        "start": "#4b7a3a",
+        "start_hover": "#3f6830",
         "on_accent": "#ffffff",
         "track": "#e9e2d2",
         "button_line": "#2b2924",
         "button_hover": "#f1eadb",
-        "warn": "#a3581b",
+        "warn": "#94501a",
     },
     "dark": {
         "bg": "#25231f",
@@ -45,7 +48,9 @@ PALETTES = {
         "ink": "#f1ece1",
         "muted": "#b3ab9b",
         "accent": "#93c47d",
-        "accent_hover": "#a7d493",
+        "accent_text": "#a7d493",
+        "start": "#93c47d",
+        "start_hover": "#a7d493",
         "on_accent": "#1c2617",
         "track": "#3a3731",
         "button_line": "#f1ece1",
@@ -264,8 +269,8 @@ def show_notice(title: str, seconds: int, *, kind: str = "calendar", auto: str |
     images: list[ImageTk.PhotoImage] = []
 
     y = pad
-    eyebrow = "GRANOLA  \u00b7  " + ("RESTARTING" if kind == "crash" else "STARTING NOTES")
-    canvas.create_text(text_x, y, text=eyebrow, anchor="nw", font=eyebrow_font, fill=colors["accent"])
+    eyebrow = "GRANOLA  \u00b7  " + ("RESTARTING NOTES" if kind == "crash" else "STARTING NOTES")
+    canvas.create_text(text_x, y, text=eyebrow, anchor="nw", font=eyebrow_font, fill=colors["accent_text"])
     y += eyebrow_font.metrics("linespace") + px(4)
     for line in _fit_lines(title_font, title, text_w, 2):
         canvas.create_text(text_x, y, text=line, anchor="nw", font=title_font, fill=colors["ink"])
@@ -294,7 +299,8 @@ def show_notice(title: str, seconds: int, *, kind: str = "calendar", auto: str |
 
     button_h = px(32)
     line_w = max(1.0, 1.25 * scale)
-    start_label = "Restart now" if kind == "crash" else "Start now"
+    # The crash line above already says Granola is starting again, so the button matches the other cards.
+    start_label = "Start now"
     cancel_w = max(px(96), button_font.measure("Cancel") + px(36))
     start_w = max(px(96), button_font.measure(start_label) + px(36))
     cancel_x = width - pad - cancel_w
@@ -313,8 +319,8 @@ def show_notice(title: str, seconds: int, *, kind: str = "calendar", auto: str |
         start_w,
         start_label,
         colors["on_accent"],
-        _pill_image(start_w, button_h, colors["accent"]),
-        _pill_image(start_w, button_h, colors["accent_hover"]),
+        _pill_image(start_w, button_h, colors["start"]),
+        _pill_image(start_w, button_h, colors["start_hover"]),
     )
     add_button(
         "cancel",
@@ -428,8 +434,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     keep_display_on()
     try:
         started = show_notice(args.title, args.seconds, kind=args.kind, auto=args.auto)
