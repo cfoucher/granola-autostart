@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import logging
+import os
 from ctypes import wintypes
 import subprocess
 import sys
@@ -17,7 +18,8 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 import pystray
 
-from calendar_feed import fetch_ics, events_between, merge_events
+from app_version import __version__
+from calendar_feed import fetch_ics, events_between, feed_owner, merge_events, my_addresses
 from decide import Prompt, Snapshot, evaluate, apply_result
 from granola_launch import build_url, launch
 from presence import idle_seconds, is_present, is_unlocked
@@ -26,8 +28,10 @@ from state_store import load_state, save_state
 from zoom_meetings import granola_running, process_table, zoom_session, zoom_window_title
 
 log = logging.getLogger("granola_autostart")
-ROOT = Path(__file__).resolve().parent
-NOTICE = ROOT / "notice.py"
+# A PyInstaller build is one GranolaAutostart.exe that runs every mode; from source each mode is a script.
+FROZEN = bool(getattr(sys, "frozen", False))
+ROOT = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
+NOTICE = Path(__file__).resolve().parent / "notice.py"
 TASK_LOGIN = "Granola Autostart"
 TASK_WATCHDOG = "Granola Autostart Watchdog"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -64,14 +68,38 @@ class Control:
         return until is not None and now < until
 
 
-def load_feed(url: str, now: datetime, settings: Settings) -> list:
-    return events_between(
-        fetch_ics(url),
-        now - timedelta(hours=12),
-        now + timedelta(hours=36),
-        ignore_title_substrings=settings.ignore_title_substrings,
-        user_email=settings.user_email,
-    )
+def load_feeds(
+    urls: list[str], now: datetime, settings: Settings, owners: dict[str, str | None]
+) -> tuple[dict[str, list], list[tuple[int, Exception]]]:
+    """Download every feed first, so each one's declines are checked against all of the user's addresses.
+
+    ``owners`` holds each calendar's own address and is updated in place, so a feed that fails
+    this time still lends the address it had last time.
+    """
+    texts: dict[str, str] = {}
+    failures: list[tuple[int, Exception]] = []
+    for index, url in enumerate(urls, start=1):
+        try:
+            texts[url] = fetch_ics(url)
+            owners[url] = feed_owner(texts[url])
+        except Exception as error:
+            failures.append((index, error))
+    addresses = my_addresses(settings.user_email, (owners.get(url) for url in urls))
+    events: dict[str, list] = {}
+    for index, url in enumerate(urls, start=1):
+        if url not in texts:
+            continue
+        try:
+            events[url] = events_between(
+                texts[url],
+                now - timedelta(hours=12),
+                now + timedelta(hours=36),
+                ignore_title_substrings=settings.ignore_title_substrings,
+                user_emails=addresses,
+            )
+        except Exception as error:
+            failures.append((index, error))
+    return events, failures
 
 
 def lower_thread_priority() -> None:
@@ -89,6 +117,7 @@ class CalendarCache:
         self._lock = threading.Lock()
         self._events: list = []
         self._by_url: dict[str, list] = {}
+        self._owners: dict[str, str | None] = {}
         self._fetched_at: datetime | None = None
         self._refresh_started: float | None = None
         self._generation = 0
@@ -119,20 +148,18 @@ class CalendarCache:
             lower_thread_priority()
             now = datetime.now().astimezone()
             urls = settings.calendar_urls()
-            fresh: dict[str, list] = {}
-            failed = False
-            for index, url in enumerate(urls, start=1):
-                try:
-                    fresh[url] = load_feed(url, now, settings)
-                except Exception as error:
-                    failed = True
-                    log.error("calendar feed %s failed (%s); keeping its previous events", index, type(error).__name__)
+            with self._lock:
+                owners = dict(self._owners)
+            fresh, failures = load_feeds(urls, now, settings, owners)
+            for index, error in failures:
+                log.error("calendar feed %s failed (%s); keeping its previous events", index, type(error).__name__)
             fetched_at = now
-            if failed:
+            if failures:
                 fetched_at = now - timedelta(seconds=max(0, settings.calendar_refresh_seconds - FAILED_FEED_RETRY_SECONDS))
             with self._lock:
                 if generation != self._generation:
                     return
+                self._owners = owners
                 self._by_url.update(fresh)
                 merged = merge_events(*(self._by_url.get(url, []) for url in urls))
                 self._events = merged
@@ -174,9 +201,19 @@ def ui_python() -> str:
     return sys.executable
 
 
+def app_command(*args: str) -> list[str]:
+    """Start this app again with ``args``: the packaged exe, or pythonw with this script."""
+    if FROZEN:
+        return [sys.executable, *args]
+    return [ui_python(), str(Path(__file__).resolve()), *args]
+
+
 def notice_command(title: str, seconds: int, kind: str) -> list[str]:
     # "--title=" keeps a title that starts with "-" from being read as an option.
-    return [ui_python(), str(NOTICE), f"--title={title}", f"--seconds={max(1, seconds)}", f"--kind={kind}"]
+    options = [f"--title={title}", f"--seconds={max(1, seconds)}", f"--kind={kind}"]
+    if FROZEN:
+        return [sys.executable, "--notice", *options]
+    return [ui_python(), str(NOTICE), *options]
 
 
 def ask_notice(title: str, seconds: int, kind: str) -> bool:
@@ -367,8 +404,7 @@ def acquire_supervisor() -> bool:
 
 
 def quoted_command(*extra: str) -> str:
-    parts = [f'"{ui_python()}"', f'"{Path(__file__).resolve()}"', *extra]
-    return " ".join(parts)
+    return " ".join([*(f'"{part}"' for part in app_command()), *extra])
 
 
 def install_run_key() -> None:
@@ -408,11 +444,11 @@ def install_tasks() -> str:
     # The new process takes the single-instance mutex. This installer must not.
     if try_scheduled_tasks():
         remove_run_key()
-        subprocess.Popen([ui_python(), str(Path(__file__).resolve())], cwd=str(ROOT), close_fds=True)
+        subprocess.Popen(app_command(), cwd=str(ROOT), close_fds=True)
         return "tasks"
     log.warning("Task Scheduler refused the install. Starting from the user startup list instead.")
     install_run_key()
-    subprocess.Popen([ui_python(), str(Path(__file__).resolve()), "--supervise"], cwd=str(ROOT), close_fds=True)
+    subprocess.Popen(app_command("--supervise"), cwd=str(ROOT), close_fds=True)
     return "startup"
 
 
@@ -421,16 +457,28 @@ def _powershell_like(text: str) -> str:
     return escaped.replace("'", "''")
 
 
-def stop_watchers() -> None:
-    script_path = _powershell_like(str(Path(__file__).resolve()))
-    script = (
-        "$procs = Get-CimInstance Win32_Process | Where-Object { "
-        f"$_.Name -match 'python' -and $_.CommandLine -like '*{script_path}*' "
-        "-and $_.CommandLine -notlike '*--uninstall*' -and $_.CommandLine -notlike '*--install*' }; "
+def stop_script() -> str:
+    """PowerShell that stops this install's supervisor first, so it cannot restart the watcher, then the rest."""
+    if FROZEN:
+        # Only this copy of the exe, so an installer stopping the old version leaves a source checkout alone.
+        exe = str(Path(sys.executable).resolve()).replace("'", "''")
+        match = f"$_.ExecutablePath -eq '{exe}' -and $_.ProcessId -ne {os.getpid()}"
+    else:
+        script_path = _powershell_like(str(Path(__file__).resolve()))
+        match = (
+            f"$_.Name -match 'python' -and $_.CommandLine -like '*{script_path}*' "
+            "-and $_.CommandLine -notlike '*--uninstall*' -and $_.CommandLine -notlike '*--install*' "
+            "-and $_.CommandLine -notlike '*--stop*'"
+        )
+    return (
+        "$procs = Get-CimInstance Win32_Process | Where-Object { " + match + " }; "
         "$procs | Sort-Object { if ($_.CommandLine -like '*--supervise*') { 0 } else { 1 } } | "
         "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
     )
-    subprocess.call(["powershell", "-NoProfile", "-Command", script], creationflags=CREATE_NO_WINDOW)
+
+
+def stop_watchers() -> None:
+    subprocess.call(["powershell", "-NoProfile", "-Command", stop_script()], creationflags=CREATE_NO_WINDOW)
 
 
 def uninstall_tasks() -> None:
@@ -445,12 +493,11 @@ def supervise() -> int:
         log.info("supervisor already running")
         return 0
     log.info("supervisor running")
-    python = ui_python()
-    script = str(Path(__file__).resolve())
+    command = app_command()
     delay = RESTART_DELAY_SECONDS
     while True:
         started = time.monotonic()
-        completed = subprocess.run([python, script], cwd=str(ROOT))
+        completed = subprocess.run(command, cwd=str(ROOT))
         quick = time.monotonic() - started < HEALTHY_RUN_SECONDS
         if not quick:
             delay = RESTART_DELAY_SECONDS
@@ -477,13 +524,10 @@ def print_check(settings: Settings, config_error: str | None) -> None:
     if not urls:
         print("calendar: no calendar feed in config")
         return
-    loaded = []
-    for index, url in enumerate(urls, start=1):
-        try:
-            loaded.append(load_feed(url, now, settings))
-        except Exception as error:
-            print(f"calendar feed {index}: failed ({type(error).__name__})")
-    events = merge_events(*loaded)
+    loaded, failures = load_feeds(urls, now, settings, {})
+    for index, error in failures:
+        print(f"calendar feed {index}: failed ({type(error).__name__})")
+    events = merge_events(*loaded.values())
     upcoming = [event for event in events if event.end > now][:8]
     if not upcoming:
         print("calendar: no upcoming events in the feed")
@@ -497,12 +541,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Start Granola when a meeting begins")
     parser.add_argument("--install", action="store_true", help="start at logon and launch the watcher now")
     parser.add_argument("--uninstall", action="store_true", help="remove startup and stop the watcher")
+    parser.add_argument("--stop", action="store_true", help="stop the running watcher and supervisor")
     parser.add_argument("--supervise", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--check", action="store_true", help="print presence, Zoom, and calendar status")
     parser.add_argument("--preview-notice", action="store_true", help="show the countdown once")
     parser.add_argument("--dry-run", action="store_true", help="show countdowns but do not launch Granola")
     args = parser.parse_args()
-    watching = not (args.supervise or args.install or args.uninstall or args.check or args.preview_notice)
+    watching = not (args.supervise or args.install or args.uninstall or args.stop or args.check or args.preview_notice)
     if watching and not acquire_single_instance():
         if sys.stdout is not None:
             print("another watcher is already running; run --uninstall first to test with --dry-run")
@@ -539,12 +584,17 @@ def main() -> int:
         uninstall_tasks()
         logger.info("granola autostart removed")
         return 0
+    if args.stop:
+        # The installer runs this before replacing files and before uninstalling.
+        stop_watchers()
+        logger.info("granola autostart stopped")
+        return 0
     if args.install:
         mode = install_tasks()
         logger.info("granola autostart installed (%s)", mode)
         print(f"installed via {mode}")
         return 0
-    logger.info("granola autostart running (dry_run=%s)", settings.dry_run)
+    logger.info("granola autostart %s running (dry_run=%s)", __version__, settings.dry_run)
     run_tray(settings, config_error)
     return 0
 

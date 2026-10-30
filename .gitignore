@@ -1,4 +1,7 @@
 .venv/
+.claude/worktrees/
+build/
+dist/
 designs/
 __pycache__/
 .pytest_cache/

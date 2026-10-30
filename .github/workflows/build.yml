@@ -1,0 +1,61 @@
+# Tests on every push to main and every pull request; an installer for pushes to main, version tags,
+# and manual runs. Windows runners, because the tests and the build use winreg and ctypes.windll.
+# The repo is private, so runner time comes out of GitHub Free's monthly allowance: keep it lean.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+
+  installer:
+    if: github.event_name != 'pull_request'
+    needs: test
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: python -m pip install -r requirements-build.txt
+      - name: Check the tag matches app_version.py
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $version = (python -c "from app_version import __version__; print(__version__)").Trim()
+          if ("v$version" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} does not match app_version.py ($version)" }
+      - run: choco install innosetup --no-progress -y
+      - run: ./build.ps1 -SkipTests
+        shell: pwsh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: GranolaAutostart-setup
+          path: dist/GranolaAutostart-*-setup.exe
+          retention-days: 7
+          if-no-files-found: error

@@ -72,6 +72,19 @@ Tests:
 
 Logs: `%LOCALAPPDATA%\granola-autostart\log.txt` (the supervisor writes `supervisor-log.txt`, and commands such as `--check` write `cli-log.txt`). The log records meeting titles. Calendar addresses are never written to it.
 
+## Building the installer
+
+From a venv with the build requirements, and Inno Setup 6 installed:
+
+```powershell
+.venv\Scripts\pip install -r requirements-build.txt
+.\build.ps1
+```
+
+It runs the tests, builds `dist\GranolaAutostart\` with PyInstaller, then `dist\GranolaAutostart-<version>-setup.exe`. The installer is per user and needs no admin rights. GitHub Actions does the same for pushes to `main` and version tags, and keeps the installer for 7 days.
+
+Before installing it over a source install, run `--uninstall` (below), so the two don't run side by side. Settings in `%LOCALAPPDATA%\granola-autostart` carry over.
+
 ## Uninstall
 
 ```powershell

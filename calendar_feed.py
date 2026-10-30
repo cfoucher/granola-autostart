@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 import urllib.error
 import urllib.request
@@ -15,6 +16,7 @@ import recurring_ical_events
 log = logging.getLogger("granola_autostart")
 MAX_FEED_BYTES = 64 * 1024 * 1024
 PREFILTER_MARGIN = timedelta(days=7)
+_EMAIL = re.compile(r"[^@\s:;]+@[^@\s:;]+\.[^@\s:;]+")
 
 
 @dataclass(frozen=True)
@@ -170,13 +172,35 @@ def _rrule_part(rule: str, name: str) -> str | None:
     return None
 
 
+def feed_owner(ics_text: str) -> str | None:
+    """The address in X-WR-CALNAME, when the calendar is named after one.
+
+    Google names a main calendar after its account, and invites list that same address.
+    A secondary calendar such as "Granola watch" has a plain name and returns None.
+    """
+    # A long header line continues on the next line after a leading space or tab.
+    header = re.sub(r"\r?\n[ \t]", "", ics_text.split("BEGIN:VEVENT", 1)[0])
+    for line in header.split("\n"):
+        name, _, value = line.partition(":")
+        if name.split(";", 1)[0].strip().upper() == "X-WR-CALNAME":
+            value = value.strip()
+            return value.casefold() if _EMAIL.fullmatch(value) else None
+    return None
+
+
+def my_addresses(user_email: str, owners) -> frozenset[str]:
+    """Every address declines are checked against: the typed one plus each calendar's own."""
+    found = {address.strip().casefold() for address in (user_email, *owners) if address and address.strip()}
+    return frozenset(found)
+
+
 def events_between(
     ics_text: str,
     window_start: datetime,
     window_end: datetime,
     *,
     ignore_title_substrings: tuple[str, ...] = (),
-    user_email: str = "",
+    user_emails: frozenset[str] = frozenset(),
 ) -> list[CalendarEvent]:
     calendar = Calendar.from_ical(prefilter_ics(ics_text, window_start, window_end))
     local_zone = datetime.now().astimezone().tzinfo or timezone.utc
@@ -192,7 +216,7 @@ def events_between(
             component,
             local_zone=local_zone,
             ignore_title_substrings=ignore_title_substrings,
-            user_email=user_email,
+            user_emails=user_emails,
             series_uids=series_uids,
         )
         if event is not None and event.end > event.start:
@@ -206,13 +230,13 @@ def _component_to_event(
     *,
     local_zone,
     ignore_title_substrings: tuple[str, ...],
-    user_email: str,
+    user_emails: frozenset[str],
     series_uids: set[str],
 ) -> CalendarEvent | None:
     status = str(component.get("status") or "").strip().upper()
     if status in {"CANCELLED", "CANCELED"}:
         return None
-    if _declined(component, user_email):
+    if _declined(component, user_emails):
         return None
     start_value = _raw_dt(component.get("dtstart"))
     if not isinstance(start_value, datetime):
@@ -258,10 +282,9 @@ def _granola_event_id(uid: str, recurrence_start: datetime | None) -> str:
     return uid
 
 
-def _declined(component, user_email: str) -> bool:
-    if not user_email:
+def _declined(component, user_emails: frozenset[str]) -> bool:
+    if not user_emails:
         return False
-    want = user_email.casefold()
     attendees = component.get("attendee")
     if attendees is None:
         return False
@@ -270,7 +293,7 @@ def _declined(component, user_email: str) -> bool:
     for attendee in attendees:
         email = str(attendee).split(":", 1)[-1].strip().casefold()
         partstat = str(attendee.params.get("PARTSTAT", "")).upper()
-        if email == want and partstat == "DECLINED":
+        if email in user_emails and partstat == "DECLINED":
             return True
     return False
 
