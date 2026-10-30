@@ -40,12 +40,23 @@ def version_resource() -> str:
     return str(path)
 
 
+from PyInstaller.utils.hooks import collect_submodules  # noqa: E402
+
 a = Analysis(
     [str(ROOT / "app.py")],
     pathex=[str(ROOT)],
-    # pystray picks its Windows backend at runtime, so the analysis cannot see the import.
-    hiddenimports=["pystray._win32"],
-    excludes=["pytest", "_pytest"],
+    # The Settings and setup page, read from _internal/ui at runtime.
+    datas=[(str(ROOT / "ui"), "ui")],
+    # Imports chosen at runtime, which the analysis cannot see: pystray's Windows backend, pywebview's
+    # Edge WebView2 platform, and the WinRT bindings behind Windows notifications.
+    hiddenimports=[
+        "pystray._win32",
+        "webview.platforms.edgechromium",
+        "webview.platforms.winforms",
+        *collect_submodules("windows_toasts"),
+        *collect_submodules("winrt"),
+    ],
+    excludes=["pytest", "_pytest", "webview.platforms.qt", "webview.platforms.gtk", "webview.platforms.cef"],
 )
 pyz = PYZ(a.pure)
 exe = EXE(

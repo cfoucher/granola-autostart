@@ -49,29 +49,45 @@ def feeds(monkeypatch):
     return served
 
 
-def titles(events):
-    return sorted(event.summary for by_url in events.values() for event in by_url)
+def titles(loaded):
+    return sorted(event.summary for by_url in loaded.events.values() for event in by_url)
 
 
 def test_a_secondary_calendar_skips_declines_by_the_main_calendars_address(feeds):
     owners = {}
-    events, failures = watcher.load_feeds([MAIN, WATCH], NOW, Settings(), owners)
-    assert failures == []
-    assert titles(events) == ["Weekly sync"]
+    loaded = watcher.load_feeds([MAIN, WATCH], NOW, Settings(), owners)
+    assert loaded.failures == []
+    assert titles(loaded) == ["Weekly sync"]
     assert owners == {MAIN: "conrad@example.com", WATCH: None}
+    assert loaded.names == {MAIN: "conrad@example.com", WATCH: "Granola watch"}
 
 
 def test_a_failed_main_calendar_still_lends_its_last_known_address(feeds):
     owners = {MAIN: "conrad@example.com"}
     feeds[MAIN] = None
-    events, failures = watcher.load_feeds([MAIN, WATCH], NOW, Settings(), owners)
-    assert [index for index, _error in failures] == [1]
-    assert titles(events) == []
+    loaded = watcher.load_feeds([MAIN, WATCH], NOW, Settings(), owners)
+    assert [(index, url) for index, url, _error in loaded.failures] == [(1, MAIN)]
+    assert titles(loaded) == []
 
 
 def test_without_any_address_a_decline_cannot_be_recognised(feeds):
     feeds[MAIN] = None
-    events, _failures = watcher.load_feeds([MAIN, WATCH], NOW, Settings(), {})
-    assert titles(events) == ["Design crit"]
-    events, _failures = watcher.load_feeds([MAIN, WATCH], NOW, Settings(user_email="conrad@example.com"), {})
-    assert titles(events) == []
+    assert titles(watcher.load_feeds([MAIN, WATCH], NOW, Settings(), {})) == ["Design crit"]
+    settings = Settings(user_email="conrad@example.com")
+    assert titles(watcher.load_feeds([MAIN, WATCH], NOW, settings, {})) == []
+
+
+def test_the_cache_reports_each_calendars_health(feeds, monkeypatch):
+    monkeypatch.setattr(watcher, "lower_thread_priority", lambda: None)
+    monkeypatch.setattr(watcher, "datetime", type("FixedNow", (datetime,), {"now": staticmethod(lambda tz=None: NOW)}))
+    cache = watcher.CalendarCache()
+    feeds[WATCH] = None
+    settings = Settings(ics_urls=(MAIN, WATCH))
+    for expected_failures in (1, 2, 3):
+        cache._refresh(settings, cache._generation)
+        main, watch = cache.feed_statuses([MAIN, WATCH])
+        assert (watch.failures, watch.last_error) == (expected_failures, "OSError")
+    assert (main.name, main.owner, main.failures, main.meetings_next_day) == ("conrad@example.com", "conrad@example.com", 0, 1)
+    feeds[WATCH] = WATCH_ICS
+    cache._refresh(settings, cache._generation)
+    assert cache.feed_statuses([WATCH])[0].failures == 0

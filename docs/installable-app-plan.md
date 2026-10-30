@@ -2,6 +2,8 @@
 
 Keep the current Python code and package it, rather than rewriting it. Two small fixes first, then three phases; each phase is useful on its own.
 
+**Status (30 October 2026):** the two fixes, Phase 1, and Phase 2 are built and released as 1.0.0, with Settings and setup in WebView2. From Phase 3, the GitHub release job and the setup guide (README) are done. Still open: code signing (installers are unsigned) and the update check, which waits for installers to have a public home.
+
 Designs: [Granola Autostart app](https://claude.ai/artifact/BuZ3FWA3LoZ8qbzzokkP69) in Claude Design (private until shared from its Share menu). It covers first-run setup, Settings, tray menu states, Windows notifications, and the countdown card, in the card's existing "Paper" style with light and dark versions.
 
 ## Current shape
@@ -127,7 +129,7 @@ Designs: [Granola Autostart app](https://claude.ai/artifact/BuZ3FWA3LoZ8qbzzokkP
 
 ## Decisions needed
 
-- **Settings toolkit:** WebView2 (recommended) or Tk.
+- **Settings toolkit:** WebView2 (decided and built).
 - **Audience:** only the author (stop after Phase 1), or coworkers.
 - **Signing:** Shift IT, Trusted Signing, or unsigned.
 - **Repo visibility:** private for now (decided). Revisit before the update check (item 20).

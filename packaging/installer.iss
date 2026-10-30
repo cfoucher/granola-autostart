@@ -42,7 +42,8 @@ Source: "..\dist\GranolaAutostart\*"; DestDir: "{app}"; Flags: ignoreversion rec
 Type: filesandordirs; Name: "{app}\_internal"
 
 [Icons]
-Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; Parameters: "--supervise"; AppUserModelID: "{#AppUserModelID}"
+; Opens Settings, which also starts the app if it isn't running.
+Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; Parameters: "--settings"; AppUserModelID: "{#AppUserModelID}"
 
 [Registry]
 ; Started at sign-in through the user's startup list, because Task Scheduler is denied on managed machines.

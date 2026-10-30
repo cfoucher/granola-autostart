@@ -172,20 +172,26 @@ def _rrule_part(rule: str, name: str) -> str | None:
     return None
 
 
+def feed_name(ics_text: str) -> str | None:
+    """The calendar's own name (X-WR-CALNAME), such as "Granola watch" or an account address."""
+    # A long header line continues on the next line after a leading space or tab.
+    header = re.sub(r"\r?\n[ \t]", "", ics_text.split("BEGIN:VEVENT", 1)[0])
+    for line in header.split("\n"):
+        name, _, value = line.partition(":")
+        if name.split(";", 1)[0].strip().upper() == "X-WR-CALNAME":
+            value = value.strip().replace("\\,", ",").replace("\\;", ";").replace("\\\\", "\\")
+            return value[:200] or None
+    return None
+
+
 def feed_owner(ics_text: str) -> str | None:
     """The address in X-WR-CALNAME, when the calendar is named after one.
 
     Google names a main calendar after its account, and invites list that same address.
     A secondary calendar such as "Granola watch" has a plain name and returns None.
     """
-    # A long header line continues on the next line after a leading space or tab.
-    header = re.sub(r"\r?\n[ \t]", "", ics_text.split("BEGIN:VEVENT", 1)[0])
-    for line in header.split("\n"):
-        name, _, value = line.partition(":")
-        if name.split(";", 1)[0].strip().upper() == "X-WR-CALNAME":
-            value = value.strip()
-            return value.casefold() if _EMAIL.fullmatch(value) else None
-    return None
+    name = feed_name(ics_text)
+    return name.casefold() if name and _EMAIL.fullmatch(name) else None
 
 
 def my_addresses(user_email: str, owners) -> frozenset[str]:
