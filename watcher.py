@@ -17,13 +17,13 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 import pystray
 
-from calendar_feed import fetch_ics, events_between
-from decide import Snapshot, evaluate, apply_result
+from calendar_feed import fetch_ics, events_between, merge_events
+from decide import Prompt, Snapshot, evaluate, apply_result
 from granola_launch import build_url, launch
-from presence import idle_seconds, is_present
-from settings import Settings, load_settings, setup_logging
+from presence import idle_seconds, is_present, is_unlocked
+from settings import ConfigError, Settings, load_settings, setup_logging
 from state_store import load_state, save_state
-from zoom_meetings import granola_running, zoom_session, zoom_window_title
+from zoom_meetings import granola_running, process_table, zoom_session, zoom_window_title
 
 log = logging.getLogger("granola_autostart")
 ROOT = Path(__file__).resolve().parent
@@ -32,6 +32,15 @@ TASK_LOGIN = "Granola Autostart"
 TASK_WATCHDOG = "Granola Autostart Watchdog"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "GranolaAutostart"
+ERROR_ALREADY_EXISTS = 183
+CREATE_NO_WINDOW = 0x08000000
+RESTART_DELAY_SECONDS = 3
+MAX_RESTART_DELAY_SECONDS = 300
+HEALTHY_RUN_SECONDS = 60
+RETURN_REFRESH_SECONDS = 60
+FAILED_FEED_RETRY_SECONDS = 60
+STUCK_REFRESH_SECONDS = 600
+THREAD_PRIORITY_BELOW_NORMAL = -1
 _MUTEX = None
 _SUPERVISOR_MUTEX = None
 
@@ -55,38 +64,86 @@ class Control:
         return until is not None and now < until
 
 
+def load_feed(url: str, now: datetime, settings: Settings) -> list:
+    return events_between(
+        fetch_ics(url),
+        now - timedelta(hours=12),
+        now + timedelta(hours=36),
+        ignore_title_substrings=settings.ignore_title_substrings,
+        user_email=settings.user_email,
+    )
+
+
+def lower_thread_priority() -> None:
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GetCurrentThread.restype = wintypes.HANDLE
+    kernel32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+    kernel32.SetThreadPriority.restype = wintypes.BOOL
+    kernel32.SetThreadPriority(kernel32.GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL)
+
+
 class CalendarCache:
+    """Feeds download on a background thread so a slow server never delays a Zoom prompt."""
+
     def __init__(self) -> None:
-        self.events = []
-        self.fetched_at: datetime | None = None
+        self._lock = threading.Lock()
+        self._events: list = []
+        self._by_url: dict[str, list] = {}
+        self._fetched_at: datetime | None = None
+        self._refresh_started: float | None = None
+        self._generation = 0
 
-    def current(self, now: datetime, settings: Settings) -> list:
-        if not settings.ics_url:
+    def current(self, now: datetime, settings: Settings, *, refresh: bool = True, eager: bool = False) -> list:
+        """Return cached events. Downloads only start when ``refresh`` is set, i.e. someone is at the PC."""
+        if not settings.calendar_urls():
             return []
-        stale = self.fetched_at is None or (now - self.fetched_at).total_seconds() >= settings.calendar_refresh_seconds
-        if stale:
-            self._refresh(now, settings)
-        return [event for event in self.events if event.end > now]
+        limit = min(settings.calendar_refresh_seconds, RETURN_REFRESH_SECONDS) if eager else settings.calendar_refresh_seconds
+        with self._lock:
+            stale = self._fetched_at is None or (now - self._fetched_at).total_seconds() >= limit
+            # A lookup that hangs past every socket timeout is abandoned rather than blocking refreshes forever.
+            stuck = self._refresh_started is not None and time.monotonic() - self._refresh_started > STUCK_REFRESH_SECONDS
+            if refresh and stale and (self._refresh_started is None or stuck):
+                self._generation += 1
+                self._refresh_started = time.monotonic()
+                threading.Thread(
+                    target=self._refresh,
+                    args=(settings, self._generation),
+                    name="calendar-refresh",
+                    daemon=True,
+                ).start()
+            events = self._events
+        return [event for event in events if event.end > now]
 
-    def _refresh(self, now: datetime, settings: Settings) -> None:
-        if not settings.ics_url.lower().startswith(("http://", "https://")):
-            log.error("ics_url must be an http(s) address")
-            self.fetched_at = now
-            return
+    def _refresh(self, settings: Settings, generation: int) -> None:
         try:
-            text = fetch_ics(settings.ics_url)
-            self.events = events_between(
-                text,
-                now - timedelta(hours=12),
-                now + timedelta(hours=36),
-                ignore_title_substrings=settings.ignore_title_substrings,
-                user_email=settings.user_email,
-            )
-            self.fetched_at = now
-            log.info("calendar feed has %s upcoming events", len(self.events))
-        except Exception:
-            log.exception("calendar fetch failed; keeping the previous list")
-            self.fetched_at = now
+            lower_thread_priority()
+            now = datetime.now().astimezone()
+            urls = settings.calendar_urls()
+            fresh: dict[str, list] = {}
+            failed = False
+            for index, url in enumerate(urls, start=1):
+                try:
+                    fresh[url] = load_feed(url, now, settings)
+                except Exception as error:
+                    failed = True
+                    log.error("calendar feed %s failed (%s); keeping its previous events", index, type(error).__name__)
+            fetched_at = now
+            if failed:
+                fetched_at = now - timedelta(seconds=max(0, settings.calendar_refresh_seconds - FAILED_FEED_RETRY_SECONDS))
+            with self._lock:
+                if generation != self._generation:
+                    return
+                self._by_url.update(fresh)
+                merged = merge_events(*(self._by_url.get(url, []) for url in urls))
+                self._events = merged
+                self._fetched_at = fetched_at
+            log.info("calendar feeds have %s upcoming events from %s calendars", len(merged), len(urls))
+        except Exception as error:
+            log.error("calendar refresh failed (%s)", type(error).__name__)
+        finally:
+            with self._lock:
+                if generation == self._generation:
+                    self._refresh_started = None
 
 
 def create_mutex(name: str) -> tuple[int, int]:
@@ -107,7 +164,7 @@ def acquire_single_instance() -> bool:
     global _MUTEX
     handle, error = create_mutex("Local\\GranolaAutostart")
     _MUTEX = handle
-    return error != 183
+    return handle != 0 and error != ERROR_ALREADY_EXISTS
 
 
 def ui_python() -> str:
@@ -117,10 +174,17 @@ def ui_python() -> str:
     return sys.executable
 
 
+def notice_command(title: str, seconds: int, kind: str) -> list[str]:
+    # "--title=" keeps a title that starts with "-" from being read as an option.
+    return [ui_python(), str(NOTICE), f"--title={title}", f"--seconds={max(1, seconds)}", f"--kind={kind}"]
+
+
 def ask_notice(title: str, seconds: int, kind: str) -> bool:
-    command = [ui_python(), str(NOTICE), "--title", title, "--seconds", str(max(1, seconds)), "--kind", kind]
     try:
-        completed = subprocess.run(command)
+        completed = subprocess.run(notice_command(title, seconds, kind), timeout=max(1, seconds) + 60)
+    except subprocess.TimeoutExpired:
+        log.error("countdown window did not close; not starting Granola")
+        return False
     except Exception:
         log.exception("countdown window failed to open")
         return False
@@ -133,17 +197,20 @@ def ask_notice(title: str, seconds: int, kind: str) -> bool:
 
 def run_loop(settings: Settings, control: Control, state_lock: threading.Lock, state) -> None:
     cache = CalendarCache()
-    if not settings.ics_url:
-        log.warning("No ICS url configured. Calendar meetings will not start notes. Zoom joins still will.")
+    if not settings.calendar_urls():
+        log.warning("No calendar feed configured. Calendar meetings will not start notes. Zoom joins still will.")
+    was_present = False
     while not control.stop.is_set():
         try:
             now = datetime.now().astimezone()
-            session_id, age = zoom_session()
+            table = process_table()
+            session_id, age = zoom_session(table)
             in_zoom = session_id is not None
-            events = cache.current(now, settings)
             present = is_present(settings.idle_seconds)
-            running = granola_running()
-            title = zoom_window_title() if in_zoom else None
+            events = cache.current(now, settings, refresh=present, eager=present and not was_present)
+            was_present = present
+            running = granola_running(table)
+            title = zoom_window_title(table) if in_zoom else None
             with state_lock:
                 prompt = evaluate(
                     now,
@@ -164,28 +231,43 @@ def run_loop(settings: Settings, control: Control, state_lock: threading.Lock, s
                 _warn_if_launch_missing(state, now)
                 save_state(state, control.current_pause())
             if prompt is not None and not control.stop.is_set():
-                log.info("countdown for %s (%s)", prompt.title, prompt.kind)
-                accepted = ask_notice(prompt.title, settings.countdown_seconds, prompt.kind)
-                if control.stop.is_set():
-                    break
-                started = False
-                if not accepted:
-                    log.info("cancelled Granola for %s", prompt.title)
-                elif settings.dry_run:
-                    launch(build_url(prompt.payload), dry_run=True)
-                else:
-                    try:
-                        launch(build_url(prompt.payload), dry_run=False)
-                        started = True
-                        log.info("started Granola for %s", prompt.title)
-                    except Exception:
-                        log.exception("could not start Granola for %s", prompt.title)
-                with state_lock:
-                    apply_result(state, prompt, started, datetime.now().astimezone())
-                    save_state(state, control.current_pause())
+                handle_prompt(prompt, settings, control, state_lock, state)
         except Exception:
             log.exception("watcher tick failed")
         control.stop.wait(settings.poll_seconds)
+
+
+def still_present(settings: Settings) -> bool:
+    """The countdown itself adds idle time, so allow for it on top of the presence limit."""
+    return is_unlocked() and idle_seconds() <= settings.idle_seconds + settings.countdown_seconds + 5
+
+
+def handle_prompt(prompt: Prompt, settings: Settings, control: Control, state_lock: threading.Lock, state) -> None:
+    log.info("countdown for %s (%s)", prompt.title, prompt.kind)
+    accepted = ask_notice(prompt.title, settings.countdown_seconds, prompt.kind)
+    if control.stop.is_set():
+        return
+    if accepted and control.paused(datetime.now().astimezone()):
+        log.info("paused during the countdown; not starting Granola for %s", prompt.title)
+        return
+    if accepted and not still_present(settings):
+        log.info("left the computer during the countdown; will ask again for %s", prompt.title)
+        return
+    started = False
+    if not accepted:
+        log.info("cancelled Granola for %s", prompt.title)
+    elif settings.dry_run:
+        launch(build_url(prompt.payload), dry_run=True)
+    else:
+        try:
+            launch(build_url(prompt.payload), dry_run=False)
+            started = True
+            log.info("started Granola for %s", prompt.title)
+        except Exception:
+            log.exception("could not start Granola for %s", prompt.title)
+    with state_lock:
+        apply_result(state, prompt, started, datetime.now().astimezone())
+        save_state(state, control.current_pause())
 
 
 def _warn_if_launch_missing(state, now: datetime) -> None:
@@ -206,8 +288,24 @@ def tray_image() -> Image.Image:
     return image
 
 
-def run_tray(settings: Settings) -> None:
+def warn_user(message: str) -> None:
+    """One visible warning, on its own thread so the watcher keeps running."""
+
+    def show() -> None:
+        mb_iconwarning, mb_setforeground, mb_topmost = 0x30, 0x10000, 0x40000
+        ctypes.windll.user32.MessageBoxW(None, message, "Granola autostart", mb_iconwarning | mb_setforeground | mb_topmost)
+
+    threading.Thread(target=show, name="config-warning", daemon=True).start()
+
+
+def run_tray(settings: Settings, config_error: str | None = None) -> None:
     control = Control()
+    idle_title = "Granola autostart: config.json error" if config_error else "Granola autostart"
+    if config_error:
+        warn_user(
+            f"{config_error}\n\nUsing default settings until it is fixed, so calendar meetings will not prompt. "
+            "Zoom joins still will. Fix the file, then choose Quit from the tray icon to reload it."
+        )
     state_lock = threading.Lock()
     state, saved_pause = load_state()
     if saved_pause is not None:
@@ -237,7 +335,7 @@ def run_tray(settings: Settings) -> None:
         pause_until(until, icon, "Paused until tomorrow")
 
     def on_resume(icon: pystray.Icon, _item) -> None:
-        pause_until(None, icon, "Granola autostart")
+        pause_until(None, icon, idle_title)
 
     def on_quit(icon: pystray.Icon, _item) -> None:
         log.info("quitting")
@@ -247,7 +345,7 @@ def run_tray(settings: Settings) -> None:
     icon = pystray.Icon(
         "granola-autostart",
         tray_image(),
-        "Granola autostart",
+        idle_title,
         menu=pystray.Menu(
             pystray.MenuItem("Pause for 1 hour", on_hour),
             pystray.MenuItem("Pause for today", on_today),
@@ -265,7 +363,7 @@ def acquire_supervisor() -> bool:
     global _SUPERVISOR_MUTEX
     handle, error = create_mutex("Local\\GranolaAutostartSupervisor")
     _SUPERVISOR_MUTEX = handle
-    return error != 183
+    return handle != 0 and error != ERROR_ALREADY_EXISTS
 
 
 def quoted_command(*extra: str) -> str:
@@ -287,7 +385,7 @@ def remove_run_key() -> None:
 
 
 def try_scheduled_tasks() -> bool:
-    command = f"{ui_python()} {Path(__file__).resolve()}"
+    command = quoted_command()
     try:
         subprocess.check_call(
             ["schtasks", "/Create", "/F", "/TN", TASK_LOGIN, "/SC", "ONLOGON", "/TR", command],
@@ -309,6 +407,7 @@ def try_scheduled_tasks() -> bool:
 def install_tasks() -> str:
     # The new process takes the single-instance mutex. This installer must not.
     if try_scheduled_tasks():
+        remove_run_key()
         subprocess.Popen([ui_python(), str(Path(__file__).resolve())], cwd=str(ROOT), close_fds=True)
         return "tasks"
     log.warning("Task Scheduler refused the install. Starting from the user startup list instead.")
@@ -317,15 +416,21 @@ def install_tasks() -> str:
     return "startup"
 
 
+def _powershell_like(text: str) -> str:
+    escaped = "".join(f"`{char}" if char in "[]*?`" else char for char in text)
+    return escaped.replace("'", "''")
+
+
 def stop_watchers() -> None:
+    script_path = _powershell_like(str(Path(__file__).resolve()))
     script = (
         "$procs = Get-CimInstance Win32_Process | Where-Object { "
-        "$_.Name -match 'python' -and $_.CommandLine -like '*granola-autostart*watcher.py*' "
-        "-and $_.CommandLine -notlike '*--uninstall*' }; "
+        f"$_.Name -match 'python' -and $_.CommandLine -like '*{script_path}*' "
+        "-and $_.CommandLine -notlike '*--uninstall*' -and $_.CommandLine -notlike '*--install*' }; "
         "$procs | Sort-Object { if ($_.CommandLine -like '*--supervise*') { 0 } else { 1 } } | "
         "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
     )
-    subprocess.call(["powershell", "-NoProfile", "-Command", script])
+    subprocess.call(["powershell", "-NoProfile", "-Command", script], creationflags=CREATE_NO_WINDOW)
 
 
 def uninstall_tasks() -> None:
@@ -342,13 +447,24 @@ def supervise() -> int:
     log.info("supervisor running")
     python = ui_python()
     script = str(Path(__file__).resolve())
+    delay = RESTART_DELAY_SECONDS
     while True:
+        started = time.monotonic()
         completed = subprocess.run([python, script], cwd=str(ROOT))
-        log.info("watcher exited %s; restarting in 3s", completed.returncode)
-        time.sleep(3)
+        quick = time.monotonic() - started < HEALTHY_RUN_SECONDS
+        if not quick:
+            delay = RESTART_DELAY_SECONDS
+        log.info("watcher exited %s; restarting in %ss", completed.returncode, delay)
+        time.sleep(delay)
+        if quick:
+            delay = min(delay * 2, MAX_RESTART_DELAY_SECONDS)
 
 
-def print_check(settings: Settings) -> None:
+def print_check(settings: Settings, config_error: str | None) -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if config_error:
+        print(f"config: {config_error} (using defaults)")
     now = datetime.now().astimezone()
     present = is_present(settings.idle_seconds)
     session_id, age = zoom_session()
@@ -357,16 +473,17 @@ def print_check(settings: Settings) -> None:
     if age is not None:
         print(f"zoom age: {age:.0f}s")
     print(f"granola running: {granola_running()}")
-    if not settings.ics_url:
-        print("calendar: no ics_url in config")
+    urls = settings.calendar_urls()
+    if not urls:
+        print("calendar: no calendar feed in config")
         return
-    events = events_between(
-        fetch_ics(settings.ics_url),
-        now - timedelta(hours=12),
-        now + timedelta(hours=36),
-        ignore_title_substrings=settings.ignore_title_substrings,
-        user_email=settings.user_email,
-    )
+    loaded = []
+    for index, url in enumerate(urls, start=1):
+        try:
+            loaded.append(load_feed(url, now, settings))
+        except Exception as error:
+            print(f"calendar feed {index}: failed ({type(error).__name__})")
+    events = merge_events(*loaded)
     upcoming = [event for event in events if event.end > now][:8]
     if not upcoming:
         print("calendar: no upcoming events in the feed")
@@ -385,8 +502,26 @@ def main() -> int:
     parser.add_argument("--preview-notice", action="store_true", help="show the countdown once")
     parser.add_argument("--dry-run", action="store_true", help="show countdowns but do not launch Granola")
     args = parser.parse_args()
-    logger = setup_logging()
-    settings = load_settings()
+    watching = not (args.supervise or args.install or args.uninstall or args.check or args.preview_notice)
+    if watching and not acquire_single_instance():
+        if sys.stdout is not None:
+            print("another watcher is already running; run --uninstall first to test with --dry-run")
+        return 0
+    if args.supervise:
+        log_name = "supervisor-log.txt"
+    elif watching:
+        log_name = "log.txt"
+    else:
+        log_name = "cli-log.txt"
+    logger = setup_logging(log_name)
+    config_error = None
+    try:
+        settings = load_settings()
+    except ConfigError as error:
+        config_error = str(error)
+        settings = Settings()
+        if not args.supervise:
+            logger.error("%s; using defaults until it is fixed", config_error)
     if args.dry_run:
         settings.dry_run = True
     if args.preview_notice:
@@ -396,8 +531,8 @@ def main() -> int:
         print("would start" if started else "cancelled")
         return 0
     if args.check:
-        print_check(settings)
-        return 0
+        print_check(settings, config_error)
+        return 1 if config_error else 0
     if args.supervise:
         return supervise()
     if args.uninstall:
@@ -409,11 +544,8 @@ def main() -> int:
         logger.info("granola autostart installed (%s)", mode)
         print(f"installed via {mode}")
         return 0
-    if not acquire_single_instance():
-        logger.info("another watcher is already running")
-        return 0
     logger.info("granola autostart running (dry_run=%s)", settings.dry_run)
-    run_tray(settings)
+    run_tray(settings, config_error)
     return 0
 
 

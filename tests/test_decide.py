@@ -120,13 +120,160 @@ def test_accepting_a_prompt_arms_crash_recovery():
     prompt, _ = decide(snap(events=(meeting,)), state)
     apply_result(state, prompt, accepted=True, now=NOW)
     assert state.active_launch is not None
-    state.active_launch.seen_running = True
-    later = NOW + timedelta(seconds=30)
+    prompt, state = decide(snap(events=(meeting,), granola_running=True), state, now=NOW + timedelta(seconds=5))
+    assert prompt is None
+    gone = NOW + timedelta(seconds=30)
+    prompt, state = decide(snap(events=(meeting,), granola_running=False), state, now=gone)
+    assert prompt is None
+    later = gone + timedelta(seconds=10)
     prompt, state = decide(snap(events=(meeting,), granola_running=False), state, now=later)
     assert prompt is not None
     assert prompt.kind == "crash"
     apply_result(state, prompt, accepted=False, now=later)
     prompt, _state = decide(snap(events=(meeting,), granola_running=False), state, now=later)
+    assert prompt is None
+
+
+def test_a_brief_granola_restart_is_not_a_crash():
+    meeting = event()
+    state = WatcherState()
+    prompt, _ = decide(snap(events=(meeting,)), state)
+    apply_result(state, prompt, accepted=True, now=NOW)
+    decide(snap(events=(meeting,), granola_running=True), state, now=NOW + timedelta(seconds=20))
+    decide(snap(events=(meeting,), granola_running=False), state, now=NOW + timedelta(seconds=25))
+    prompt, state = decide(snap(events=(meeting,), granola_running=True), state, now=NOW + timedelta(seconds=30))
+    assert prompt is None
+    prompt, _state = decide(snap(events=(meeting,), granola_running=False), state, now=NOW + timedelta(seconds=35))
+    assert prompt is None
+
+
+def test_cancelling_another_meeting_keeps_crash_recovery_for_the_running_one():
+    first = event(summary="Standup", start=NOW - timedelta(minutes=5), minutes=60, event_id="first")
+    second = event(summary="Design review", start=NOW + timedelta(minutes=10), event_id="second")
+    state = WatcherState()
+    prompt, _ = decide(snap(events=(first, second)), state)
+    apply_result(state, prompt, accepted=True, now=NOW)
+    decide(snap(events=(first, second), granola_running=True), state, now=NOW + timedelta(seconds=5))
+    at_second = second.start + timedelta(seconds=1)
+    prompt, state = decide(snap(events=(first, second), granola_running=True), state, now=at_second)
+    assert prompt is not None and prompt.title == "Design review"
+    apply_result(state, prompt, accepted=False, now=at_second)
+    assert state.active_launch is not None
+    assert state.active_launch.title == "Standup"
+
+
+def test_adhoc_zoom_crash_recovery_ends_with_the_call():
+    state = WatcherState()
+    zoom = dict(in_zoom=True, zoom_session_id="4:10", zoom_age_seconds=3, zoom_title="Roadmap")
+    prompt, state = decide(snap(**zoom), state)
+    apply_result(state, prompt, accepted=True, now=NOW)
+    decide(snap(**zoom, granola_running=True), state, now=NOW + timedelta(seconds=5))
+    assert state.active_launch is not None
+    after_call = NOW + timedelta(minutes=30)
+    decide(snap(granola_running=True), state, now=after_call)
+    assert state.active_launch is None
+    prompt, _state = decide(snap(granola_running=False), state, now=after_call + timedelta(minutes=1))
+    assert prompt is None
+
+
+def test_an_extended_meeting_does_not_prompt_again():
+    meeting = event(minutes=30)
+    state = WatcherState()
+    prompt, _ = decide(snap(events=(meeting,)), state)
+    apply_result(state, prompt, accepted=False, now=NOW)
+    extended = CalendarEvent(id=meeting.id, summary=meeting.summary, start=meeting.start, end=meeting.end + timedelta(minutes=30))
+    decide(snap(events=(extended,)), state, now=NOW + timedelta(minutes=20))
+    prompt, _state = decide(snap(events=(extended,)), state, now=NOW + timedelta(minutes=40))
+    assert prompt is None
+
+
+def test_joining_zoom_early_matches_the_next_meeting_not_the_one_ending():
+    ending = event(summary="Standup", start=NOW - timedelta(minutes=25), minutes=30, event_id="ending")
+    nextup = event(summary="Design review", start=NOW + timedelta(minutes=5), event_id="next")
+    prompt, state = decide(snap(in_zoom=True, zoom_session_id="4:10", zoom_age_seconds=3, events=(ending, nextup)))
+    assert prompt is not None
+    assert prompt.title == "Design review"
+    apply_result(state, prompt, accepted=False, now=NOW)
+    still_in_call = snap(in_zoom=True, zoom_session_id="4:10", zoom_age_seconds=400, events=(ending, nextup))
+    prompt, _state = decide(still_in_call, state, now=nextup.start + timedelta(seconds=5))
+    assert prompt is not None
+    assert prompt.title == "Design review"
+
+
+def test_zoom_rejoin_near_the_end_of_a_decided_meeting_leaves_the_next_one_alone():
+    current = event(summary="Standup", start=NOW - timedelta(minutes=52), minutes=60, event_id="current")
+    nextup = event(summary="Design review", start=current.end, event_id="next")
+    state = WatcherState()
+    first = decide(snap(events=(current, nextup)), state, now=current.start)[0]
+    apply_result(state, first, accepted=True, now=current.start)
+    prompt, state = decide(
+        snap(in_zoom=True, zoom_session_id="7:20", zoom_age_seconds=3, events=(current, nextup)),
+        state,
+    )
+    assert prompt is None
+    prompt, _state = decide(snap(events=(current, nextup)), state, now=nextup.start + timedelta(seconds=5))
+    assert prompt is not None
+    assert prompt.title == "Design review"
+
+
+def test_a_calendar_that_loads_after_a_zoom_prompt_does_not_prompt_again():
+    zoom = dict(in_zoom=True, zoom_session_id="4:10", zoom_age_seconds=3, zoom_title="Roadmap")
+    prompt, state = decide(snap(**zoom))
+    assert prompt.payload["id"].startswith("zoom-")
+    apply_result(state, prompt, accepted=True, now=NOW)
+    current = event(summary="Roadmap", start=NOW - timedelta(minutes=2), event_id="current")
+    later = event(summary="Overlap", start=NOW + timedelta(minutes=20), event_id="later")
+    prompt, state = decide(snap(**zoom, events=(current, later)), state, now=NOW + timedelta(seconds=10))
+    assert prompt is None
+    prompt, _state = decide(snap(**zoom, events=(current, later)), state, now=later.start + timedelta(seconds=5))
+    assert prompt is not None
+    assert prompt.title == "Overlap"
+
+
+def test_a_zoom_call_found_already_running_does_not_hide_the_calendar_prompt():
+    meeting = event(start=NOW - timedelta(minutes=20))
+    prompt, _state = decide(snap(in_zoom=True, zoom_session_id="4:10", zoom_age_seconds=900, events=(meeting,)))
+    assert prompt is not None
+    assert prompt.kind == "calendar"
+
+
+def test_a_zoom_call_right_after_a_decided_meeting_is_adhoc():
+    meeting = event(start=NOW - timedelta(minutes=40), minutes=30)
+    state = WatcherState()
+    first = decide(snap(events=(meeting,)), state, now=meeting.start)[0]
+    apply_result(state, first, accepted=True, now=meeting.start)
+    prompt, _state = decide(
+        snap(in_zoom=True, zoom_session_id="8:30", zoom_age_seconds=3, zoom_title="Hallway chat", events=(meeting,)),
+        state,
+    )
+    assert prompt is not None
+    assert prompt.title == "Hallway chat"
+    assert prompt.payload["id"].startswith("zoom-")
+
+
+def test_crash_recovery_follows_a_late_extension():
+    meeting = event(minutes=30)
+    state = WatcherState()
+    prompt, _ = decide(snap(events=(meeting,)), state)
+    apply_result(state, prompt, accepted=True, now=NOW)
+    decide(snap(events=(meeting,), granola_running=True), state, now=NOW + timedelta(seconds=5))
+    decide(snap(events=(), granola_running=True), state, now=meeting.end + timedelta(minutes=1))
+    extended = CalendarEvent(id=meeting.id, summary=meeting.summary, start=meeting.start, end=meeting.end + timedelta(minutes=30))
+    decide(snap(events=(extended,), granola_running=True), state, now=meeting.end + timedelta(minutes=3))
+    decide(snap(events=(extended,), granola_running=False), state, now=meeting.end + timedelta(minutes=4))
+    prompt, _state = decide(snap(events=(extended,), granola_running=False), state, now=meeting.end + timedelta(minutes=5))
+    assert prompt is not None
+    assert prompt.kind == "crash"
+
+
+def test_an_extension_seen_after_the_old_end_does_not_prompt_again():
+    meeting = event(minutes=30)
+    state = WatcherState()
+    prompt, _ = decide(snap(events=(meeting,)), state)
+    apply_result(state, prompt, accepted=False, now=NOW)
+    decide(snap(events=()), state, now=meeting.end + timedelta(minutes=1))
+    extended = CalendarEvent(id=meeting.id, summary=meeting.summary, start=meeting.start, end=meeting.end + timedelta(minutes=30))
+    prompt, _state = decide(snap(events=(extended,)), state, now=meeting.end + timedelta(minutes=3))
     assert prompt is None
 
 

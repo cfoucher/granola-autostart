@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 
 from decide import ActiveLaunch, WatcherState
 from settings import state_path
+
+log = logging.getLogger("granola_autostart")
+_last_written: str | None = None
 
 
 def load_state() -> tuple[WatcherState, datetime | None]:
@@ -15,37 +19,48 @@ def load_state() -> tuple[WatcherState, datetime | None]:
         return WatcherState(), None
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        return _parse(raw)
+    except Exception as error:
+        log.warning("state.json unreadable (%s); starting fresh", type(error).__name__)
         return WatcherState(), None
+
+
+def _parse(raw: dict) -> tuple[WatcherState, datetime | None]:
     state = WatcherState(
-        handled={key: _dt(value) for key, value in (raw.get("handled") or {}).items()},
+        handled={str(key): _dt(value) for key, value in (raw.get("handled") or {}).items()},
         zoom_session_id=raw.get("zoom_session_id"),
         zoom_needs_decision=bool(raw.get("zoom_needs_decision")),
+        zoom_decided_session=raw.get("zoom_decided_session"),
+        zoom_decided_at=_dt(raw["zoom_decided_at"]) if raw.get("zoom_decided_at") else None,
     )
     launch = raw.get("active_launch")
     if isinstance(launch, dict) and launch.get("expires_at") and launch.get("launched_at"):
+        missing = launch.get("missing_since")
         state.active_launch = ActiveLaunch(
             title=str(launch.get("title") or "Meeting"),
             payload=launch.get("payload") or {},
-            keys=tuple(launch.get("keys") or ()),
+            keys=tuple(str(key) for key in launch.get("keys") or ()),
             expires_at=_dt(launch["expires_at"]),
             seen_running=bool(launch.get("seen_running")),
             launched_at=_dt(launch["launched_at"]),
             warned=bool(launch.get("warned")),
+            zoom_session_id=launch.get("zoom_session_id"),
+            missing_since=_dt(missing) if missing else None,
         )
     pause = raw.get("pause_until")
     return state, _dt(pause) if pause else None
 
 
 def save_state(state: WatcherState, pause_until: datetime | None) -> None:
-    path = state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    global _last_written
     launch = state.active_launch
     payload = {
         "version": 1,
         "handled": {key: until.isoformat() for key, until in state.handled.items()},
         "zoom_session_id": state.zoom_session_id,
         "zoom_needs_decision": state.zoom_needs_decision,
+        "zoom_decided_session": state.zoom_decided_session,
+        "zoom_decided_at": state.zoom_decided_at.isoformat() if state.zoom_decided_at else None,
         "pause_until": pause_until.isoformat() if pause_until else None,
         "active_launch": None
         if launch is None
@@ -57,11 +72,19 @@ def save_state(state: WatcherState, pause_until: datetime | None) -> None:
             "seen_running": launch.seen_running,
             "launched_at": launch.launched_at.isoformat(),
             "warned": launch.warned,
+            "zoom_session_id": launch.zoom_session_id,
+            "missing_since": launch.missing_since.isoformat() if launch.missing_since else None,
         },
     }
+    text = json.dumps(payload, indent=2) + "\n"
+    path = state_path()
+    if _last_written == f"{path}\n{text}" and path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    temporary.write_text(text, encoding="utf-8")
     temporary.replace(path)
+    _last_written = f"{path}\n{text}"
 
 
 def _dt(value: str) -> datetime:

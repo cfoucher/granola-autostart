@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import logging
+import time
+import urllib.error
 import urllib.request
+import zlib
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from icalendar import Calendar
 import recurring_ical_events
 
 log = logging.getLogger("granola_autostart")
+MAX_FEED_BYTES = 64 * 1024 * 1024
+PREFILTER_MARGIN = timedelta(days=7)
 
 
 @dataclass(frozen=True)
@@ -31,10 +36,138 @@ class CalendarEvent:
         }
 
 
-def fetch_ics(url: str, timeout: float = 20) -> str:
-    request = urllib.request.Request(url, headers={"User-Agent": "granola-autostart"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read().decode("utf-8", errors="replace")
+def merge_events(*groups: list[CalendarEvent]) -> list[CalendarEvent]:
+    """Keep one copy when the same meeting is on more than one calendar."""
+    by_key: dict[str, CalendarEvent] = {}
+    for events in groups:
+        for event in events:
+            by_key.setdefault(event.key(), event)
+    return sorted(by_key.values(), key=lambda event: event.start)
+
+
+def normalize_feed_url(url: str) -> str:
+    """Secret calendar addresses carry a credential, so only https is allowed."""
+    cleaned = url.strip()
+    if cleaned.casefold().startswith("webcal://"):
+        cleaned = "https://" + cleaned[len("webcal://") :]
+    if not cleaned.casefold().startswith("https://"):
+        raise ValueError("calendar feeds must use https")
+    return cleaned
+
+
+class _HttpsOnlyRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not newurl.casefold().startswith("https://"):
+            raise urllib.error.HTTPError(req.full_url, code, "redirect away from https refused", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(_HttpsOnlyRedirects)
+
+
+def fetch_ics(url: str, timeout: float = 30) -> str:
+    request = urllib.request.Request(
+        normalize_feed_url(url),
+        headers={"User-Agent": "granola-autostart", "Accept-Encoding": "gzip"},
+    )
+    deadline = time.monotonic() + timeout * 4
+    with _opener.open(request, timeout=timeout) as response:
+        body = _read_capped(response, MAX_FEED_BYTES, deadline)
+        encoding = (response.headers.get("Content-Encoding") or "").strip().casefold()
+    if encoding == "gzip":
+        body = _gunzip_capped(body, MAX_FEED_BYTES)
+    return body.decode("utf-8", errors="replace")
+
+
+def _read_capped(response, limit: int, deadline: float) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        if time.monotonic() > deadline:
+            raise TimeoutError("calendar download took too long")
+        chunk = response.read(64 * 1024)
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > limit:
+            raise ValueError("calendar feed is too large")
+        chunks.append(chunk)
+
+
+def _gunzip_capped(body: bytes, limit: int) -> bytes:
+    inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    data = inflater.decompress(body, limit + 1)
+    if len(data) > limit or inflater.unconsumed_tail:
+        raise ValueError("calendar feed is too large")
+    if not inflater.eof:
+        raise ValueError("calendar download was cut short")
+    return data
+
+
+def prefilter_ics(ics_text: str, window_start: datetime, window_end: datetime) -> str:
+    """Drop one-off events far from the window before the slow full parse.
+
+    Recurring masters and moved instances are always kept, because either can
+    produce or hide an occurrence inside the window.
+    """
+    low = (window_start - PREFILTER_MARGIN).strftime("%Y%m%d")
+    high = (window_end + PREFILTER_MARGIN).strftime("%Y%m%d")
+    kept: list[str] = []
+    block: list[str] | None = None
+    # Only "\n" ends an iCalendar line; splitlines() would also split on characters inside descriptions.
+    for line in ics_text.split("\n"):
+        if block is None:
+            if line.startswith("BEGIN:VEVENT"):
+                block = [line]
+            else:
+                kept.append(line)
+            continue
+        block.append(line)
+        if line.startswith("END:VEVENT"):
+            if _block_may_matter(block, low, high):
+                kept.extend(block)
+            block = None
+    if block:
+        kept.extend(block)
+    return "\n".join(kept)
+
+
+def _block_may_matter(block: list[str], low: str, high: str) -> bool:
+    fields: dict[str, str] = {}
+    depth = 0
+    for line in block[1:-1]:
+        if line.startswith("BEGIN:"):
+            depth += 1
+        elif line.startswith("END:"):
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            name = line.split(":", 1)[0].split(";", 1)[0].strip().upper()
+            fields.setdefault(name, line.rsplit(":", 1)[-1].strip())
+    start = _stamp(fields.get("DTSTART"))
+    if start is None or "RDATE" in fields:
+        return True
+    if "RRULE" in fields:
+        until = _stamp(_rrule_part(fields["RRULE"], "UNTIL"))
+        return start <= high and (until is None or until >= low)
+    if "RECURRENCE-ID" in fields:
+        moved_from = _stamp(fields["RECURRENCE-ID"])
+        return moved_from is None or low <= moved_from <= high or low <= start <= high
+    return low <= start <= high
+
+
+def _stamp(value: str | None) -> str | None:
+    if not value:
+        return None
+    stamp = value[:8]
+    return stamp if len(stamp) == 8 and stamp.isdigit() else None
+
+
+def _rrule_part(rule: str, name: str) -> str | None:
+    for part in rule.split(";"):
+        key, _, value = part.partition("=")
+        if key.strip().upper() == name:
+            return value.strip()
+    return None
 
 
 def events_between(
@@ -45,12 +178,12 @@ def events_between(
     ignore_title_substrings: tuple[str, ...] = (),
     user_email: str = "",
 ) -> list[CalendarEvent]:
-    calendar = Calendar.from_ical(ics_text)
+    calendar = Calendar.from_ical(prefilter_ics(ics_text, window_start, window_end))
     local_zone = datetime.now().astimezone().tzinfo or timezone.utc
     series_uids = {
         str(component.get("uid") or "").strip()
         for component in calendar.walk("VEVENT")
-        if component.get("rrule") and str(component.get("uid") or "").strip()
+        if (component.get("rrule") or component.get("recurrence-id")) and str(component.get("uid") or "").strip()
     }
     found: list[CalendarEvent] = []
     instances = recurring_ical_events.of(calendar).between(window_start, window_end)

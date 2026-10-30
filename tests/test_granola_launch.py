@@ -37,6 +37,28 @@ def test_launch_url_starts_transcription_without_opening_zoom():
     assert json.loads(params["event"]) == event
 
 
+def test_awkward_titles_survive_the_double_encoding():
+    event = {
+        "id": "x",
+        "summary": "Q&A #3 + café = 100%?\nnext",
+        "start": {"dateTime": "2026-10-28T10:00:00-07:00"},
+        "end": {"dateTime": "2026-10-28T10:30:00-07:00"},
+    }
+    params = decoded_params(build_url(event))
+    assert json.loads(params["event"]) == event
+    assert set(params) == {"creation_source", "auto_transcribe", "event"}
+
+
+def test_notice_title_starting_with_a_dash_is_not_an_option():
+    from notice import build_parser
+    from watcher import notice_command
+
+    command = notice_command("-- standup", 10, "calendar")
+    args = build_parser().parse_args(command[2:])
+    assert args.title == "-- standup"
+    assert args.seconds == 10
+
+
 def test_adhoc_zoom_title_ignores_the_generic_window_name():
     assert meeting_title("Zoom Meeting") == "Zoom meeting"
     assert meeting_title("Roadmap") == "Roadmap"
