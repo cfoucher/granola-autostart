@@ -76,7 +76,7 @@ Designs: [Granola Autostart app](https://claude.ai/artifact/BuZ3FWA3LoZ8qbzzokkP
     - **Starting notes**: countdown length (5, 10, 15, 20, or 30 seconds), **Preview** (shows the card, never starts Granola), idle time, and title words to skip.
     - **About**: version, update status with **Check now** (only once item 20 exists), the last start and whether Granola opened, **Open log folder**, and **Run setup again**.
 
-    A side panel shows the watcher's state ("Watching" and the next meeting).
+    A side panel shows the watcher's state, with the tray menu's commands, so nothing in the tray is missing from Settings (the "Status panel states" board): Watching or Taking notes with **Pause** (1 hour, rest of today), Paused with **Resume**, Needs attention with **Fix**, Not running with **Start**, and Starting… for the seconds before a new watcher reports. **Quit** is in About. Settings sends these to the watcher as named Windows events (`commands.py`), and the watcher exits with code 3 after Quit so the supervisor stops instead of restarting it.
 12. **First-run setup**, four steps. It opens on first run when no calendar is configured and setup has not been finished or skipped.
     - Welcome, showing the card. **Zoom only for now** skips to the end.
     - How to copy the secret address, with Google and Outlook tabs. Includes "Not there? Your admin may have turned it off."

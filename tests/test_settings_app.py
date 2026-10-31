@@ -1,4 +1,6 @@
 import json
+import os
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -97,6 +99,14 @@ def test_setup_saves_the_calendar_and_marks_itself_done(api):
     assert settings.setup_complete is True
 
 
+def test_setup_done_turns_the_window_into_settings(api):
+    api.page = "setup"
+    api.finish_setup(GOOD, None)
+    view = api.open_settings()
+    assert (view["page"], view["section"]) == ("settings", "calendars")
+    assert [c["id"] for c in view["settings"]["calendars"]] == [feed_id(GOOD)]
+
+
 def test_zoom_only_setup_is_remembered(api):
     api.skip_setup()
     assert load_settings().setup_complete is True and load_settings().calendar_urls() == []
@@ -113,3 +123,55 @@ def test_relative_times():
     assert settings_app.ago(NOW - timedelta(seconds=20), NOW) == "just now"
     assert settings_app.ago(NOW - timedelta(minutes=1), NOW) == "1 minute ago"
     assert settings_app.ago(NOW - timedelta(hours=3), NOW) == "3 hours ago"
+
+
+def write_status(tmp_path, **status):
+    (tmp_path / "status.json").write_text(json.dumps(status), encoding="utf-8")
+
+
+def test_the_status_box_follows_the_watcher(api, tmp_path, monkeypatch):
+    write_status(tmp_path, next_meeting={"title": "Design crit", "start": (NOW + timedelta(hours=1)).isoformat()})
+    status = api.load()["status"]
+    assert status["state"] == "watching" and status["detail"].startswith("Next: Design crit at ")
+    write_status(tmp_path)
+    assert api.load()["status"]["detail"] == "No meetings coming up. Zoom calls still start notes."
+    write_status(tmp_path, taking_notes={"title": "Design crit", "since": NOW.isoformat()})
+    assert api.load()["status"]["state"] == "notes"
+    in_an_hour = (NOW + timedelta(hours=1)).isoformat()
+    write_status(tmp_path, paused_until=in_an_hour)
+    status = api.load()["status"]
+    assert (status["state"], status["paused"], status["paused_today"]) == ("paused", True, False)
+    write_status(tmp_path, paused_until=settings_app._midnight(datetime.now().astimezone()).isoformat())
+    assert api.load()["status"]["detail"].startswith("Until tomorrow")
+    write_status(tmp_path, paused_until=in_an_hour, problems=[{"key": "config", "title": "Settings couldn't be read", "section": "calendars"}])
+    status = api.load()["status"]
+    assert (status["state"], status["fix_section"], status["paused"]) == ("attention", "calendars", True)
+    monkeypatch.setattr(settings_app, "watcher_running", lambda: False)
+    status = api.load()["status"]
+    assert (status["state"], status["paused"]) == ("stopped", False)
+
+
+def test_starting_shows_until_the_new_watcher_reports(api, tmp_path, monkeypatch):
+    write_status(tmp_path)
+    old = time.time() - 600
+    os.utime(tmp_path / "status.json", (old, old))  # left by the watcher that was quit
+    monkeypatch.setattr(settings_app, "watcher_running", lambda: False)
+    assert api.start_watcher()["status"]["state"] == "starting"
+    assert api.spawned[-1][-1] == "--supervise"
+    monkeypatch.setattr(settings_app, "watcher_running", lambda: True)
+    assert api.load()["status"]["state"] == "starting"
+    fresh = time.time() + 1
+    os.utime(tmp_path / "status.json", (fresh, fresh))  # the new watcher's first report
+    assert api.load()["status"]["state"] == "watching"
+
+
+def test_pause_resume_and_quit_go_to_the_running_watcher(api, monkeypatch):
+    sent = []
+    monkeypatch.setattr(settings_app.commands, "send", lambda command: sent.append(command) or True)
+    monkeypatch.setattr(settings_app, "_wait_for", lambda done, seconds=3: True)
+    api.pause("hour")
+    api.pause("today")
+    api.pause("forever")
+    api.resume()
+    api.quit_app()
+    assert sent == ["pause-hour", "pause-today", "resume", "quit"]

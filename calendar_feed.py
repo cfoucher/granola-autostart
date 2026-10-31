@@ -25,6 +25,8 @@ class CalendarEvent:
     summary: str
     start: datetime
     end: datetime
+    # Its title has a skip word. It never prompts, but a Zoom join during it is not asked about either.
+    skipped: bool = False
 
     def key(self) -> str:
         return f"event:{self.id}:{self.start.isoformat()}"
@@ -207,7 +209,9 @@ def events_between(
     *,
     ignore_title_substrings: tuple[str, ...] = (),
     user_emails: frozenset[str] = frozenset(),
+    keep_skipped: bool = False,
 ) -> list[CalendarEvent]:
+    """Meetings in the window. With ``keep_skipped``, ones with a skip word stay in, marked ``skipped``."""
     calendar = Calendar.from_ical(prefilter_ics(ics_text, window_start, window_end))
     local_zone = datetime.now().astimezone().tzinfo or timezone.utc
     series_uids = {
@@ -225,7 +229,7 @@ def events_between(
             user_emails=user_emails,
             series_uids=series_uids,
         )
-        if event is not None and event.end > event.start:
+        if event is not None and event.end > event.start and (keep_skipped or not event.skipped):
             found.append(event)
     found.sort(key=lambda item: item.start)
     return found
@@ -258,8 +262,7 @@ def _component_to_event(
             end = _as_aware(start_value, local_zone) + timedelta(hours=1)
     start = _as_aware(start_value, local_zone)
     summary = str(component.get("summary") or "").strip() or "Meeting"
-    if any(piece.casefold() in summary.casefold() for piece in ignore_title_substrings if piece):
-        return None
+    skipped = any(piece.casefold() in summary.casefold() for piece in ignore_title_substrings if piece)
     uid = str(component.get("uid") or "").strip()
     if not uid:
         uid = f"{summary}-{start.isoformat()}"
@@ -270,6 +273,7 @@ def _component_to_event(
         summary=summary[:200],
         start=start,
         end=end,
+        skipped=skipped,
     )
 
 

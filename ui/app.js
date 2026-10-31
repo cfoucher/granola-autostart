@@ -17,6 +17,7 @@ const ICONS = {
   video: '<rect x="2.5" y="6" width="13" height="12" rx="2"/><path d="M15.5 10.5l6-3.5v10l-6-3.5"/>',
   folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
   up: '<path d="M6 15l6-6 6 6"/>',
+  down: '<path d="M6 9l6 6 6-6"/>',
   arrowUp: '<path d="M12 19V5M6 11l6-6 6 6"/>',
   wifi: '<path d="M2 9a15 15 0 0 1 20 0M5.5 12.5a10 10 0 0 1 13 0M9 16a5 5 0 0 1 6 0M12 19.5h.01"/>',
   speaker: '<path d="M4 9.5h4L13 5v14l-5-4.5H4zM16.5 9a4 4 0 0 1 0 6M19 6.5a8 8 0 0 1 0 11"/>',
@@ -25,8 +26,14 @@ const ICONS = {
 const icon = (name, cls = "") => `<svg class="icon ${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
 const esc = (text) =>
   String(text ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+// The Labyrinth app icon (app_icon.py draws the same thing for the exe, tray, and notifications).
 const appMark = (size) =>
-  `<svg width="${size}" height="${size}" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="7" style="fill: var(--accent)"/><circle cx="8" cy="8" r="2.75" fill="#fff"/></svg>`;
+  `<svg width="${size}" height="${size}" viewBox="0 0 64 64" aria-hidden="true">` +
+  `<circle cx="32" cy="32" r="31" fill="#fbf8f1" stroke="#e2d9c6" stroke-width="1"/>` +
+  `<circle cx="32" cy="32" r="27" fill="none" stroke="#e9e2d2" stroke-width="5"/>` +
+  `<circle cx="32" cy="32" r="27" transform="rotate(-90 32 32)" fill="none" stroke="#5a8a47" stroke-width="5" stroke-linecap="round" stroke-dasharray="127.2 169.6"/>` +
+  `<g fill="none" stroke="#42703a" stroke-width="4" stroke-linecap="round"><path d="M36.6 15.63A17 17 0 1 1 27.4 15.63"/>` +
+  `<path d="M27.8 41.08A10 10 0 1 1 36.2 41.08"/><path d="M42 32H49"/></g><circle cx="32" cy="32" r="4.5" fill="#5a8a47"/></svg>`;
 const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
 let data = null;
@@ -36,6 +43,7 @@ const ui = {
   tests: {}, confirmRemove: null, showHelp: false,
   addingAddress: false, newAddress: "", emailError: null,
   newWord: "",
+  pauseMenu: false, busy: false,
   step: "welcome", tab: "google", setupUrl: "", found: null, setupBusy: false, setupError: null, setupEmail: "", zoomOnly: false,
 };
 const api = () => window.pywebview.api;
@@ -81,8 +89,6 @@ function focusSoon(id) {
 // Settings
 
 function settingsView() {
-  const s = data.status;
-  const label = { watching: "Watching", paused: "Paused", attention: "Needs attention", stopped: "Not running" }[s.state];
   const nav = (id, glyph, text) =>
     `<button class="nav" data-action="section" data-section="${id}" ${ui.section === id ? 'aria-current="page"' : ""}>${icon(glyph)}${text}</button>`;
   return `<div class="window">
@@ -90,12 +96,45 @@ function settingsView() {
       ${nav("calendars", "calendar", "Calendars")}
       ${nav("notes", "timer", "Starting notes")}
       ${nav("about", "info", "About")}
-      <div class="rail-status" aria-live="polite">
-        <div class="state"><span class="dot ${s.state}"></span>${label}</div>
-        <div class="small muted">${esc(s.detail)}</div>
-      </div>
+      ${statusBox()}
     </nav>
     <main>${{ calendars: calendarsSection, notes: notesSection, about: aboutSection }[ui.section]()}</main>
+  </div>`;
+}
+
+// The status box at the foot of the side panel. Its buttons are the tray menu's: Pause, Resume, Start, and Fix.
+function statusBox() {
+  const s = data.status;
+  const label = {
+    watching: "Watching", notes: "Taking notes", paused: "Paused", attention: "Needs attention", stopped: "Not running", starting: "Starting…",
+  }[s.state];
+  const busy = ui.busy ? "disabled" : "";
+  let controls = "";
+  if (s.state === "stopped") {
+    controls = `<button class="btn mini primary" data-action="startWatcher" ${busy}>Start</button>`;
+  } else if (s.state !== "starting") {
+    const fix = s.state === "attention" ? `<button class="btn mini primary" data-action="fix">Fix</button>` : "";
+    const resume = `<button class="btn mini ${fix ? "" : "primary"}" data-action="resume" ${busy}>Resume</button>`;
+    const restOfToday = !fix && !s.paused_today ? `<button class="link small" data-action="pause" data-length="today" ${busy}>Rest of today</button>` : "";
+    controls = fix + (s.paused ? resume + restOfToday : pauseMenu(busy));
+  }
+  return `<div class="rail-status">
+    <div class="stack" style="gap:4px" aria-live="polite">
+      <div class="state"><span class="dot ${s.state}"></span>${label}</div>
+      <div class="small ${s.state === "attention" ? "warn" : "muted"}">${esc(s.detail)}</div>
+    </div>
+    ${controls ? `<div class="row controls">${controls}</div>` : ""}
+  </div>`;
+}
+
+function pauseMenu(busy) {
+  const open = ui.pauseMenu;
+  return `<div class="menu-anchor">
+    <button id="pause-toggle" class="btn mini dropdown" data-action="togglePause" aria-haspopup="menu" aria-expanded="${open}" ${busy}>Pause${icon(open ? "up" : "down", "xs")}</button>
+    ${open ? `<div class="menu" role="menu" aria-label="Pause">
+      <button id="pause-hour" role="menuitem" data-action="pause" data-length="hour">For 1 hour</button>
+      <button id="pause-today" role="menuitem" data-action="pause" data-length="today">For the rest of today</button>
+    </div>` : ""}
   </div>`;
 }
 
@@ -263,9 +302,16 @@ function aboutSection() {
     lastRow = row("play", `Last start: ${last.title}, ${last.when}`,
       last.opened ? "Granola opened and started transcribing. If an update ever stops notes from opening, you'll get a notification." : "Waiting to see Granola open…");
   }
-  const watcher = s.running
-    ? row("check", "Running in the background", "It starts when you sign in to Windows.")
-    : row("warn", "Not running", "Meetings won't start notes until it runs again.", "warn", `<button class="btn small" data-action="startWatcher">Start</button>`);
+  const busy = ui.busy ? "disabled" : "";
+  let watcher;
+  if (s.state === "starting") {
+    watcher = row("clock", "Starting…", "Checking your calendars.");
+  } else if (s.running) {
+    watcher = row("check", "Running in the background", "It starts when you sign in to Windows. If you quit, it starts again at sign-in, or from the Start menu.", "",
+      `<button class="btn small" data-action="quitApp" ${busy}>Quit</button>`);
+  } else {
+    watcher = row("warn", "Not running", "Meetings won't start notes until it runs again.", "warn", `<button class="btn small" data-action="startWatcher" ${busy}>Start</button>`);
+  }
   return `<h1>About</h1>
     <div class="identity">${appMark(52)}<div class="stack" style="gap:2px"><div class="title">Granola Autostart</div><div class="muted" style="font-size:13px">Version ${esc(data.version)}</div></div></div>
     <div class="list">${watcher}${lastRow}${row("folder", "Logs", "Logs record meeting titles. Calendar addresses are never written to them.", "",
@@ -388,7 +434,7 @@ function doneStep() {
           <span class="clock">${clock()}</span></div>
         <div class="row small muted" style="align-self:flex-end;margin-right:152px">${icon("arrowUp", "sm")}Right-click it to pause or open Settings</div></div>`,
     footer: `<button class="btn large" data-action="preview">${icon("play", "sm")}Show me the card</button>
-      <button class="btn large primary" data-action="close">Done</button>`,
+      <button class="btn large primary" data-action="toSettings">Done</button>`,
   };
 }
 
@@ -438,8 +484,15 @@ const actions = {
   openConfig: () => api().open_config(),
   openLink: (d) => api().open_link(d.url),
   runSetup: () => api().run_setup(),
-  startWatcher: async () => { data = await api().start_watcher(); render(); },
+  startWatcher: () => command(() => api().start_watcher()),
+  togglePause: () => { ui.pauseMenu = !ui.pauseMenu; render(); if (ui.pauseMenu) focusSoon("pause-hour"); },
+  pause: (d) => command(() => api().pause(d.length)),
+  resume: () => command(() => api().resume()),
+  quitApp: () => command(() => api().quit_app()),
+  fix: () => { ui.section = data.status.fix_section || "calendars"; render(); },
   close: () => api().close(),
+  // Setup's Done turns this window into Settings, so another calendar can be added right away.
+  toSettings: async () => { data = await api().open_settings(); ui.section = "calendars"; render(); },
   goStep: (d) => { ui.step = d.step; ui.setupError = null; render(); if (d.step === "calendar") focusSoon("setup-url"); },
   tab: (d) => { ui.tab = d.tab; render(); },
   testSetup: async () => {
@@ -458,8 +511,39 @@ const actions = {
   zoomOnly: async () => { data = await api().skip_setup(); ui.zoomOnly = true; ui.step = "done"; render(); },
 };
 
+// Pause, Resume, Start, and Quit wait for the watcher to act, so their buttons stay disabled meanwhile.
+async function command(call) {
+  if (ui.busy) return;
+  ui.busy = true; ui.pauseMenu = false; render();
+  try { data = await call(); } finally { ui.busy = false; render(); }
+}
+
+function closePauseMenu(returnFocus) {
+  ui.pauseMenu = false; render();
+  if (returnFocus) focusSoon("pause-toggle");
+}
+
+document.addEventListener("keydown", (event) => {
+  if (!ui.pauseMenu) return;
+  const items = [...document.querySelectorAll('.menu [role="menuitem"]')];
+  const at = items.indexOf(document.activeElement);
+  if (event.key === "Escape") { event.preventDefault(); closePauseMenu(true); }
+  else if (event.key === "Tab") closePauseMenu(false);
+  else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    items[(at + (event.key === "ArrowDown" ? 1 : items.length - 1)) % items.length]?.focus();
+  }
+});
+
+// WebView2's own right-click menu gives text fields Cut, Copy, and Paste. Anywhere else it would offer Back and Reload.
+document.addEventListener("contextmenu", (event) => {
+  if (!event.target.closest("input, textarea")) event.preventDefault();
+});
+
 const app = document.getElementById("app");
 app.addEventListener("click", (event) => {
+  // A click anywhere outside the open Pause menu closes it.
+  if (ui.pauseMenu && !event.target.closest(".menu-anchor")) { ui.pauseMenu = false; render(); }
   const target = event.target.closest("[data-action]");
   if (!target || target.disabled) return;
   event.preventDefault();

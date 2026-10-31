@@ -171,7 +171,15 @@ def _zoom_prompt(now: datetime, snap: Snapshot, state: WatcherState, lookahead: 
     if zoom_key in state.handled:
         state.zoom_needs_decision = False
         return None
-    event = _match_event(snap.events, now, lookahead, state.handled)
+    meetings = [event for event in snap.events if not event.skipped]
+    event = _match_event(meetings, now, lookahead, state.handled)
+    if event is None:
+        # A call during a meeting whose title has a skip word is that meeting, so it is skipped too.
+        skipped = _match_event([event for event in snap.events if event.skipped], now, lookahead, state.handled)
+        if skipped is not None:
+            state.handled[zoom_key] = max(skipped.end, now + ZOOM_HOLD)
+            state.zoom_needs_decision = False
+            return None
     if event is not None and event.key() in state.handled:
         state.handled[zoom_key] = max(event.end, now + ZOOM_HOLD)
         state.zoom_needs_decision = False
@@ -209,7 +217,8 @@ def _calendar_prompt(now: datetime, snap: Snapshot, state: WatcherState, lookahe
     ongoing = [
         event
         for event in snap.events
-        if event.start <= now < event.end
+        if not event.skipped
+        and event.start <= now < event.end
         and event.key() not in state.handled
         and (covered_until is None or event.start > covered_until)
     ]

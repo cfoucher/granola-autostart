@@ -18,9 +18,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
-from PIL import Image, ImageDraw
+from PIL import Image
 import pystray
 
+from app_icon import draw_icon
 from app_status import (
     AlertBook,
     FeedStatus,
@@ -33,11 +34,13 @@ from app_status import (
     find_problems,
     next_meeting,
     read_status,
+    taking_notes,
     tray_view,
     write_status,
 )
 from app_version import __version__
 from calendar_feed import fetch_ics, events_between, feed_name, feed_owner, merge_events, my_addresses
+import commands
 from notify import Notifier, register_app_id
 from decide import Prompt, Snapshot, evaluate, apply_result
 from granola_launch import build_url, launch
@@ -60,6 +63,7 @@ CREATE_NO_WINDOW = 0x08000000
 RESTART_DELAY_SECONDS = 3
 MAX_RESTART_DELAY_SECONDS = 300
 HEALTHY_RUN_SECONDS = 60
+QUIT_EXIT_CODE = 3  # the watcher exits with this after Quit, so the supervisor stops instead of restarting it
 RETURN_REFRESH_SECONDS = 60
 FAILED_FEED_RETRY_SECONDS = 60
 STUCK_REFRESH_SECONDS = 600
@@ -164,6 +168,7 @@ def load_feeds(urls: list[str], now: datetime, settings: Settings, owners: dict[
                 now + timedelta(hours=36),
                 ignore_title_substrings=settings.ignore_title_substrings,
                 user_emails=addresses,
+                keep_skipped=True,
             )
         except Exception as error:
             result.failures.append((index, url, error))
@@ -237,7 +242,9 @@ class CalendarCache:
                         now,
                         name=loaded.names.get(url),
                         owner=owners.get(url),
-                        meetings_next_day=sum(1 for event in events if now <= event.start < now + timedelta(days=1)),
+                        meetings_next_day=sum(
+                            1 for event in events if not event.skipped and now <= event.start < now + timedelta(days=1)
+                        ),
                     )
                 merged = merge_events(*(self._by_url.get(url, []) for url in urls))
                 self._events = merged
@@ -372,6 +379,7 @@ class Reporter:
                 version=__version__,
                 paused_until=pause if pause is not None and now < pause else None,
                 next_meeting=(upcoming.summary, upcoming.start) if upcoming else None,
+                taking_notes=taking_notes(launch, now),
                 feeds=feeds,
                 last_start=control.note_launch(launch),
                 problems=problems,
@@ -475,27 +483,9 @@ def _warn_if_launch_missing(state, now: datetime) -> None:
     log.warning("Granola was not running 30s after the launch for %s", launch.title)
 
 
-GREEN = (90, 138, 71, 255)  # the countdown ring's colour
-GREY = (124, 119, 109, 255)
-AMBER = (208, 112, 31, 255)
-WHITE = (255, 255, 255, 255)
-
-
 def tray_image(kind: str = "watching") -> Image.Image:
-    """Green circle while watching, grey with pause bars while paused, and an amber dot when something is wrong."""
-    s = 4  # drawn large, then reduced, for smooth edges
-    image = Image.new("RGBA", (64 * s, 64 * s), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
-    draw.ellipse((4 * s, 4 * s, 60 * s, 60 * s), fill=GREY if kind == "paused" else GREEN)
-    if kind == "paused":
-        draw.rounded_rectangle((22 * s, 19 * s, 29 * s, 45 * s), radius=2 * s, fill=WHITE)
-        draw.rounded_rectangle((35 * s, 19 * s, 42 * s, 45 * s), radius=2 * s, fill=WHITE)
-    else:
-        draw.ellipse((21 * s, 21 * s, 43 * s, 43 * s), fill=WHITE)
-    if kind == "attention":
-        draw.ellipse((37 * s, 0, 64 * s, 27 * s), fill=WHITE)
-        draw.ellipse((40 * s, 3 * s, 61 * s, 24 * s), fill=AMBER)
-    return image.resize((64, 64), Image.LANCZOS)
+    """The Labyrinth icon; its goal dot is green while watching, grey while paused, amber when something is wrong."""
+    return draw_icon(64, kind)
 
 
 def save_app_icon() -> Path:
@@ -547,7 +537,30 @@ def retry_launch(control: Control) -> None:
     launch(build_url(payload), dry_run=control.settings.dry_run)
 
 
-def run_tray(settings: Settings, config_error: str | None = None, *, dry_run: bool = False) -> None:
+def modern_menus() -> None:
+    """A crisp Windows 11 tray menu that follows the light or dark app theme.
+
+    Without DPI awareness Windows draws the menu at 100% and stretches it on scaled displays.
+    SetPreferredAppMode and FlushMenuThemes (uxtheme ordinals 135 and 136) are undocumented but
+    stable since Windows 10 1903; without them menus stay light.
+    """
+    try:
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))  # per-monitor v2
+    except (AttributeError, OSError):
+        pass
+    try:
+        uxtheme = ctypes.WinDLL("uxtheme")
+        set_preferred_app_mode = uxtheme[135]
+        set_preferred_app_mode.argtypes = [ctypes.c_int]
+        set_preferred_app_mode(1)  # AllowDark: follow the Windows app theme
+        uxtheme[136]()  # FlushMenuThemes
+    except (AttributeError, OSError):
+        pass
+
+
+def run_tray(settings: Settings, config_error: str | None = None, *, dry_run: bool = False) -> int:
+    """Run until Quit; returns the exit code. Settings can pause, resume, and quit through commands.py."""
+    modern_menus()
     control = Control(settings, config_error)
     control.force_dry_run = dry_run
     control.last_start = LastStart.from_json(read_status(status_path()).get("last_start"))
@@ -594,21 +607,24 @@ def run_tray(settings: Settings, config_error: str | None = None, *, dry_run: bo
             save_state(state, control.current_pause())
         log.info(label)
 
-    def on_hour(_icon, _item) -> None:
+    def pause_hour() -> None:
         until = datetime.now().astimezone() + timedelta(hours=1)
         pause_until(until, f"Paused until {until:%H:%M}")
 
-    def on_today(_icon, _item) -> None:
+    def pause_today() -> None:
         now = datetime.now().astimezone()
         pause_until((now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0), "Paused until tomorrow")
 
-    def on_resume(_icon, _item) -> None:
+    def resume() -> None:
         pause_until(None, "Resumed")
 
-    def on_quit(icon: pystray.Icon, _item) -> None:
+    quitting = threading.Event()
+
+    def quit_app() -> None:
         log.info("quitting")
+        quitting.set()
         control.halt()
-        icon.stop()
+        tray["icon"].stop()
 
     def refresh(view: TrayView) -> None:
         icon = tray["icon"]
@@ -620,6 +636,8 @@ def run_tray(settings: Settings, config_error: str | None = None, *, dry_run: bo
         icon.visible = True
         control.on_view = refresh
         refresh(control.view)
+        handlers = {"pause-hour": pause_hour, "pause-today": pause_today, "resume": resume, "quit": quit_app}
+        threading.Thread(target=commands.listen, args=(handlers, control.stop), name="settings-commands", daemon=True).start()
 
     # Left-clicking the icon runs the first default item: Fix in Settings... when something is wrong, else Settings...
     menu = pystray.Menu(
@@ -631,9 +649,9 @@ def run_tray(settings: Settings, config_error: str | None = None, *, dry_run: bo
             default=True,
             visible=lambda _item: control.view.kind == "attention",
         ),
-        pystray.MenuItem("Resume", on_resume, visible=lambda _item: control.view.paused),
-        pystray.MenuItem("Pause for 1 hour", on_hour, visible=lambda _item: not control.view.paused),
-        pystray.MenuItem("Pause for today", on_today),
+        pystray.MenuItem("Resume", lambda *_: resume(), visible=lambda _item: control.view.paused),
+        pystray.MenuItem("Pause for 1 hour", lambda *_: pause_hour(), visible=lambda _item: not control.view.paused),
+        pystray.MenuItem("Pause for today", lambda *_: pause_today()),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(
             "Settings…",
@@ -644,12 +662,13 @@ def run_tray(settings: Settings, config_error: str | None = None, *, dry_run: bo
         pystray.MenuItem("Open log folder", lambda *_: open_log_folder()),
         pystray.MenuItem("About", lambda *_: open_settings("about")),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Quit", on_quit),
+        pystray.MenuItem("Quit", lambda *_: quit_app()),
     )
     tray["icon"] = pystray.Icon("granola-autostart", tray_image(control.view.kind), control.view.tooltip, menu=menu)
     tray["icon"].run(setup=ready)
     control.halt()
     worker.join(timeout=control.settings.countdown_seconds + 15)
+    return QUIT_EXIT_CODE if quitting.is_set() else 0
 
 
 def acquire_supervisor() -> bool:
@@ -754,6 +773,9 @@ def supervise() -> int:
     while True:
         started = time.monotonic()
         completed = subprocess.run(command, cwd=str(ROOT))
+        if completed.returncode == QUIT_EXIT_CODE:
+            log.info("watcher quit; supervisor stopping until the next sign-in")
+            return 0
         quick = time.monotonic() - started < HEALTHY_RUN_SECONDS
         if not quick:
             delay = RESTART_DELAY_SECONDS
@@ -790,7 +812,7 @@ def print_check(settings: Settings, config_error: str | None) -> None:
         return
     print("calendar:")
     for event in upcoming:
-        print(f"  {event.start:%Y-%m-%d %H:%M}  {event.summary}")
+        print(f"  {event.start:%Y-%m-%d %H:%M}  {event.summary}{'  (skipped)' if event.skipped else ''}")
 
 
 def main() -> int:
@@ -851,8 +873,7 @@ def main() -> int:
         print(f"installed via {mode}")
         return 0
     logger.info("granola autostart %s running (dry_run=%s)", __version__, settings.dry_run)
-    run_tray(settings, config_error, dry_run=args.dry_run)
-    return 0
+    return run_tray(settings, config_error, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

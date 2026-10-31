@@ -2,7 +2,7 @@ import urllib.error
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from app_status import AlertBook, FeedStatus, LastStart, describe_error, feed_id, find_problems, tray_view, when
+from app_status import AlertBook, FeedStatus, LastStart, describe_error, feed_id, find_problems, taking_notes, tray_view, when
 from calendar_feed import CalendarEvent
 
 NOW = datetime(2026, 10, 30, 9, 0, tzinfo=timezone.utc)
@@ -73,6 +73,19 @@ def test_the_tray_shows_the_next_meeting_a_pause_or_the_problem():
     attention = tray_view(NOW, NOW + timedelta(hours=1), problems, upcoming)
     assert (attention.kind, attention.paused, attention.problem_section) == ("attention", True, "calendars")
     assert attention.tooltip.startswith("Granola Autostart: “Granola watch”")
+
+
+def test_taking_notes_while_granola_is_open_for_the_meeting():
+    from decide import ActiveLaunch
+
+    launch = ActiveLaunch("Design crit", {}, ("k",), expires_at=NOW + timedelta(minutes=30), seen_running=False, launched_at=NOW)
+    assert taking_notes(launch, NOW) is None  # not open yet
+    launch.seen_running = True
+    assert taking_notes(launch, NOW + timedelta(minutes=5)) == ("Design crit", NOW)
+    assert taking_notes(launch, NOW + timedelta(minutes=30)) is None  # the meeting is over
+    launch.missing_since = NOW + timedelta(minutes=10)
+    assert taking_notes(launch, NOW + timedelta(minutes=11)) is None  # Granola was closed
+    assert taking_notes(None, NOW) is None
 
 
 def test_times_read_naturally():
