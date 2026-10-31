@@ -3,9 +3,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-import watcher
-from decide import Prompt, WatcherState
-from settings import Settings
+from granola_autostart import watcher
+from granola_autostart.decide import Prompt, WatcherState
+from granola_autostart.settings import Settings
 
 NOW = datetime(2026, 10, 28, 17, 0, tzinfo=timezone.utc)
 

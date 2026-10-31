@@ -1,4 +1,4 @@
-from app_icon import DOTS, GREEN, draw_icon
+from granola_autostart.icon import DOTS, GREEN, draw_icon
 
 
 def test_the_goal_dot_shows_the_status():

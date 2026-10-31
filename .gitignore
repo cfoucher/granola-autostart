@@ -3,6 +3,8 @@
 build/
 dist/
 designs/
+# Plans and other working notes stay local.
+docs/
 __pycache__/
 .pytest_cache/
 *.pyc

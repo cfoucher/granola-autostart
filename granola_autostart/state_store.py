@@ -6,8 +6,8 @@ import json
 import logging
 from datetime import datetime
 
-from decide import ActiveLaunch, WatcherState
-from settings import state_path
+from .decide import ActiveLaunch, WatcherState
+from .settings import state_path
 
 log = logging.getLogger("granola_autostart")
 _last_written: str | None = None

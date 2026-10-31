@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from secret_box import protect, unprotect
+from .secret_box import protect, unprotect
 
 DEFAULT_IGNORE = ("focus time", "out of office", "lunch")
 MIN_CALENDAR_REFRESH_SECONDS = 60

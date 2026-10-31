@@ -2,7 +2,7 @@ import json
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 
-from granola_launch import adhoc_payload, build_url, meeting_title
+from granola_autostart.granola_launch import adhoc_payload, build_url, meeting_title
 
 
 def decoded_params(url: str) -> dict:
@@ -50,11 +50,11 @@ def test_awkward_titles_survive_the_double_encoding():
 
 
 def test_notice_title_starting_with_a_dash_is_not_an_option():
-    from notice import build_parser
-    from watcher import notice_command
+    from granola_autostart.notice import build_parser
+    from granola_autostart.watcher import notice_command
 
     command = notice_command("-- standup", 10, "calendar")
-    args = build_parser().parse_args(command[2:])
+    args = build_parser().parse_args(command[command.index("--notice") + 1 :])
     assert args.title == "-- standup"
     assert args.seconds == 10
 

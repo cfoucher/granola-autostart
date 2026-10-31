@@ -5,7 +5,7 @@ import pytest
 import recurring_ical_events
 from icalendar import Calendar
 
-from calendar_feed import _gunzip_capped, events_between, feed_owner, my_addresses, normalize_feed_url, prefilter_ics
+from granola_autostart.calendar_feed import _gunzip_capped, events_between, feed_owner, my_addresses, normalize_feed_url, prefilter_ics
 
 ICS = """BEGIN:VCALENDAR
 VERSION:2.0

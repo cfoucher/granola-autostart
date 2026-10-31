@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from calendar_feed import CalendarEvent
-from granola_launch import adhoc_payload, meeting_title
+from .calendar_feed import CalendarEvent
+from .granola_launch import adhoc_payload, meeting_title
 
 ZOOM_HOLD = timedelta(hours=12)
 CRASH_GRACE = timedelta(seconds=10)

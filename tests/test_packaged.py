@@ -1,9 +1,10 @@
+import subprocess
 import sys
 
 import pytest
 
-import watcher
-from notice import build_parser
+from granola_autostart import watcher
+from granola_autostart.notice import build_parser
 
 EXE = r"C:\Users\someone\AppData\Local\Programs\Granola Autostart\GranolaAutostart.exe"
 
@@ -35,16 +36,23 @@ def test_the_packaged_stop_only_matches_this_exe_and_spares_itself(packaged):
 
 def test_stopping_from_source_spares_the_command_doing_the_stopping():
     script = watcher.stop_script()
-    assert "watcher.py*'" in script
+    assert "__main__.py*'" in script
     for own_mode in ("--uninstall", "--install", "--stop"):
         assert f"-notlike '*{own_mode}*'" in script
 
 
-def test_from_source_the_modes_run_this_script_with_pythonw():
+def test_from_source_every_mode_runs_the_package_main_with_pythonw():
     command = watcher.app_command("--supervise")
-    assert command[1].endswith("watcher.py")
+    assert command[1].endswith("__main__.py")
     assert command[2:] == ["--supervise"]
-    assert watcher.notice_command("Standup", 10, "calendar")[1].endswith("notice.py")
+    assert watcher.notice_command("Standup", 10, "calendar")[1:3] == [command[1], "--notice"]
+
+
+def test_the_package_main_runs_by_file_path_from_any_folder(tmp_path):
+    # A source checkout's sign-in entry starts it this way, with no current folder to import from.
+    completed = subprocess.run([sys.executable, str(watcher.MAIN), "--help"], cwd=tmp_path, capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+    assert "--supervise" not in completed.stdout and "--dry-run" in completed.stdout
 
 
 def test_the_supervisor_restarts_a_crash_but_not_a_quit(monkeypatch):

@@ -442,7 +442,3 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         return 2
     return 0 if started else 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

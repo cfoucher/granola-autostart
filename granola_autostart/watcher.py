@@ -21,8 +21,16 @@ from typing import Callable
 from PIL import Image
 import pystray
 
-from app_icon import draw_icon
-from app_status import (
+from . import __version__, commands
+from .calendar_feed import fetch_ics, events_between, feed_name, feed_owner, merge_events, my_addresses
+from .decide import Prompt, Snapshot, evaluate, apply_result
+from .granola_launch import build_url, launch
+from .icon import draw_icon
+from .notify import Notifier, register_app_id
+from .presence import idle_seconds, is_present, is_unlocked
+from .settings import ConfigError, Settings, app_dir, config_path, load_settings, setup_logging, status_path
+from .state_store import load_state, save_state
+from .status import (
     AlertBook,
     FeedStatus,
     LastStart,
@@ -38,22 +46,13 @@ from app_status import (
     tray_view,
     write_status,
 )
-from app_version import __version__
-from calendar_feed import fetch_ics, events_between, feed_name, feed_owner, merge_events, my_addresses
-import commands
-from notify import Notifier, register_app_id
-from decide import Prompt, Snapshot, evaluate, apply_result
-from granola_launch import build_url, launch
-from presence import idle_seconds, is_present, is_unlocked
-from settings import ConfigError, Settings, app_dir, config_path, load_settings, setup_logging, status_path
-from state_store import load_state, save_state
-from zoom_meetings import granola_running, process_table, zoom_session, zoom_window_title
+from .zoom_meetings import granola_running, process_table, zoom_session, zoom_window_title
 
 log = logging.getLogger("granola_autostart")
-# A PyInstaller build is one GranolaAutostart.exe that runs every mode; from source each mode is a script.
+# A PyInstaller build is one GranolaAutostart.exe that runs every mode; from source the package's __main__.py does.
 FROZEN = bool(getattr(sys, "frozen", False))
-ROOT = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
-NOTICE = Path(__file__).resolve().parent / "notice.py"
+MAIN = Path(__file__).resolve().with_name("__main__.py")
+ROOT = Path(sys.executable).resolve().parent if FROZEN else MAIN.parent.parent
 TASK_LOGIN = "Granola Autostart"
 TASK_WATCHDOG = "Granola Autostart Watchdog"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -296,18 +295,15 @@ def ui_python() -> str:
 
 
 def app_command(*args: str) -> list[str]:
-    """Start this app again with ``args``: the packaged exe, or pythonw with this script."""
+    """Start this app again with ``args``: the packaged exe, or pythonw with the package's __main__.py."""
     if FROZEN:
         return [sys.executable, *args]
-    return [ui_python(), str(Path(__file__).resolve()), *args]
+    return [ui_python(), str(MAIN), *args]
 
 
 def notice_command(title: str, seconds: int, kind: str) -> list[str]:
     # "--title=" keeps a title that starts with "-" from being read as an option.
-    options = [f"--title={title}", f"--seconds={max(1, seconds)}", f"--kind={kind}"]
-    if FROZEN:
-        return [sys.executable, "--notice", *options]
-    return [ui_python(), str(NOTICE), *options]
+    return app_command("--notice", f"--title={title}", f"--seconds={max(1, seconds)}", f"--kind={kind}")
 
 
 def ask_notice(title: str, seconds: int, kind: str) -> bool:
@@ -497,13 +493,8 @@ def save_app_icon() -> Path:
     return folder / "app.png"
 
 
-SETTINGS_SCRIPT = Path(__file__).resolve().parent / "settings_app.py"
-
-
 def settings_command(*args: str) -> list[str]:
-    if FROZEN:
-        return [sys.executable, "--settings", *args]
-    return [ui_python(), str(SETTINGS_SCRIPT), *args]
+    return app_command("--settings", *args)
 
 
 def _spawn(command: list[str]) -> None:
@@ -739,7 +730,7 @@ def stop_script() -> str:
         exe = str(Path(sys.executable).resolve()).replace("'", "''")
         match = f"$_.ExecutablePath -eq '{exe}' -and $_.ProcessId -ne {os.getpid()}"
     else:
-        script_path = _powershell_like(str(Path(__file__).resolve()))
+        script_path = _powershell_like(str(MAIN))
         match = (
             f"$_.Name -match 'python' -and $_.CommandLine -like '*{script_path}*' "
             "-and $_.CommandLine -notlike '*--uninstall*' -and $_.CommandLine -notlike '*--install*' "
@@ -848,7 +839,7 @@ def main() -> int:
     if args.dry_run:
         settings.dry_run = True
     if args.preview_notice:
-        from notice import show_notice
+        from .notice import show_notice
 
         started = show_notice("Design review", settings.countdown_seconds)
         print("would start" if started else "cancelled")
@@ -874,7 +865,3 @@ def main() -> int:
         return 0
     logger.info("granola autostart %s running (dry_run=%s)", __version__, settings.dry_run)
     return run_tray(settings, config_error, dry_run=args.dry_run)
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

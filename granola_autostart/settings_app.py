@@ -1,7 +1,7 @@
-"""Settings and first-run setup, in an Edge WebView2 window (pywebview). The page itself is ui/.
+"""Settings and first-run setup, in an Edge WebView2 window (pywebview). The page itself is web/.
 
-    settings_app.py [--section=calendars|notes|about]   Settings
-    settings_app.py --setup                              first-run setup
+    python -m granola_autostart --settings [--section=calendars|notes|about]   Settings
+    python -m granola_autostart --setup                                         first-run setup
 
 Changes are saved to config.json as they are made; the running watcher reloads it. Only one of
 these windows is open at a time: opening another brings the first one forward.
@@ -24,16 +24,16 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
-import commands
-from app_status import describe_error, feed_id, read_status, when
-from app_version import __version__
-from calendar_feed import events_between, feed_name, feed_owner, fetch_ics, my_addresses, normalize_feed_url
-from settings import ConfigError, Settings, app_dir, config_path, load_settings, save_settings, setup_logging, status_path
+from . import __version__, commands
+from .calendar_feed import events_between, feed_name, feed_owner, fetch_ics, my_addresses, normalize_feed_url
+from .settings import ConfigError, Settings, app_dir, config_path, load_settings, save_settings, setup_logging, status_path
+from .status import describe_error, feed_id, read_status, when
 
 log = logging.getLogger("granola_autostart")
 FROZEN = bool(getattr(sys, "frozen", False))
-HERE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-UI = HERE / "ui"
+MAIN = Path(__file__).resolve().with_name("__main__.py")
+# Beside this module from source and in the packaged build's _internal folder alike.
+WEB = Path(__file__).resolve().with_name("web")
 TITLES = {"settings": "Granola Autostart settings", "setup": "Set up Granola Autostart"}
 SIZES = {"settings": (796, 660), "setup": (656, 680)}
 COUNTDOWN_CHOICES = (5, 10, 15, 20, 30)
@@ -63,17 +63,12 @@ def watcher_running() -> bool:
 
 
 def app_command(*args: str) -> list[str]:
-    """This app's other modes: the packaged exe, or pythonw with the matching script."""
+    """This app's other modes: the packaged exe, or pythonw with the package's __main__.py."""
     if FROZEN:
         return [sys.executable, *args]
     pythonw = Path(sys.executable).with_name("pythonw.exe")
     python = str(pythonw if pythonw.exists() else sys.executable)
-    if args and args[0] == "--notice":
-        return [python, str(Path(__file__).resolve().parent / "notice.py"), *args[1:]]
-    if args and args[0] in ("--settings", "--setup"):
-        rest = args[1:] if args[0] == "--settings" else args
-        return [python, str(Path(__file__).resolve()), *rest]
-    return [python, str(Path(__file__).resolve().parent / "watcher.py"), *args]
+    return [python, str(MAIN), *args]
 
 
 def _spawn(command: list[str]) -> None:
@@ -139,7 +134,7 @@ def summarize_feed(text: str, settings: Settings, known_owners: list[str], now: 
 
 
 class Api:
-    """Called from ui/app.js as window.pywebview.api.<name>(...). Every method returns plain JSON data."""
+    """Called from web/app.js as window.pywebview.api.<name>(...). Every method returns plain JSON data."""
 
     def __init__(self, page: str, section: str) -> None:
         self.page = page
@@ -212,7 +207,7 @@ class Api:
             return True
 
     def _status_view(self, status: dict, running: bool, now: datetime) -> dict:
-        """The side panel's status box. Its buttons (see ui/app.js) follow the state, like the tray menu."""
+        """The side panel's status box. Its buttons (see web/app.js) follow the state, like the tray menu."""
         problems = [p for p in status.get("problems") or [] if isinstance(p, dict)]
         paused_until = datetime.fromisoformat(status["paused_until"]) if status.get("paused_until") else None
         paused = bool(running and paused_until and now < paused_until)
@@ -553,7 +548,7 @@ def _enable_text_field_menus(window) -> None:
     """Right-click Cut, Copy, and Paste in text fields.
 
     pywebview switches WebView2's own context menu off outside debug mode. It is switched back on
-    here, on the window's UI thread, and ui/app.js keeps it to text fields so pages never offer Back or Reload.
+    here, on the window's UI thread, and web/app.js keeps it to text fields so pages never offer Back or Reload.
     """
     try:
         from System import Func, Type  # pythonnet, already loaded by pywebview
@@ -589,7 +584,7 @@ def main(argv: list[str] | None = None) -> int:
     width, height = SIZES[page]
     window = webview.create_window(
         TITLES[page],
-        url=(UI / "index.html").as_uri(),
+        url=(WEB / "index.html").as_uri(),
         js_api=api,
         width=width,
         height=height,
@@ -607,7 +602,3 @@ def main(argv: list[str] | None = None) -> int:
         _spawn(["notepad.exe", str(config_path())])
         return 1
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

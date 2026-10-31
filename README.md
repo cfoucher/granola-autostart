@@ -1,5 +1,7 @@
 # Granola Autostart
 
+> **Disclaimer:** this is a small personal project, to fix a frustration I have with missing meeting notes. It is 100% AI-built, on a best-effort basis, with no guarantee of success.
+
 Starts [Granola](https://granola.ai) when a meeting begins on this PC. A small card appears first in the top-right corner of the screen under the pointer, with the meeting title and a 10-second ring.
 
 **Cancel** leaves Granola alone. **Start now** or doing nothing opens that meeting's note and starts transcription. It does not join Zoom. The card never takes keyboard focus, so typing in another app is not interrupted (and Esc is not used).
@@ -66,16 +68,29 @@ python -m venv .venv
 .venv\Scripts\python -m pytest
 ```
 
-Running from source:
+Running from source, in the checkout folder:
 
 ```powershell
-.venv\Scripts\python watcher.py --check            # presence, Zoom, and calendar status
-.venv\Scripts\python watcher.py --preview-notice   # show the card once
-.venv\Scripts\python watcher.py --dry-run          # the real watcher, logging the Granola link instead of opening it
-.venv\Scripts\python settings_app.py               # Settings (--setup for first-run setup)
+.venv\Scripts\python -m granola_autostart --check            # presence, Zoom, and calendar status
+.venv\Scripts\python -m granola_autostart --preview-notice   # show the card once
+.venv\Scripts\python -m granola_autostart --dry-run          # the real watcher, logging the Granola link instead of opening it
+.venv\Scripts\python -m granola_autostart --settings         # Settings (--setup for first-run setup)
 ```
 
-Only one watcher runs at a time, so stop an installed copy first (right-click the tray icon, **Quit**). `watcher.py --install` and `--uninstall` still set up a source checkout to start at sign-in, without the installer.
+Only one watcher runs at a time, so stop an installed copy first (right-click the tray icon, **Quit**). `--install` and `--uninstall` still set up a source checkout to start at sign-in, without the installer.
+
+### Layout
+
+- `granola_autostart/` is the app, one package. `__main__.py` starts every mode, from source and in the packaged exe.
+  - `watcher.py`: the tray, the meeting checks, the supervisor that restarts it, and starting at sign-in.
+  - `decide.py`: when to show the countdown, as pure logic. `state_store.py` remembers what was cancelled or started.
+  - `calendar_feed.py`, `zoom_meetings.py`, `presence.py`: calendars, Zoom, and whether you are at the PC.
+  - `granola_launch.py`: opens the meeting's note in Granola.
+  - `notice.py`: the countdown card. `settings_app.py`: Settings and setup, a WebView2 window showing the page in `web/`.
+  - `status.py`, `notify.py`, `icon.py`, `commands.py`: what the tray and Settings show, notifications, the icon, and Settings' Pause, Resume, and Quit.
+  - `settings.py`, `secret_box.py`: config and file paths, and the encryption for calendar addresses.
+- `tests/`: pytest.
+- `packaging/`: the PyInstaller spec, the Inno Setup script, and the icon drawing for both. `build.ps1` runs them.
 
 ### Building the installer
 
@@ -87,6 +102,4 @@ With the build requirements and Inno Setup 7 (6 also works) installed:
 
 It runs the tests, builds `dist\GranolaAutostart\` with PyInstaller, then `dist\GranolaAutostart-<version>-setup.exe`. One `GranolaAutostart.exe` runs every mode: the watcher, `--supervise`, `--notice`, `--settings`, `--setup`, and `--stop`.
 
-GitHub Actions runs the tests and builds the installer for pull requests, pushes to `main`, and version tags, keeping it for 7 days. A tag such as `v1.0.0` must match `app_version.py`, and also creates a GitHub release with the installer attached.
-
-The design canvas and the plan behind this are in [docs/installable-app-plan.md](docs/installable-app-plan.md).
+GitHub Actions runs the tests and builds the installer for pull requests, pushes to `main`, and version tags, keeping it for 7 days. A tag such as `v1.0.0` must match `__version__` in `granola_autostart/__init__.py`, and also creates a GitHub release with the installer attached.

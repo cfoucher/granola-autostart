@@ -26,7 +26,7 @@ const ICONS = {
 const icon = (name, cls = "") => `<svg class="icon ${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
 const esc = (text) =>
   String(text ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
-// The Labyrinth app icon (app_icon.py draws the same thing for the exe, tray, and notifications).
+// The Labyrinth app icon (icon.py draws the same thing for the exe, tray, and notifications).
 const appMark = (size) =>
   `<svg width="${size}" height="${size}" viewBox="0 0 64 64" aria-hidden="true">` +
   `<circle cx="32" cy="32" r="31" fill="#fbf8f1" stroke="#e2d9c6" stroke-width="1"/>` +

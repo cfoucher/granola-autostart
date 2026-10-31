@@ -10,7 +10,7 @@ ROOT = Path(SPECPATH).parent
 BUILD = ROOT / "build"
 BUILD.mkdir(exist_ok=True)
 sys.path.insert(0, str(ROOT))
-from app_version import __version__  # noqa: E402
+from granola_autostart import __version__  # noqa: E402
 
 
 def version_resource() -> str:
@@ -43,10 +43,10 @@ def version_resource() -> str:
 from PyInstaller.utils.hooks import collect_submodules  # noqa: E402
 
 a = Analysis(
-    [str(ROOT / "app.py")],
+    [str(ROOT / "packaging" / "entry.py")],
     pathex=[str(ROOT)],
-    # The Settings and setup page, read from _internal/ui at runtime.
-    datas=[(str(ROOT / "ui"), "ui")],
+    # The Settings and setup page, read from _internal/granola_autostart/web at runtime, beside settings_app.
+    datas=[(str(ROOT / "granola_autostart" / "web"), "granola_autostart/web")],
     # Imports chosen at runtime, which the analysis cannot see: pystray's Windows backend, pywebview's
     # Edge WebView2 platform, and the WinRT bindings behind Windows notifications.
     hiddenimports=[

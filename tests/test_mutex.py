@@ -1,4 +1,4 @@
-from watcher import create_mutex
+from granola_autostart.watcher import create_mutex
 
 
 def test_second_mutex_with_the_same_name_is_already_owned():

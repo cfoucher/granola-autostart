@@ -36,8 +36,8 @@ function Find-Iscc {
 
 if (-not $SkipTests) { Invoke-Step "tests" { & $python -m pytest -q } }
 
-$version = (& $python -c "from app_version import __version__; print(__version__)")
-if ($LASTEXITCODE -ne 0) { throw "could not read app_version" }
+$version = (& $python -c "from granola_autostart import __version__; print(__version__)")
+if ($LASTEXITCODE -ne 0) { throw "could not read the version from granola_autostart" }
 $version = $version.Trim()
 
 Invoke-Step "icon" { & $python packaging\make_icon.py build\app.ico }

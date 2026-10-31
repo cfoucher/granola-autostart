@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
-from calendar_feed import CalendarEvent
-from decide import ActiveLaunch, Snapshot, WatcherState, apply_result, evaluate
+from granola_autostart.calendar_feed import CalendarEvent
+from granola_autostart.decide import ActiveLaunch, Snapshot, WatcherState, apply_result, evaluate
 
 NOW = datetime(2026, 10, 28, 17, 0, tzinfo=timezone.utc)
 LOOKAHEAD = timedelta(minutes=10)

@@ -43,12 +43,12 @@ jobs:
           cache: pip
           cache-dependency-path: requirements*.txt
       - run: python -m pip install -r requirements-build.txt
-      - name: Check the tag matches app_version.py
+      - name: Check the tag matches the package version
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         run: |
-          $version = (python -c "from app_version import __version__; print(__version__)").Trim()
-          if ("v$version" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} does not match app_version.py ($version)" }
+          $version = (python -c "from granola_autostart import __version__; print(__version__)").Trim()
+          if ("v$version" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} does not match granola_autostart/__init__.py ($version)" }
       - run: choco install innosetup --no-progress -y
       - run: ./build.ps1 -SkipTests
         shell: pwsh

@@ -5,9 +5,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-import settings_app
-from app_status import feed_id
-from settings import load_settings
+from granola_autostart import settings_app
+from granola_autostart.status import feed_id
+from granola_autostart.settings import load_settings
 
 GOOD = "https://calendar.google.com/calendar/ical/me/private-abc/basic.ics"
 NOW = datetime.now().astimezone()
@@ -115,7 +115,7 @@ def test_zoom_only_setup_is_remembered(api):
 def test_preview_shows_the_card_without_launching_anything(api):
     api.preview()
     [command] = api.spawned
-    assert any(part.endswith("notice.py") or part == "--notice" for part in command)
+    assert "--notice" in command
     assert "--title=Weekly product sync" in command
 
 

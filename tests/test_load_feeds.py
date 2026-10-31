@@ -2,8 +2,8 @@ from datetime import datetime, timezone
 
 import pytest
 
-import watcher
-from settings import Settings
+from granola_autostart import watcher
+from granola_autostart.settings import Settings
 
 NOW = datetime(2026, 10, 28, 16, 0, tzinfo=timezone.utc)
 MAIN = "https://calendar.google.com/main.ics"

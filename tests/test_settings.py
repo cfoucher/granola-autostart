@@ -2,8 +2,8 @@ import json
 
 import pytest
 
-from secret_box import protect, unprotect
-from settings import ConfigError, load_settings, save_settings
+from granola_autostart.secret_box import protect, unprotect
+from granola_autostart.settings import ConfigError, load_settings, save_settings
 
 
 def write_config(tmp_path, monkeypatch, text: str, encoding: str = "utf-8"):

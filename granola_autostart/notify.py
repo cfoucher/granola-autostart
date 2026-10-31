@@ -12,7 +12,7 @@ import winreg
 from pathlib import Path
 from typing import Callable
 
-from app_status import Problem
+from .status import Problem
 
 log = logging.getLogger("granola_autostart")
 APP_ID = "GranolaAutostart"

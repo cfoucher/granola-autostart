@@ -2,7 +2,7 @@ import threading
 
 import pytest
 
-import commands
+from granola_autostart import commands
 
 
 @pytest.fixture(autouse=True)

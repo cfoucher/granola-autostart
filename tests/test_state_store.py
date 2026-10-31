@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
-from decide import ActiveLaunch, WatcherState
-from state_store import load_state, save_state
+from granola_autostart.decide import ActiveLaunch, WatcherState
+from granola_autostart.state_store import load_state, save_state
 
 
 def test_state_roundtrip(tmp_path, monkeypatch):

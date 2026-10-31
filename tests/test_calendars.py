@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
-from calendar_feed import CalendarEvent, merge_events
-from settings import Settings
+from granola_autostart.calendar_feed import CalendarEvent, merge_events
+from granola_autostart.settings import Settings
 
 
 def test_calendar_urls_keeps_the_primary_and_extra_feeds():
