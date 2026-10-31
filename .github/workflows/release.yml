@@ -11,8 +11,8 @@ on:
       bump:
         description: Which part of the version to increase
         type: choice
-        options: [patch, minor, major]
-        default: patch
+        options: [minor, patch, major]
+        default: minor
 
 permissions:
   contents: write
