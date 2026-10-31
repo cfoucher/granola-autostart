@@ -1,0 +1,60 @@
+# Bumps the version in granola_autostart/__init__.py, commits it to main, tags it, and starts the Build workflow
+# on the tag, which tests, builds the installer, and attaches it to a GitHub release.
+# Run it from the Actions tab (or `gh workflow run release.yml -f bump=minor`). Ubuntu, because nothing here needs Windows.
+# Pushes made with the workflow's token do not trigger other workflows, but a workflow_dispatch does, which is why
+# the last step dispatches Build on the new tag instead of relying on the tag push.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which part of the version to increase
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Bump, commit, and tag
+        id: bump
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          file=granola_autostart/__init__.py
+          current=$(sed -n 's/^__version__ = "\([0-9]*\.[0-9]*\.[0-9]*\)"$/\1/p' "$file")
+          [ -n "$current" ] || { echo "::error::no X.Y.Z __version__ in $file"; exit 1; }
+          IFS=. read -r major minor patch <<< "$current"
+          case "$BUMP" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          new="$major.$minor.$patch"
+          if git ls-remote --exit-code --tags origin "refs/tags/v$new" > /dev/null; then
+            echo "::error::tag v$new already exists"; exit 1
+          fi
+          sed -i "s/^__version__ = \".*\"$/__version__ = \"$new\"/" "$file"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Bump the version to $new."
+          git tag "v$new"
+          git push --atomic origin HEAD:main "v$new"
+          echo "tag=v$new" >> "$GITHUB_OUTPUT"
+      - name: Build and release the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run build.yml --repo "$GITHUB_REPOSITORY" --ref "${{ steps.bump.outputs.tag }}"
