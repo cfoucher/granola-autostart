@@ -65,6 +65,22 @@ Granola's own one-minute reminder is unchanged. Clicking that reminder still ope
 
 Files: `%LOCALAPPDATA%\granola-autostart` holds `config.json`, `state.json`, `status.json`, and the logs (`log.txt`, `supervisor-log.txt`, `settings-log.txt`, `cli-log.txt`, and `notice-log.txt` if the countdown card ever fails). Logs record meeting titles, never calendar addresses.
 
+## Security
+
+A secret calendar address works like a password: anyone who has it can read your whole calendar. Here is how the app handles it, and where that protection stops.
+
+**What is protected.** Calendar addresses are encrypted in `config.json` with the Windows Data Protection API (DPAPI), through `CryptProtectData`. DPAPI means the app stores no key: Windows derives it from your sign-in. Microsoft describes DPAPI as [encrypting data with the current user's account, without you generating or storing a key](https://learn.microsoft.com/en-us/dotnet/standard/security/how-to-use-data-protection), and documents its behaviour and limits in the [`CryptProtectData` reference](https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata). Neither page says DPAPI is *the* recommended way to store a per-user app's secrets; it is the built-in Windows mechanism for this job, and a common choice for it.
+
+Addresses never appear in the logs, `status.json` (feeds there are named by a hash) or error messages. Downloads must use HTTPS, are refused if redirected to plain HTTP, and are capped in size and time. A test (`test_a_failed_download_never_puts_the_address_in_the_log_or_status`) fails every kind of download error on purpose and checks the address appears nowhere.
+
+**What this does not protect against:**
+
+- **Other programs running as you.** DPAPI ties the data to your Windows account, so any program running under it can decrypt the address. The app also mixes in a fixed extra string, but it is in the source code, so it only stops programs that don't know it. It is not a second secret. Microsoft's pages don't cover this case, so don't read them as saying DPAPI defends against it.
+- **Someone who knows your Windows password.** The key comes from your sign-in, so your account's security is the app's security. Use a strong password or Windows Hello, and turn on BitLocker so a stolen laptop's disk can't be read offline.
+- **Another PC or account.** Copying `config.json` elsewhere doesn't work, by design. The app tells you to clear the `ics_urls_protected` list and add your calendars again.
+- **Everything else in the folder.** Only the addresses are encrypted. `config.json` settings, `state.json`, `status.json` and the logs are plain text in `%LOCALAPPDATA%\granola-autostart`, and the logs record meeting titles.
+- **A leaked address.** The app can't revoke it. If you think one has leaked, reset it at the source: in Google Calendar, **Integrate calendar**, **Reset** next to the secret address; in Outlook, unpublish the calendar and publish it again. Then paste the new address into Settings.
+
 ## Development
 
 Use Python 3.13, as CI and the installer do:
