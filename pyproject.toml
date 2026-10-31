@@ -1,2 +1,5 @@
 [tool.pytest.ini_options]
 pythonpath = ["."]
+testpaths = ["tests"]
+# A guard in tests/conftest.py tripped on a background thread must fail the run, not just warn.
+filterwarnings = ["error::pytest.PytestUnhandledThreadExceptionWarning"]

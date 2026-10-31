@@ -11,27 +11,34 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import dataclasses
 import logging
 import os
 import re
-import subprocess
-import sys
 import time
 import urllib.error
-import winreg
+import urllib.parse
 from ctypes import wintypes
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
-from . import __version__, commands
-from .calendar_feed import events_between, feed_name, feed_owner, fetch_ics, my_addresses, normalize_feed_url
-from .settings import ConfigError, Settings, app_dir, config_path, load_settings, save_settings, setup_logging, status_path
-from .status import describe_error, feed_id, read_status, when
+from . import __version__, commands, processes
+from .calendar_feed import (
+    events_between,
+    feed_name,
+    feed_owner,
+    fetch_ics,
+    meetings_next_day,
+    my_addresses,
+    normalize_feed_url,
+    skip_word,
+)
+from .settings import ConfigError, Settings, app_dir, load_or_defaults, load_settings, save_settings, setup_logging, status_path
+from .status import FeedStatus, Status, describe_error, feed_id, read_status, until_tomorrow, when
+from .winui import app_theme, set_window_attribute
 
 log = logging.getLogger("granola_autostart")
-FROZEN = bool(getattr(sys, "frozen", False))
-MAIN = Path(__file__).resolve().with_name("__main__.py")
 # Beside this module from source and in the packaged build's _internal folder alike.
 WEB = Path(__file__).resolve().with_name("web")
 TITLES = {"settings": "Granola Autostart settings", "setup": "Set up Granola Autostart"}
@@ -39,40 +46,9 @@ SIZES = {"settings": (796, 660), "setup": (656, 680)}
 COUNTDOWN_CHOICES = (5, 10, 15, 20, 30)
 IDLE_CHOICES = (1, 2, 5, 10, 15)  # minutes
 SECTIONS = ("calendars", "notes", "about")
-STARTING_SECONDS = 30  # how long "Starting…" shows before a watcher that never came up counts as not running
+STARTING_SECONDS = 30  # after this window starts the watcher, how long "Starting…" shows before it counts as not running
+RESTARTING_SECONDS = 30  # a supervisor with no watcher for longer is restarting one that keeps failing
 _EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
-
-
-def theme() -> str:
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
-            return "light" if winreg.QueryValueEx(key, "AppsUseLightTheme")[0] else "dark"
-    except OSError:
-        return "light"
-
-
-def watcher_running() -> bool:
-    kernel32 = ctypes.windll.kernel32
-    kernel32.OpenMutexW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
-    kernel32.OpenMutexW.restype = wintypes.HANDLE
-    handle = kernel32.OpenMutexW(0x00100000, False, "Local\\GranolaAutostart")
-    if not handle:
-        return False
-    kernel32.CloseHandle(handle)
-    return True
-
-
-def app_command(*args: str) -> list[str]:
-    """This app's other modes: the packaged exe, or pythonw with the package's __main__.py."""
-    if FROZEN:
-        return [sys.executable, *args]
-    pythonw = Path(sys.executable).with_name("pythonw.exe")
-    python = str(pythonw if pythonw.exists() else sys.executable)
-    return [python, str(MAIN), *args]
-
-
-def _spawn(command: list[str]) -> None:
-    subprocess.Popen(command, close_fds=True)
 
 
 def ago(moment: datetime, now: datetime) -> str:
@@ -88,7 +64,7 @@ def ago(moment: datetime, now: datetime) -> str:
 
 
 def provider(url: str) -> str:
-    host = url.split("/")[2].casefold() if url.count("/") >= 2 else ""
+    host = (urllib.parse.urlsplit(url).hostname or "").casefold()
     if host.endswith("google.com"):
         return "Google Calendar"
     if "outlook" in host or "office" in host or "live.com" in host:
@@ -96,41 +72,37 @@ def provider(url: str) -> str:
     return host or "Calendar"
 
 
-def calendar_line(feed: dict | None, now: datetime) -> tuple[str, str]:
+def calendar_line(feed: FeedStatus | None, now: datetime) -> tuple[str, str]:
     """(state, text) for a calendar row: ok, pending, or warn."""
-    if not feed:
+    if feed is not None and feed.failures:
+        return "warn" if feed.alerting else "pending", feed.failure_detail()
+    if feed is None or feed.last_ok is None:
         return "pending", "Checking… The watcher downloads it within a minute."
-    failures = int(feed.get("failures") or 0)
-    reason = f" ({feed['last_error']})" if feed.get("last_error") else ""
-    if failures >= 3:
-        return "warn", f"The last {failures} downloads failed{reason}. Meetings on this calendar won't start notes until it's fixed."
-    if failures:
-        return "pending", f"The last download failed{reason}. Trying again shortly."
-    if not feed.get("last_ok"):
-        return "pending", "Checking… The watcher downloads it within a minute."
-    count = int(feed.get("meetings_next_day") or 0)
-    checked = ago(datetime.fromisoformat(feed["last_ok"]), now)
-    return "ok", f"{count} meeting{'s' if count != 1 else ''} in the next day · checked {checked}"
+    count = feed.meetings_next_day or 0
+    return "ok", f"{count} meeting{'s' if count != 1 else ''} in the next day · checked {ago(feed.last_ok, now)}"
 
 
 def summarize_feed(text: str, settings: Settings, known_owners: list[str], now: datetime) -> dict:
-    """What a Test shows: the calendar's name, how many meetings in the next day, and the next few."""
+    """What a Test shows: the calendar's name, how many meetings in the next day, and the next few.
+
+    It filters the way the watcher does, so Test agrees with what the watcher will start notes for.
+    """
     if "BEGIN:VCALENDAR" not in text[:4096]:
         return {"ok": False, "error": "That address didn't return a calendar. Check you copied the secret address in iCal format."}
     owner = feed_owner(text)
+    words = settings.ignore_title_substrings
     addresses = my_addresses(settings.user_email, [owner, *known_owners])
-    events = [event for event in events_between(text, now, now + timedelta(days=1), user_emails=addresses) if event.start >= now]
-    meetings = []
-    count = 0
-    for event in events:
-        word = next((piece for piece in settings.ignore_title_substrings if piece and piece.casefold() in event.summary.casefold()), None)
-        if word is None:
-            count += 1
-        if len(meetings) < 4:
-            meetings.append(
-                {"time": when(event.start, now), "title": event.summary, "skipped": f"Skipped, title contains “{word}”" if word else None}
-            )
-    return {"ok": True, "name": feed_name(text) or "Calendar", "owner": owner, "count": count, "meetings": meetings}
+    events = events_between(text, now, now + timedelta(days=1), ignore_title_substrings=words, user_emails=addresses, keep_skipped=True)
+    events = [event for event in events if event.start >= now]
+    meetings = [{"time": when(event.start, now), "title": event.summary, "skipped": _skip_reason(event, words)} for event in events[:4]]
+    return {"ok": True, "name": feed_name(text) or "Calendar", "owner": owner, "count": meetings_next_day(events, now), "meetings": meetings}
+
+
+def _skip_reason(event, words) -> str | None:
+    if not event.skipped:
+        return None
+    word = skip_word(event.summary, words)  # None when the word sat past where the title was shortened
+    return f"Skipped, title contains “{word}”" if word else "Skipped by a skip word"
 
 
 class Api:
@@ -143,58 +115,55 @@ class Api:
         # .NET object graph would send it into endless recursion.
         self._window = None
         self._started_at: float | None = None  # time.time() when this window last started the watcher
+        self._waiting_since: float | None = None  # time.monotonic() when a supervisor was first seen with no watcher
 
     # Reading
 
     def load(self) -> dict:
         now = datetime.now().astimezone()
         status = read_status(status_path())
-        try:
-            settings, config_error = load_settings(), None
-        except ConfigError as error:
-            settings, config_error = None, str(error)
-        feeds = {feed.get("id"): feed for feed in status.get("feeds") or [] if isinstance(feed, dict)}
-        running = watcher_running()
+        settings, config_error = load_or_defaults()
+        running = processes.watcher_running()
+        waiting = not running and processes.supervisor_running()
+        if not waiting:
+            self._waiting_since = None
+        elif self._waiting_since is None:
+            self._waiting_since = time.monotonic()
         return {
             "page": self.page,
             "section": self.section,
-            "theme": theme(),
+            "theme": app_theme(),
             "version": __version__,
             "config_error": config_error,
-            "settings": self._settings_view(settings, feeds, now) if settings else None,
-            "status": self._status_view(status, running, now),
+            "settings": None if config_error else self._settings_view(settings, status.feeds, now),
+            "status": self._status_view(status, running, now, waiting=time.monotonic() - self._waiting_since if waiting else None),
         }
 
-    def _settings_view(self, settings: Settings, feeds: dict, now: datetime) -> dict:
+    def _settings_view(self, settings: Settings, feeds: list[FeedStatus], now: datetime) -> dict:
+        by_id = {feed.id: feed for feed in feeds}
         calendars = []
         for url in settings.calendar_urls():
-            feed = feeds.get(feed_id(url))
+            feed = by_id.get(feed_id(url))
             state, line = calendar_line(feed, now)
             calendars.append(
                 {
                     "id": feed_id(url),
-                    "name": (feed or {}).get("name") or "New calendar",
+                    "name": (feed.name if feed else None) or "New calendar",
                     "provider": provider(url),
                     "state": state,
                     "line": line,
                 }
             )
-        detected = []
-        for feed in feeds.values():
-            owner = feed.get("owner")
-            if owner and owner not in detected:
-                detected.append(owner)
         idle_minutes = min(IDLE_CHOICES, key=lambda choice: abs(choice * 60 - settings.idle_seconds))
         return {
             "calendars": calendars,
-            "detected_addresses": detected,
+            "detected_addresses": _owners(feeds),
             "user_email": settings.user_email,
             "countdown_seconds": settings.countdown_seconds,
             "countdown_choices": list(COUNTDOWN_CHOICES),
             "idle_minutes": idle_minutes,
             "idle_choices": list(IDLE_CHOICES),
             "skip_words": list(settings.ignore_title_substrings),
-            "setup_complete": settings.setup_complete,
         }
 
     def _starting(self) -> bool:
@@ -206,50 +175,47 @@ class Api:
         except OSError:
             return True
 
-    def _status_view(self, status: dict, running: bool, now: datetime) -> dict:
-        """The side panel's status box. Its buttons (see web/app.js) follow the state, like the tray menu."""
-        problems = [p for p in status.get("problems") or [] if isinstance(p, dict)]
-        paused_until = datetime.fromisoformat(status["paused_until"]) if status.get("paused_until") else None
+    def _status_view(self, status: Status, running: bool, now: datetime, *, waiting: float | None = None) -> dict:
+        """The side panel's status box. Its buttons (see web/app.js) follow the state, like the tray menu.
+
+        ``waiting``: for how many seconds the supervisor has been up with no watcher. Briefly, that is the
+        watcher starting (at sign-in); for longer, the supervisor is restarting one that keeps failing.
+        """
+        problems = status.problems
+        paused_until = status.paused_until
         paused = bool(running and paused_until and now < paused_until)
-        upcoming = status.get("next_meeting")
-        notes = status.get("taking_notes")
-        last = status.get("last_start")
-        # Pausing for today pauses until midnight, which the tray calls "until tomorrow".
-        today = bool(paused and paused_until.astimezone(now.tzinfo) == _midnight(now))
+        today = bool(paused and until_tomorrow(paused_until, now))
+        last = status.last_start
         if self._starting():
             state, detail = "starting", "Checking your calendars."
+        elif waiting is not None and waiting < RESTARTING_SECONDS:
+            state, detail = "starting", "Starting up."
+        elif waiting is not None:
+            state, detail = "starting", "Restarting after a problem. The log folder says why."
         elif not running:
             state, detail = "stopped", "Meetings won't start notes."
         elif problems:
-            state, detail = "attention", problems[0].get("title", "")
+            state, detail = "attention", problems[0].title
         elif paused and today:
             state, detail = "paused", "Until tomorrow. Zoom calls won't be asked about later."
         elif paused:
             state, detail = "paused", f"Until {when(paused_until, now)}. No countdown cards until then."
-        elif notes:
-            state, detail = "notes", f"{notes['title']}, since {when(datetime.fromisoformat(notes['since']), now)}"
-        elif upcoming:
-            state, detail = "watching", f"Next: {upcoming['title']} at {when(datetime.fromisoformat(upcoming['start']), now)}"
+        elif status.taking_notes:
+            title, since = status.taking_notes
+            state, detail = "notes", f"{title}, since {when(since, now)}"
+        elif status.next_meeting:
+            title, start = status.next_meeting
+            state, detail = "watching", f"Next: {title} at {when(start, now)}"
         else:
             state, detail = "watching", "No meetings coming up. Zoom calls still start notes."
-        last_view = None
-        if isinstance(last, dict) and last.get("title") and last.get("at"):
-            opened = last.get("granola_opened")
-            last_view = {
-                "title": last["title"],
-                "when": when(datetime.fromisoformat(last["at"]), now),
-                "opened": opened,
-            }
         return {
             "running": running,
             "state": state,
             "detail": detail,
             "paused": paused,
             "paused_today": today,
-            "fix_section": problems[0].get("section") if problems else None,
-            "problems": problems,
-            "last_start": last_view,
-            "next": upcoming,
+            "fix_section": problems[0].section if problems else None,
+            "last_start": {"title": last.title, "when": when(last.at, now), "opened": last.granola_opened} if last else None,
         }
 
     # Calendars
@@ -259,20 +225,15 @@ class Api:
             cleaned = normalize_feed_url(url)
         except ValueError:
             return {"ok": False, "error": "Calendar addresses start with https:// (or webcal://)."}
-        try:
-            settings = load_settings()
-        except ConfigError:
-            settings = Settings()
+        settings, _error = load_or_defaults()
         try:
             text = fetch_ics(cleaned, timeout=20)
         except urllib.error.HTTPError as error:
             return {"ok": False, "error": f"Couldn't read that address ({describe_error(error)}). Check you copied all of it."}
         except Exception as error:
             return {"ok": False, "error": f"Couldn't download that address ({describe_error(error)})."}
-        status = read_status(status_path())
-        owners = [feed.get("owner") for feed in status.get("feeds") or [] if isinstance(feed, dict) and feed.get("owner")]
         try:
-            return summarize_feed(text, settings, owners, datetime.now().astimezone())
+            return summarize_feed(text, settings, _owners(read_status(status_path()).feeds), datetime.now().astimezone())
         except Exception as error:
             log.warning("test could not read the calendar (%s)", type(error).__name__)
             return {"ok": False, "error": "That address returned a calendar this app couldn't read."}
@@ -284,100 +245,80 @@ class Api:
     def add_calendar(self, url: str) -> dict:
         cleaned = normalize_feed_url(url)
         settings = load_settings()
-        if cleaned not in settings.calendar_urls():
-            settings.ics_urls = (*settings.calendar_urls(), cleaned)
-            save_settings(settings)
-            log.info("calendar added from Settings")
-        return self.load()
+        if cleaned in settings.calendar_urls():
+            return self.load()
+        log.info("calendar added from Settings")
+        return self._save(settings, ics_urls=(*settings.calendar_urls(), cleaned))
 
     def remove_calendar(self, calendar_id: str) -> dict:
         settings = load_settings()
-        settings.ics_urls = tuple(url for url in settings.calendar_urls() if feed_id(url) != calendar_id)
-        settings.ics_url = ""
-        save_settings(settings)
         log.info("calendar removed from Settings")
-        return self.load()
+        return self._save(settings, ics_urls=tuple(url for url in settings.calendar_urls() if feed_id(url) != calendar_id))
 
     def set_email(self, email: str) -> dict:
         email = (email or "").strip()
         if email and not _EMAIL.fullmatch(email):
             return {**self.load(), "error": "That doesn't look like an email address."}
-        settings = load_settings()
-        settings.user_email = email
-        save_settings(settings)
-        return self.load()
+        return self._save(load_settings(), user_email=email)
 
     # Starting notes
 
     def set_countdown(self, seconds: int) -> dict:
-        if int(seconds) in COUNTDOWN_CHOICES:
-            settings = load_settings()
-            settings.countdown_seconds = int(seconds)
-            save_settings(settings)
-        return self.load()
+        if int(seconds) not in COUNTDOWN_CHOICES:
+            return self.load()
+        return self._save(load_settings(), countdown_seconds=int(seconds))
 
     def set_idle(self, minutes: int) -> dict:
-        if int(minutes) in IDLE_CHOICES:
-            settings = load_settings()
-            settings.idle_seconds = int(minutes) * 60
-            save_settings(settings)
-        return self.load()
+        if int(minutes) not in IDLE_CHOICES:
+            return self.load()
+        return self._save(load_settings(), idle_seconds=int(minutes) * 60)
 
     def add_word(self, word: str) -> dict:
         word = " ".join((word or "").split())
         settings = load_settings()
-        if word and word.casefold() not in (piece.casefold() for piece in settings.ignore_title_substrings):
-            settings.ignore_title_substrings = (*settings.ignore_title_substrings, word)
-            save_settings(settings)
-        return self.load()
+        words = settings.ignore_title_substrings
+        if not word or word.casefold() in (piece.casefold() for piece in words):
+            return self.load()
+        return self._save(settings, ignore_title_substrings=(*words, word))
 
     def remove_word(self, word: str) -> dict:
         settings = load_settings()
-        settings.ignore_title_substrings = tuple(piece for piece in settings.ignore_title_substrings if piece != word)
-        save_settings(settings)
-        return self.load()
+        return self._save(settings, ignore_title_substrings=tuple(piece for piece in settings.ignore_title_substrings if piece != word))
 
     def preview(self) -> None:
         """Show the countdown card. The card never starts Granola by itself, so nothing is launched."""
-        try:
-            seconds = load_settings().countdown_seconds
-        except ConfigError:
-            seconds = 10
-        upcoming = read_status(status_path()).get("next_meeting") or {}
-        title = upcoming.get("title") or "Weekly product sync"
-        _spawn(app_command("--notice", f"--title={title}", f"--seconds={seconds}"))
+        upcoming = read_status(status_path()).next_meeting
+        title = upcoming[0] if upcoming else "Weekly product sync"
+        processes.spawn(processes.notice_command(title, load_or_defaults()[0].countdown_seconds))
 
     # First-run setup
 
     def finish_setup(self, url: str | None, email: str | None) -> dict:
+        """Setup's Finish, and its "Zoom only for now", which sends neither."""
         settings = load_settings()
-        if url:
-            cleaned = normalize_feed_url(url)
-            if cleaned not in settings.calendar_urls():
-                settings.ics_urls = (*settings.calendar_urls(), cleaned)
-        if email and _EMAIL.fullmatch(email.strip()):
-            settings.user_email = email.strip()
-        settings.setup_complete = True
-        save_settings(settings)
-        log.info("setup finished (%s calendars)", len(settings.calendar_urls()))
+        urls = settings.calendar_urls()
+        cleaned = normalize_feed_url(url) if url else None
+        if cleaned and cleaned not in urls:
+            urls.append(cleaned)
+        email = (email or "").strip()
+        user_email = email if _EMAIL.fullmatch(email) else settings.user_email
+        save_settings(dataclasses.replace(settings, ics_urls=tuple(urls), user_email=user_email, setup_complete=True))
+        log.info("setup finished (%s calendars)", len(urls))
         self._ensure_watcher()
         return self.load()
 
-    def skip_setup(self) -> dict:
-        settings = load_settings()
-        settings.setup_complete = True
-        save_settings(settings)
-        log.info("setup finished for Zoom only")
-        self._ensure_watcher()
+    def _save(self, settings: Settings, **changes) -> dict:
+        """Save ``settings`` with ``changes``, which the running watcher picks up, and return the new view."""
+        save_settings(dataclasses.replace(settings, **changes))
         return self.load()
 
     # Elsewhere
 
     def open_logs(self) -> None:
-        os.startfile(str(app_dir()))
+        processes.open_log_folder()
 
     def open_config(self) -> None:
-        _spawn(["notepad.exe", str(config_path())])
+        processes.open_config_file()
 
     def open_link(self, url: str) -> None:
         if url.startswith("https://"):
@@ -402,14 +343,16 @@ class Api:
     def quit_app(self) -> dict:
         self._started_at = None
         if commands.send("quit"):
-            _wait_for(lambda: not watcher_running(), seconds=10)
+            # A countdown card on screen keeps the watcher busy until it closes.
+            seconds = load_or_defaults()[0].countdown_seconds + 15
+            _wait_for(lambda: not processes.watcher_running() and not processes.supervisor_running(), seconds=seconds)
         return self.load()
 
     def _change_pause(self, command: str) -> None:
         """Send it, then give the watcher a moment to write the new pause, so the page shows it at once."""
-        before = read_status(status_path()).get("paused_until")
+        before = read_status(status_path()).paused_until
         if commands.send(command):
-            _wait_for(lambda: read_status(status_path()).get("paused_until") != before)
+            _wait_for(lambda: read_status(status_path()).paused_until != before)
 
     def open_settings(self) -> dict:
         """Setup's Done: the same window becomes Settings, so another calendar can be added straight away."""
@@ -421,8 +364,8 @@ class Api:
         return self.load()
 
     def run_setup(self) -> None:
-        _release_window_mutex()
-        _spawn(app_command("--setup"))
+        processes.release_mutex(processes.SETTINGS_MUTEX)
+        processes.open_setup()
         self.close()
 
     def close(self) -> None:
@@ -430,9 +373,10 @@ class Api:
             self._window.destroy()
 
     def _ensure_watcher(self) -> None:
-        if not watcher_running():
+        # A supervisor waiting to restart a watcher that crashed will start it; a second one would quit at once.
+        if not processes.watcher_running() and not processes.supervisor_running():
             self._started_at = time.time()
-            _spawn(app_command("--supervise"))
+            processes.start_supervisor()
 
     def _url_for(self, calendar_id: str) -> str | None:
         try:
@@ -442,8 +386,9 @@ class Api:
         return next((url for url in urls if feed_id(url) == calendar_id), None)
 
 
-def _midnight(now: datetime) -> datetime:
-    return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+def _owners(feeds: list[FeedStatus]) -> list[str]:
+    """The calendars' own addresses, which also count as the user's for declined meetings."""
+    return list(dict.fromkeys(feed.owner for feed in feeds if feed.owner))
 
 
 def _wait_for(done: Callable[[], bool], seconds: float = 3) -> bool:
@@ -453,25 +398,6 @@ def _wait_for(done: Callable[[], bool], seconds: float = 3) -> bool:
             return False
         time.sleep(0.1)
     return True
-
-
-_WINDOW_MUTEX = None
-
-
-def _hold_window_mutex() -> bool:
-    global _WINDOW_MUTEX
-    kernel32 = ctypes.windll.kernel32
-    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
-    kernel32.CreateMutexW.restype = wintypes.HANDLE
-    _WINDOW_MUTEX = kernel32.CreateMutexW(None, False, "Local\\GranolaAutostartSettings")
-    return bool(_WINDOW_MUTEX) and kernel32.GetLastError() != 183
-
-
-def _release_window_mutex() -> None:
-    global _WINDOW_MUTEX
-    if _WINDOW_MUTEX:
-        ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(_WINDOW_MUTEX))
-        _WINDOW_MUTEX = None
 
 
 def _bring_forward() -> None:
@@ -489,18 +415,8 @@ def _bring_forward() -> None:
 def _style_title_bar(window, dark: bool) -> None:
     """Paper-coloured title bar on Windows 11 (ignored on Windows 10)."""
     try:
-        hwnd = wintypes.HWND(int(window.native.Handle.ToInt64()))
-        dwm = ctypes.windll.dwmapi
-
-        def set_attribute(attribute: int, value: int) -> None:
-            data = ctypes.c_int(value)
-            dwm.DwmSetWindowAttribute(hwnd, attribute, ctypes.byref(data), ctypes.sizeof(data))
-
-        def colorref(hex_colour: str) -> int:
-            r, g, b = (int(hex_colour[i : i + 2], 16) for i in (1, 3, 5))
-            return r | (g << 8) | (b << 16)
-
-        if not FROZEN:
+        hwnd = int(window.native.Handle.ToInt64())
+        if not processes.FROZEN:
             # The packaged exe carries the icon; from source the window would show Python's.
             icon = app_dir() / "app.ico"
             if icon.exists():
@@ -508,11 +424,11 @@ def _style_title_bar(window, dark: bool) -> None:
                 user32.LoadImageW.restype = wintypes.HANDLE
                 handle = user32.LoadImageW(None, str(icon), 1, 0, 0, 0x00000010)  # IMAGE_ICON, LR_LOADFROMFILE
                 for which in (0, 1):  # ICON_SMALL, ICON_BIG
-                    user32.SendMessageW(hwnd, 0x0080, which, handle)  # WM_SETICON
-        set_attribute(20, 1 if dark else 0)  # DWMWA_USE_IMMERSIVE_DARK_MODE
-        set_attribute(35, colorref("#1f1d1a" if dark else "#f4efe4"))  # DWMWA_CAPTION_COLOR
-        set_attribute(36, colorref("#f1ece1" if dark else "#2b2924"))  # DWMWA_TEXT_COLOR
-        set_attribute(34, colorref("#3d3a33" if dark else "#e2d9c6"))  # DWMWA_BORDER_COLOR
+                    user32.SendMessageW(wintypes.HWND(hwnd), 0x0080, which, handle)  # WM_SETICON
+        set_window_attribute(hwnd, 20, 1 if dark else 0)  # DWMWA_USE_IMMERSIVE_DARK_MODE
+        set_window_attribute(hwnd, 35, "#1f1d1a" if dark else "#f4efe4")  # DWMWA_CAPTION_COLOR
+        set_window_attribute(hwnd, 36, "#f1ece1" if dark else "#2b2924")  # DWMWA_TEXT_COLOR
+        set_window_attribute(hwnd, 34, "#3d3a33" if dark else "#e2d9c6")  # DWMWA_BORDER_COLOR
     except Exception as error:
         log.debug("title bar colours not applied (%s)", type(error).__name__)
 
@@ -570,13 +486,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--section", default="calendars", choices=SECTIONS)
     args = parser.parse_args(argv)
     setup_logging("settings-log.txt")
-    if not _hold_window_mutex():
+    if not processes.hold_mutex(processes.SETTINGS_MUTEX):
         _bring_forward()
         return 0
     import webview
 
     page = "setup" if args.setup else "settings"
-    dark = theme() == "dark"
+    dark = app_theme() == "dark"
     api = Api(page, args.section)
     if page == "settings":
         # The Start menu shortcut opens Settings, so opening it also starts an app that was quit.
@@ -599,6 +515,6 @@ def main(argv: list[str] | None = None) -> int:
         webview.start(gui="edgechromium", private_mode=True)
     except Exception:
         log.exception("the settings window could not open; opening config.json instead")
-        _spawn(["notepad.exe", str(config_path())])
+        processes.open_config_file()
         return 1
     return 0

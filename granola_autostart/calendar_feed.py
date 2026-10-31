@@ -16,6 +16,7 @@ import recurring_ical_events
 log = logging.getLogger("granola_autostart")
 MAX_FEED_BYTES = 64 * 1024 * 1024
 PREFILTER_MARGIN = timedelta(days=7)
+DEFAULT_MEETING_LENGTH = timedelta(hours=1)
 _EMAIL = re.compile(r"[^@\s:;]+@[^@\s:;]+\.[^@\s:;]+")
 
 
@@ -213,6 +214,8 @@ def events_between(
 ) -> list[CalendarEvent]:
     """Meetings in the window. With ``keep_skipped``, ones with a skip word stay in, marked ``skipped``."""
     calendar = Calendar.from_ical(prefilter_ics(ics_text, window_start, window_end))
+    _give_missing_ends_an_hour(calendar)
+    # Starts and ends are written in today's UTC offset, which stored event keys already use.
     local_zone = datetime.now().astimezone().tzinfo or timezone.utc
     series_uids = {
         str(component.get("uid") or "").strip()
@@ -235,6 +238,29 @@ def events_between(
     return found
 
 
+def skip_word(summary: str, words) -> str | None:
+    """The first skip word in a meeting's title, if it has one."""
+    return next((word for word in words if word and word.casefold() in summary.casefold()), None)
+
+
+def meetings_next_day(events: list[CalendarEvent], now: datetime) -> int:
+    """How many meetings start in the next day, leaving out skipped ones: a calendar's health at a glance."""
+    return sum(1 for event in events if not event.skipped and now <= event.start < now + timedelta(days=1))
+
+
+def _give_missing_ends_an_hour(calendar) -> None:
+    """A timed event with neither DTEND nor DURATION is zero-length by the standard.
+
+    recurring_ical_events follows that and sets DTEND to DTSTART, so the meeting would
+    be dropped. Adding the hour to the source also lets the window see one under way.
+    """
+    for component in calendar.walk("VEVENT"):
+        if "DTEND" in component or "DURATION" in component:
+            continue
+        if isinstance(_raw_dt(component.get("dtstart")), datetime):
+            component.add("duration", DEFAULT_MEETING_LENGTH)
+
+
 def _component_to_event(
     component,
     *,
@@ -249,20 +275,14 @@ def _component_to_event(
     if _declined(component, user_emails):
         return None
     start_value = _raw_dt(component.get("dtstart"))
-    if not isinstance(start_value, datetime):
-        return None
+    # recurring_ical_events always sets DTEND on an occurrence, working it out from DURATION if need be.
     end_value = _raw_dt(component.get("dtend"))
-    if isinstance(end_value, datetime):
-        end = _as_aware(end_value, local_zone)
-    else:
-        duration = component.get("duration")
-        if duration is not None and getattr(duration, "dt", None):
-            end = _as_aware(start_value, local_zone) + duration.dt
-        else:
-            end = _as_aware(start_value, local_zone) + timedelta(hours=1)
+    if not isinstance(start_value, datetime) or not isinstance(end_value, datetime):
+        return None
     start = _as_aware(start_value, local_zone)
+    end = _as_aware(end_value, local_zone)
     summary = str(component.get("summary") or "").strip() or "Meeting"
-    skipped = any(piece.casefold() in summary.casefold() for piece in ignore_title_substrings if piece)
+    skipped = skip_word(summary, ignore_title_substrings) is not None
     uid = str(component.get("uid") or "").strip()
     if not uid:
         uid = f"{summary}-{start.isoformat()}"
@@ -321,5 +341,14 @@ def _raw_dt(prop):
 
 def _as_aware(value: datetime, local_zone) -> datetime:
     if value.tzinfo is None:
-        return value.replace(tzinfo=local_zone)
+        try:
+            value = _local_time(value)
+        except (OSError, OverflowError, ValueError):
+            # Windows only knows its zone's rules from 1970 to 3000.
+            return value.replace(tzinfo=local_zone)
     return value.astimezone(local_zone)
+
+
+def _local_time(value: datetime) -> datetime:
+    """A floating time (no TZID, no Z) on this PC's clock, with that date's daylight saving rule."""
+    return value.astimezone()

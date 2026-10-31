@@ -1,8 +1,9 @@
 import json
 import urllib.parse
-from datetime import datetime, timedelta, timezone
 
-from granola_autostart.granola_launch import adhoc_payload, build_url, meeting_title
+import pytest
+
+from granola_autostart.granola_launch import build_url, launch
 
 
 def decoded_params(url: str) -> dict:
@@ -49,21 +50,7 @@ def test_awkward_titles_survive_the_double_encoding():
     assert set(params) == {"creation_source", "auto_transcribe", "event"}
 
 
-def test_notice_title_starting_with_a_dash_is_not_an_option():
-    from granola_autostart.notice import build_parser
-    from granola_autostart.watcher import notice_command
-
-    command = notice_command("-- standup", 10, "calendar")
-    args = build_parser().parse_args(command[command.index("--notice") + 1 :])
-    assert args.title == "-- standup"
-    assert args.seconds == 10
-
-
-def test_adhoc_zoom_title_ignores_the_generic_window_name():
-    assert meeting_title("Zoom Meeting") == "Zoom meeting"
-    assert meeting_title("Roadmap") == "Roadmap"
-    now = datetime(2026, 10, 28, 17, 0, tzinfo=timezone.utc)
-    payload = adhoc_payload("Roadmap", "10:20", now)
-    assert payload["summary"] == "Roadmap"
-    assert payload["id"] == "zoom-10-20"
-    assert payload["end"]["dateTime"] == (now + timedelta(hours=1)).isoformat()
+def test_only_granola_links_are_opened():
+    with pytest.raises(ValueError):
+        launch("https://example.com/", dry_run=False)
+    launch(build_url(None), dry_run=True)  # logged, never opened

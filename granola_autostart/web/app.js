@@ -43,7 +43,7 @@ const ui = {
   tests: {}, confirmRemove: null, showHelp: false,
   addingAddress: false, newAddress: "", emailError: null,
   newWord: "",
-  pauseMenu: false, busy: false,
+  pauseMenu: false, busy: false, error: null, actions: 0,
   step: "welcome", tab: "google", setupUrl: "", found: null, setupBusy: false, setupError: null, setupEmail: "", zoomOnly: false,
 };
 const api = () => window.pywebview.api;
@@ -57,7 +57,10 @@ window.addEventListener("pywebviewready", async () => {
 
 async function poll() {
   if (!data || data.page !== "settings" || document.hidden) return;
-  const fresh = await api().load();
+  // An action that ran meanwhile already loaded newer data than this poll may bring back.
+  const actionsBefore = ui.actions;
+  const fresh = await api().load().catch(() => null);
+  if (!fresh || ui.actions !== actionsBefore) return;
   const changed = JSON.stringify([fresh.status, fresh.settings, fresh.config_error, fresh.theme]) !==
     JSON.stringify([data.status, data.settings, data.config_error, data.theme]);
   data = fresh;
@@ -98,7 +101,7 @@ function settingsView() {
       ${nav("about", "info", "About")}
       ${statusBox()}
     </nav>
-    <main>${{ calendars: calendarsSection, notes: notesSection, about: aboutSection }[ui.section]()}</main>
+    <main>${errorBlock(data.config_error && ui.section !== "about" ? null : ui.error)}${{ calendars: calendarsSection, notes: notesSection, about: aboutSection }[ui.section]()}</main>
   </div>`;
 }
 
@@ -194,7 +197,7 @@ function testOutcome(result) {
 }
 
 function resultBlock(result) {
-  if (!result.ok) return `<div class="result error" role="alert"><div class="headline">${icon("warn", "sm")}<span>${esc(result.error)}</span></div></div>`;
+  if (!result.ok) return errorBlock(result.error);
   const rows = result.meetings
     .map((m) => `<span class="time">${esc(m.time)}</span><span class="${m.skipped ? "skipped" : ""}">${esc(m.title)}${m.skipped ? ` · ${esc(m.skipped)}` : ""}</span>`)
     .join("");
@@ -305,7 +308,7 @@ function aboutSection() {
   const busy = ui.busy ? "disabled" : "";
   let watcher;
   if (s.state === "starting") {
-    watcher = row("clock", "Starting…", "Checking your calendars.");
+    watcher = row("clock", "Starting…", s.detail);
   } else if (s.running) {
     watcher = row("check", "Running in the background", "It starts when you sign in to Windows. If you quit, it starts again at sign-in, or from the Start menu.", "",
       `<button class="btn small" data-action="quitApp" ${busy}>Quit</button>`);
@@ -330,7 +333,7 @@ function row(glyph, title, detail, tone = "", action = "") {
 
 function setupView() {
   const step = { welcome: welcomeStep, calendar: calendarStep, found: foundStep, done: doneStep }[ui.step]();
-  return `<div class="setup"><main>${step.body}</main><div class="footer">${step.footer}</div></div>`;
+  return `<div class="setup"><main>${errorBlock(ui.error)}${step.body}</main><div class="footer">${step.footer}</div></div>`;
 }
 
 function card() {
@@ -385,7 +388,7 @@ function calendarStep() {
         <label class="label" for="setup-url">Paste the address</label>
         <input id="setup-url" class="field" type="text" spellcheck="false" autocomplete="off" placeholder="https://calendar.google.com/calendar/ical/…/basic.ics"
           value="${esc(ui.setupUrl)}" data-bind="setupUrl" data-enter="testSetup">
-        ${ui.setupError ? `<div class="result error" role="alert"><div class="headline">${icon("warn", "sm")}<span>${esc(ui.setupError)}</span></div></div>` : ""}
+        ${errorBlock(ui.setupError)}
         <p class="footnote" style="margin-top:2px">${icon("lock", "sm")}Anyone with this address can read your calendar, so it's stored encrypted on this PC and never written to logs.</p>
       </div>`,
     footer: `<button class="btn large" data-action="goStep" data-step="welcome">Back</button>
@@ -490,7 +493,6 @@ const actions = {
   resume: () => command(() => api().resume()),
   quitApp: () => command(() => api().quit_app()),
   fix: () => { ui.section = data.status.fix_section || "calendars"; render(); },
-  close: () => api().close(),
   // Setup's Done turns this window into Settings, so another calendar can be added right away.
   toSettings: async () => { data = await api().open_settings(); ui.section = "calendars"; render(); },
   goStep: (d) => { ui.step = d.step; ui.setupError = null; render(); if (d.step === "calendar") focusSoon("setup-url"); },
@@ -508,8 +510,33 @@ const actions = {
     data = await api().finish_setup(ui.setupUrl, ui.found && !ui.found.owner ? ui.setupEmail : null);
     ui.setupBusy = false; ui.zoomOnly = false; ui.step = "done"; render();
   },
-  zoomOnly: async () => { data = await api().skip_setup(); ui.zoomOnly = true; ui.step = "done"; render(); },
+  zoomOnly: async () => { data = await api().finish_setup(null, null); ui.zoomOnly = true; ui.step = "done"; render(); },
 };
+
+// A Python call can fail, most often on a config.json that can't be read. Every action recovers the
+// same way, so no button stays stuck on "Testing…" and the page says why.
+async function perform(name, ...args) {
+  const action = actions[name];
+  if (!action) return;
+  ui.actions += 1;
+  ui.error = null;
+  try {
+    await action(...args);
+  } catch {
+    ui.busy = ui.addBusy = ui.setupBusy = false;
+    for (const id of Object.keys(ui.tests)) if (ui.tests[id].busy) delete ui.tests[id];
+    try { data = await api().load(); } catch { /* keep the page as it was */ }
+    ui.error = data.config_error ? `${data.config_error}.` : "That didn't work. Try again, or open the log folder from About.";
+    render();
+  } finally {
+    // A poll that began while this ran may bring back data from before it, so it is dropped too.
+    ui.actions += 1;
+  }
+}
+
+function errorBlock(message) {
+  return message ? `<div class="result error" role="alert"><div class="headline">${icon("warn", "sm")}<span>${esc(message)}</span></div></div>` : "";
+}
 
 // Pause, Resume, Start, and Quit wait for the watcher to act, so their buttons stay disabled meanwhile.
 async function command(call) {
@@ -547,7 +574,7 @@ app.addEventListener("click", (event) => {
   const target = event.target.closest("[data-action]");
   if (!target || target.disabled) return;
   event.preventDefault();
-  actions[target.dataset.action]?.(target.dataset, target);
+  perform(target.dataset.action, target.dataset, target);
 });
 app.addEventListener("input", (event) => {
   const bind = event.target.dataset.bind;
@@ -559,9 +586,9 @@ app.addEventListener("input", (event) => {
 });
 app.addEventListener("keydown", (event) => {
   const action = event.target.dataset.enter;
-  if (event.key === "Enter" && action) { event.preventDefault(); actions[action](event.target.dataset, event.target); }
+  if (event.key === "Enter" && action) { event.preventDefault(); perform(action, event.target.dataset, event.target); }
 });
 app.addEventListener("change", (event) => {
   const action = event.target.dataset.change;
-  if (action) actions[action](event.target.dataset, event.target);
+  if (action) perform(action, event.target.dataset, event.target);
 });

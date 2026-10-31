@@ -4,9 +4,9 @@
 
 Starts [Granola](https://granola.ai) when a meeting begins on this PC. A small card appears first in the top-right corner of the screen under the pointer, with the meeting title and a 10-second ring.
 
-**Cancel** leaves Granola alone. **Start now** or doing nothing opens that meeting's note and starts transcription. It does not join Zoom. The card never takes keyboard focus, so typing in another app is not interrupted (and Esc is not used).
+**Cancel** leaves Granola alone. **Start now** or doing nothing opens that meeting's note and starts transcription. It does not join Zoom. The card never takes keyboard focus, so typing in another app is not interrupted (and Esc is not used). If the card itself can't open, notes for a meeting start anyway, as if nobody had answered it, and the tray says the card is broken. Notes aren't restarted after Granola closes without a card to cancel.
 
-It runs in the background, so this still works when Granola was quit or crashed. The same card is used for a calendar meeting (including one where you are in the room and not on Zoom), a Zoom join, and Granola closing mid-meeting.
+It runs in the background, so this still works when Granola was quit or crashed. The same card is used for a calendar meeting (including one where you are in the room and not on Zoom), a Zoom join, and Granola closing mid-meeting (for notes started from a Zoom call, while that call is still going).
 
 Notes start only when the Windows session is unlocked and you have used the mouse or keyboard in the last few minutes. A locked or idle laptop does not start a recording. If you sit down after the start time, the card appears then, until the meeting's scheduled end.
 
@@ -22,7 +22,7 @@ Granola Autostart is an independent tool and is not made by Granola.
 
    Paste it, choose **Test address**, check the meetings it found, then **Finish**.
 
-It starts again whenever you sign in to Windows. Look for the green circle in the system tray.
+It starts again whenever you sign in to Windows. Look for the green ring with a small labyrinth in the system tray; the dot in its middle is green while it's watching.
 
 ### Settings
 
@@ -33,7 +33,7 @@ Left-click the tray icon, or right-click it and choose **Settings…**.
 - **Starting notes:** countdown length (with **Preview**), how recently you must have used the PC, and words that skip a meeting (`focus time`, `out of office`, and `lunch` to start with). All-day events are always skipped.
 - **About:** version, whether it's running (with **Quit** or **Start**), the last time it started Granola, and the log folder.
 
-The box at the foot of the side panel shows what the app is doing: watching (and the next meeting), taking notes, paused, needing attention, or not running. It has the tray menu's buttons: **Pause** (for 1 hour or the rest of today), **Resume**, **Fix**, and **Start**.
+The box at the foot of the side panel shows what the app is doing: starting up (or restarting after a problem), watching (and the next meeting), taking notes, paused, needing attention, or not running. It has the tray menu's buttons: **Pause** (for 1 hour or the rest of today), **Resume**, **Fix**, and **Start**.
 
 Changes save as you make them, and the running app picks them up within a few seconds.
 
@@ -43,14 +43,15 @@ Calendars are downloaded every 5 minutes while you are at the PC, and again when
 
 ### Tray and notifications
 
-- **Pause for 1 hour** or **Pause for today** — no new cards, and a countdown already on screen will not start Granola. A Zoom join during the pause is not asked about later. The icon turns grey.
+- **Pause for 1 hour** or **Pause for today** — no new cards, and a countdown already on screen will not start Granola. A Zoom join during the pause is not asked about later. The icon's middle dot turns grey.
 - **Resume**, **Settings…**, **Open log folder**, **About**, **Quit** (it starts again at the next sign-in, or from the Start menu).
 
-When something needs fixing, the icon gets an orange dot and Windows shows a notification once:
+When something needs fixing, the middle dot turns orange and Windows shows a notification once:
 
-- **Granola didn't open** 30 seconds after a start. Granola's launch link is undocumented, so an update could break it; **Try again**, or open Granola yourself.
+- **Granola didn't open** 30 seconds after a start, or at once when Windows couldn't open its link. Granola's launch link is undocumented, so an update could break it; **Try again**, or open Granola yourself.
 - **A calendar isn't updating** after 3 failed downloads in a row.
 - **Settings couldn't be read**, after a hand edit broke `config.json`. Zoom joins still start notes meanwhile.
+- **The countdown card couldn't open.** Meetings start notes without it, but Granola isn't restarted after it closes. The log folder says why.
 
 Granola's own one-minute reminder is unchanged. Clicking that reminder still opens the video call. Turn it off in Granola's notification settings if the second popup is in the way.
 
@@ -58,13 +59,15 @@ Granola's own one-minute reminder is unchanged. Clicking that reminder still ope
 
 **Settings**, **Apps**, **Installed apps**, **Granola Autostart**, **Uninstall**. It stops the app and asks whether to keep your settings.
 
-Files: `%LOCALAPPDATA%\granola-autostart` holds `config.json`, `state.json`, `status.json`, and the logs (`log.txt`, `supervisor-log.txt`, `settings-log.txt`, `cli-log.txt`). Logs record meeting titles, never calendar addresses.
+Files: `%LOCALAPPDATA%\granola-autostart` holds `config.json`, `state.json`, `status.json`, and the logs (`log.txt`, `supervisor-log.txt`, `settings-log.txt`, `cli-log.txt`, and `notice-log.txt` if the countdown card ever fails). Logs record meeting titles, never calendar addresses.
 
 ## Development
 
+Use Python 3.13, as CI and the installer do:
+
 ```powershell
 python -m venv .venv
-.venv\Scripts\pip install -r requirements-build.txt
+.venv\Scripts\pip install -r requirements-build.txt -c constraints.txt
 .venv\Scripts\python -m pytest
 ```
 
@@ -77,20 +80,22 @@ Running from source, in the checkout folder:
 .venv\Scripts\python -m granola_autostart --settings         # Settings (--setup for first-run setup)
 ```
 
-Only one watcher runs at a time, so stop an installed copy first (right-click the tray icon, **Quit**). `--install` and `--uninstall` still set up a source checkout to start at sign-in, without the installer.
+Only one watcher runs at a time, so stop an installed copy first (right-click the tray icon, **Quit**). `--install` and `--uninstall` set up a source checkout to start at sign-in, in the same startup entry the installer uses, so they replace and remove an installed copy's.
 
 ### Layout
 
 - `granola_autostart/` is the app, one package. `__main__.py` starts every mode, from source and in the packaged exe.
-  - `watcher.py`: the tray, the meeting checks, the supervisor that restarts it, and starting at sign-in.
+  - `watcher.py`: the meeting checks each tick, the tray, and the command line.
   - `decide.py`: when to show the countdown, as pure logic. `state_store.py` remembers what was cancelled or started.
-  - `calendar_feed.py`, `zoom_meetings.py`, `presence.py`: calendars, Zoom, and whether you are at the PC.
+  - `calendar_feed.py` reads a calendar, and `calendar_cache.py` keeps them all downloaded. `zoom_meetings.py` and `presence.py`: Zoom, and whether you are at the PC.
   - `granola_launch.py`: opens the meeting's note in Granola.
   - `notice.py`: the countdown card. `settings_app.py`: Settings and setup, a WebView2 window showing the page in `web/`.
-  - `status.py`, `notify.py`, `icon.py`, `commands.py`: what the tray and Settings show, notifications, the icon, and Settings' Pause, Resume, and Quit.
-  - `settings.py`, `secret_box.py`: config and file paths, and the encryption for calendar addresses.
+  - `processes.py`: starting each mode, one of each at a time, the sign-in entry, and the supervisor that restarts the watcher.
+  - `status.py`, `notify.py`, `icon.py`, `winui.py`, `commands.py`: what the tray and Settings show, notifications, the icon, the Windows theme and window colours, and Settings' Pause, Resume, and Quit.
+  - `settings.py`, `secret_box.py`: config, file paths and writes, and the encryption for calendar addresses.
 - `tests/`: pytest.
-- `packaging/`: the PyInstaller spec, the Inno Setup script, and the icon drawing for both. `build.ps1` runs them.
+- `packaging/`: the PyInstaller spec and its entry script (`entry.py`), the Inno Setup script, and the icon drawing for both. `build.ps1` runs them.
+- `constraints.txt`: the exact package versions builds use; its header says how to upgrade them.
 
 ### Building the installer
 
@@ -102,4 +107,4 @@ With the build requirements and Inno Setup 7 (6 also works) installed:
 
 It runs the tests, builds `dist\GranolaAutostart\` with PyInstaller, then `dist\GranolaAutostart-<version>-setup.exe`. One `GranolaAutostart.exe` runs every mode: the watcher, `--supervise`, `--notice`, `--settings`, `--setup`, and `--stop`.
 
-GitHub Actions runs the tests and builds the installer for pull requests, pushes to `main`, and version tags, keeping it for 7 days. A tag such as `v1.0.0` must match `__version__` in `granola_autostart/__init__.py`, and also creates a GitHub release with the installer attached.
+GitHub Actions runs the tests and builds the installer for pull requests, pushes to `main`, and version tags, keeping it for 7 days. Changes to Markdown files alone don't start a build. A tag such as `v1.0.0` must match `__version__` in `granola_autostart/__init__.py`, and also creates a GitHub release with the installer attached.

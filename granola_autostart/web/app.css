@@ -28,7 +28,6 @@ h1 { margin: 0; font: 400 26px/1.2 Georgia, Cambria, serif; }
 p { margin: 0; }
 .muted { color: var(--muted); }
 .small { font-size: 12px; }
-.hidden { display: none !important; }
 svg.icon { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
 svg.icon.sm { width: 14px; height: 14px; stroke-width: 2; }
 svg.icon.xs { width: 12px; height: 12px; stroke-width: 2.25; }

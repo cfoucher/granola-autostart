@@ -1,4 +1,4 @@
-"""Local config, state, and log paths."""
+"""Local config, state, and log paths, and writing those files."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import sys
+import time
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -17,6 +18,8 @@ DEFAULT_IGNORE = ("focus time", "out of office", "lunch")
 MIN_CALENDAR_REFRESH_SECONDS = 60
 # Older configs, and hand edits, hold addresses in plain text under these keys.
 PLAIN_ADDRESS_KEYS = ("ics_url", "ics_urls")
+REPLACE_ATTEMPTS = 5
+_written: dict[Path, str] = {}
 
 
 class ConfigError(Exception):
@@ -49,9 +52,32 @@ def status_path() -> Path:
     return app_dir() / "status.json"
 
 
+def write_json(path: Path, data, *, skip_unchanged: bool = False) -> None:
+    """Replace the file in one step, so a reader never sees half of it.
+
+    ``skip_unchanged`` saves a write when this process last wrote the same content, for files that
+    only this process writes. Replacing fails while another process has the file open for a moment,
+    so it tries a few times.
+    """
+    text = json.dumps(data, indent=2) + "\n"
+    if skip_unchanged and _written.get(path) == text and path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(text, encoding="utf-8")
+    for attempt in range(1, REPLACE_ATTEMPTS + 1):
+        try:
+            temporary.replace(path)
+            break
+        except PermissionError:
+            if attempt == REPLACE_ATTEMPTS:
+                raise
+            time.sleep(0.05 * attempt)
+    _written[path] = text
+
+
 @dataclass
 class Settings:
-    ics_url: str = ""
     ics_urls: tuple[str, ...] = ()
     user_email: str = ""
     idle_seconds: int = 300
@@ -66,7 +92,7 @@ class Settings:
 
     def calendar_urls(self) -> list[str]:
         urls: list[str] = []
-        for url in (self.ics_url, *self.ics_urls):
+        for url in self.ics_urls:
             cleaned = url.strip()
             if cleaned and cleaned not in urls:
                 urls.append(cleaned)
@@ -99,10 +125,15 @@ def save_settings(settings: Settings) -> None:
     for key in PLAIN_ADDRESS_KEYS:
         raw.pop(key, None)
     raw.update(settings.to_json())
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    write_json(path, raw)
+
+
+def load_or_defaults() -> tuple[Settings, str | None]:
+    """The saved settings, or the defaults and why config.json couldn't be used."""
+    try:
+        return load_settings(), None
+    except ConfigError as error:
+        return Settings(), str(error)
 
 
 def load_settings() -> Settings:
@@ -116,8 +147,8 @@ def load_settings() -> Settings:
         protected = tuple(unprotect(token) for token in _text_list(raw, "ics_urls_protected", ()))
     except ValueError:
         raise ConfigError(
-            "config.json: a calendar address could not be decrypted. It was saved by another Windows user or PC, "
-            "so add that calendar again in Settings."
+            "config.json: a calendar address could not be decrypted, because another Windows user or PC saved it. "
+            "Open config.json and delete the ics_urls_protected list, then add your calendars again in Settings"
         ) from None
     plain = tuple(url for url in (_text(raw, "ics_url"), *_text_list(raw, "ics_urls", ())) if url)
     defaults = Settings()
@@ -187,14 +218,17 @@ def _text_list(raw: dict, name: str, default: tuple[str, ...]) -> tuple[str, ...
 
 
 def _number(raw: dict, name: str, default, kind, *, minimum):
-    value = raw.get(name, default)
+    # null means "use the default". (For text it means empty, and for a list, none.)
+    value = default if raw.get(name) is None else raw[name]
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise ConfigError(f"config.json: {name} must be a number")
     return max(kind(minimum), kind(value))
 
 
 def _flag(raw: dict, name: str) -> bool:
-    value = raw.get(name, False)
+    value = raw.get(name)
+    if value is None:
+        return False
     if isinstance(value, bool):
         return value
     if isinstance(value, str) and value.strip().casefold() in {"true", "false"}:

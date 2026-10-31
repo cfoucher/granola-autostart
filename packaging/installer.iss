@@ -47,7 +47,10 @@ Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; Parameters: "--s
 
 [Registry]
 ; Started at sign-in through the user's startup list, because Task Scheduler is denied on managed machines.
+; A source checkout's --install writes the same entry (processes.py, RUN_KEY and RUN_VALUE); keep the two alike.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "GranolaAutostart"; ValueData: """{app}\{#AppExe}"" --supervise"; Flags: uninsdeletevalue
+; The app writes its notification name and icon here (notify.py); uninstalling removes them.
+Root: HKCU; Subkey: "Software\Classes\AppUserModelId\{#AppUserModelID}"; Flags: uninsdeletekey
 
 [Run]
 Filename: "{app}\{#AppExe}"; Parameters: "--supervise"; Description: "Start {#AppName} now"; Flags: nowait postinstall
