@@ -9,10 +9,10 @@ on:
   workflow_dispatch:
     inputs:
       bump:
-        description: Which part of the version to increase
+        description: Which part of the version to increase. none re-releases the current version without a bump, for retrying a failed build
         type: choice
-        options: [patch, minor, major]
-        default: patch
+        options: [minor, patch, major, none]
+        default: minor
 
 permissions:
   contents: write
@@ -39,20 +39,31 @@ jobs:
           [ -n "$current" ] || { echo "::error::no X.Y.Z __version__ in $file"; exit 1; }
           IFS=. read -r major minor patch <<< "$current"
           case "$BUMP" in
+            none) ;;
             major) major=$((major + 1)); minor=0; patch=0 ;;
             minor) minor=$((minor + 1)); patch=0 ;;
             patch) patch=$((patch + 1)) ;;
           esac
           new="$major.$minor.$patch"
-          if git ls-remote --exit-code --tags origin "refs/tags/v$new" > /dev/null; then
-            echo "::error::tag v$new already exists"; exit 1
+          tag_exists=false
+          git ls-remote --exit-code --tags origin "refs/tags/v$new" > /dev/null && tag_exists=true
+          if [ "$BUMP" = none ]; then
+            # Retry the current version: reuse its tag, or create it on this commit if the bump never got that far.
+            if [ "$tag_exists" = false ]; then
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git tag "v$new"
+              git push origin "v$new"
+            fi
+          else
+            [ "$tag_exists" = false ] || { echo "::error::tag v$new already exists"; exit 1; }
+            sed -i "s/^__version__ = \".*\"$/__version__ = \"$new\"/" "$file"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -am "Bump the version to $new."
+            git tag "v$new"
+            git push --atomic origin HEAD:main "v$new"
           fi
-          sed -i "s/^__version__ = \".*\"$/__version__ = \"$new\"/" "$file"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -am "Bump the version to $new."
-          git tag "v$new"
-          git push --atomic origin HEAD:main "v$new"
           echo "tag=v$new" >> "$GITHUB_OUTPUT"
       - name: Build and release the tag
         env:
