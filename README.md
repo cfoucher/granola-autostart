@@ -12,6 +12,10 @@ Notes start only when the Windows session is unlocked and you have used the mous
 
 Granola Autostart is an independent tool and is not made by Granola.
 
+![The countdown card: Starting notes, Weekly product sync, 7 seconds, with Start now and Cancel buttons](assets/countdown-card.png)
+
+![The Settings window on the Calendars page, showing one calendar and the Watching status](assets/settings-calendars.png)
+
 ## Install
 
 1. Get `GranolaAutostart-<version>-setup.exe` from the [releases](https://github.com/cfoucher/granola-autostart/releases), or from whoever shared it with you.
