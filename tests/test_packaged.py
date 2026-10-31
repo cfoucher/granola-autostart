@@ -45,3 +45,18 @@ def test_from_source_the_modes_run_this_script_with_pythonw():
     assert command[1].endswith("watcher.py")
     assert command[2:] == ["--supervise"]
     assert watcher.notice_command("Standup", 10, "calendar")[1].endswith("notice.py")
+
+
+def test_the_supervisor_restarts_a_crash_but_not_a_quit(monkeypatch):
+    exits = iter([1, watcher.QUIT_EXIT_CODE])
+    runs = []
+
+    def run(command, cwd):
+        runs.append(command)
+        return watcher.subprocess.CompletedProcess(command, next(exits))
+
+    monkeypatch.setattr(watcher, "acquire_supervisor", lambda: True)
+    monkeypatch.setattr(watcher.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(watcher.subprocess, "run", run)
+    assert watcher.supervise() == 0
+    assert len(runs) == 2

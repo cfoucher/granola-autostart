@@ -92,6 +92,16 @@ END:VCALENDAR
 """
 
 
+def test_skipped_meetings_can_be_kept_and_marked_for_zoom_matching():
+    start = datetime(2026, 10, 28, 16, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=8)
+    kept = events_between(ICS, start, end, ignore_title_substrings=("focus time",), keep_skipped=True)
+    assert [(e.summary, e.skipped) for e in kept if e.summary == "Focus time"] == [("Focus time", True)]
+    assert all(not e.skipped for e in kept if e.summary != "Focus time")
+    dropped = events_between(ICS, start, end, ignore_title_substrings=("focus time",))
+    assert "Focus time" not in [e.summary for e in dropped]
+
+
 def test_a_lone_moved_instance_keeps_its_google_instance_id():
     start = datetime(2026, 10, 28, 16, 0, tzinfo=timezone.utc)
     events = events_between(LONE_INSTANCE, start, start + timedelta(hours=8))

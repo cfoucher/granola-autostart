@@ -16,12 +16,15 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import winreg
 from ctypes import wintypes
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Callable
 
+import commands
 from app_status import describe_error, feed_id, read_status, when
 from app_version import __version__
 from calendar_feed import events_between, feed_name, feed_owner, fetch_ics, my_addresses, normalize_feed_url
@@ -36,6 +39,7 @@ SIZES = {"settings": (796, 660), "setup": (656, 680)}
 COUNTDOWN_CHOICES = (5, 10, 15, 20, 30)
 IDLE_CHOICES = (1, 2, 5, 10, 15)  # minutes
 SECTIONS = ("calendars", "notes", "about")
+STARTING_SECONDS = 30  # how long "Starting…" shows before a watcher that never came up counts as not running
 _EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 
 
@@ -143,6 +147,7 @@ class Api:
         # Private: pywebview walks every public attribute to expose it to the page, and the window's
         # .NET object graph would send it into endless recursion.
         self._window = None
+        self._started_at: float | None = None  # time.time() when this window last started the watcher
 
     # Reading
 
@@ -197,21 +202,41 @@ class Api:
             "setup_complete": settings.setup_complete,
         }
 
+    def _starting(self) -> bool:
+        """Just started, and the new watcher hasn't written its first status yet."""
+        if self._started_at is None or time.time() - self._started_at > STARTING_SECONDS:
+            return False
+        try:
+            return status_path().stat().st_mtime < self._started_at
+        except OSError:
+            return True
+
     def _status_view(self, status: dict, running: bool, now: datetime) -> dict:
+        """The side panel's status box. Its buttons (see ui/app.js) follow the state, like the tray menu."""
         problems = [p for p in status.get("problems") or [] if isinstance(p, dict)]
-        paused_until = status.get("paused_until")
+        paused_until = datetime.fromisoformat(status["paused_until"]) if status.get("paused_until") else None
+        paused = bool(running and paused_until and now < paused_until)
         upcoming = status.get("next_meeting")
+        notes = status.get("taking_notes")
         last = status.get("last_start")
-        if not running:
-            state, detail = "stopped", "Meetings won't start notes. Starting it…"
+        # Pausing for today pauses until midnight, which the tray calls "until tomorrow".
+        today = bool(paused and paused_until.astimezone(now.tzinfo) == _midnight(now))
+        if self._starting():
+            state, detail = "starting", "Checking your calendars."
+        elif not running:
+            state, detail = "stopped", "Meetings won't start notes."
         elif problems:
             state, detail = "attention", problems[0].get("title", "")
-        elif paused_until:
-            state, detail = "paused", f"Until {when(datetime.fromisoformat(paused_until), now)}"
+        elif paused and today:
+            state, detail = "paused", "Until tomorrow. Zoom calls won't be asked about later."
+        elif paused:
+            state, detail = "paused", f"Until {when(paused_until, now)}. No countdown cards until then."
+        elif notes:
+            state, detail = "notes", f"{notes['title']}, since {when(datetime.fromisoformat(notes['since']), now)}"
         elif upcoming:
             state, detail = "watching", f"Next: {upcoming['title']} at {when(datetime.fromisoformat(upcoming['start']), now)}"
         else:
-            state, detail = "watching", "No more meetings in the next day"
+            state, detail = "watching", "No meetings coming up. Zoom calls still start notes."
         last_view = None
         if isinstance(last, dict) and last.get("title") and last.get("at"):
             opened = last.get("granola_opened")
@@ -220,7 +245,17 @@ class Api:
                 "when": when(datetime.fromisoformat(last["at"]), now),
                 "opened": opened,
             }
-        return {"running": running, "state": state, "detail": detail, "problems": problems, "last_start": last_view, "next": upcoming}
+        return {
+            "running": running,
+            "state": state,
+            "detail": detail,
+            "paused": paused,
+            "paused_today": today,
+            "fix_section": problems[0].get("section") if problems else None,
+            "problems": problems,
+            "last_start": last_view,
+            "next": upcoming,
+        }
 
     # Calendars
 
@@ -357,6 +392,39 @@ class Api:
         self._ensure_watcher()
         return self.load()
 
+    # The tray menu's commands, sent to the running watcher
+
+    def pause(self, length: str) -> dict:
+        command = {"hour": "pause-hour", "today": "pause-today"}.get(length)
+        if command:
+            self._change_pause(command)
+        return self.load()
+
+    def resume(self) -> dict:
+        self._change_pause("resume")
+        return self.load()
+
+    def quit_app(self) -> dict:
+        self._started_at = None
+        if commands.send("quit"):
+            _wait_for(lambda: not watcher_running(), seconds=10)
+        return self.load()
+
+    def _change_pause(self, command: str) -> None:
+        """Send it, then give the watcher a moment to write the new pause, so the page shows it at once."""
+        before = read_status(status_path()).get("paused_until")
+        if commands.send(command):
+            _wait_for(lambda: read_status(status_path()).get("paused_until") != before)
+
+    def open_settings(self) -> dict:
+        """Setup's Done: the same window becomes Settings, so another calendar can be added straight away."""
+        self.page, self.section = "settings", "calendars"
+        if self._window is not None:
+            self._window.set_title(TITLES["settings"])
+            self._window.resize(*SIZES["settings"])
+            _center_on_primary(self._window)
+        return self.load()
+
     def run_setup(self) -> None:
         _release_window_mutex()
         _spawn(app_command("--setup"))
@@ -368,6 +436,7 @@ class Api:
 
     def _ensure_watcher(self) -> None:
         if not watcher_running():
+            self._started_at = time.time()
             _spawn(app_command("--supervise"))
 
     def _url_for(self, calendar_id: str) -> str | None:
@@ -376,6 +445,19 @@ class Api:
         except ConfigError:
             return None
         return next((url for url in urls if feed_id(url) == calendar_id), None)
+
+
+def _midnight(now: datetime) -> datetime:
+    return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _wait_for(done: Callable[[], bool], seconds: float = 3) -> bool:
+    deadline = time.monotonic() + seconds
+    while not done():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+    return True
 
 
 _WINDOW_MUTEX = None
@@ -440,6 +522,53 @@ def _style_title_bar(window, dark: bool) -> None:
         log.debug("title bar colours not applied (%s)", type(error).__name__)
 
 
+def _center_on_primary(window) -> None:
+    """Every new window opens in the middle of the primary monitor's work area.
+
+    pywebview leaves WinForms to centre the window on whichever display has the pointer, and
+    applies that when the window is shown. So placement is switched to manual first, on the
+    window's UI thread, using WinForms' own screen and window coordinates.
+    """
+    try:
+        import System.Windows.Forms as WinForms
+        from System import Func, Type
+        from System.Drawing import Point
+
+        form = window.native
+
+        def center():
+            area = WinForms.Screen.PrimaryScreen.WorkingArea
+            form.StartPosition = WinForms.FormStartPosition.Manual
+            form.Location = Point(
+                area.X + max(0, (area.Width - form.Width) // 2),
+                area.Y + max(0, (area.Height - form.Height) // 2),
+            )
+
+        form.Invoke(Func[Type](center))
+    except Exception as error:
+        log.warning("window not centered (%s)", type(error).__name__)
+
+
+def _enable_text_field_menus(window) -> None:
+    """Right-click Cut, Copy, and Paste in text fields.
+
+    pywebview switches WebView2's own context menu off outside debug mode. It is switched back on
+    here, on the window's UI thread, and ui/app.js keeps it to text fields so pages never offer Back or Reload.
+    """
+    try:
+        from System import Func, Type  # pythonnet, already loaded by pywebview
+
+        form = window.native
+
+        def enable():
+            form.webview.CoreWebView2.Settings.AreDefaultContextMenusEnabled = True
+
+        form.Invoke(Func[Type](enable))
+        log.info("text field context menus enabled")
+    except Exception as error:
+        log.warning("right-click menus stay off (%s)", type(error).__name__)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Granola Autostart settings")
     parser.add_argument("--setup", action="store_true", help="first-run setup")
@@ -468,7 +597,9 @@ def main(argv: list[str] | None = None) -> int:
         background_color="#25231f" if dark else "#fbf8f1",
     )
     api._window = window
+    window.events.before_show += lambda: _center_on_primary(window)
     window.events.shown += lambda: _style_title_bar(window, dark)
+    window.events.loaded += lambda: _enable_text_field_menus(window)
     try:
         webview.start(gui="edgechromium", private_mode=True)
     except Exception:

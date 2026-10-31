@@ -143,8 +143,15 @@ class TrayView:
 
 
 def next_meeting(events, now: datetime):
-    upcoming = [event for event in events if event.start > now]
+    upcoming = [event for event in events if event.start > now and not getattr(event, "skipped", False)]
     return min(upcoming, key=lambda event: event.start) if upcoming else None
+
+
+def taking_notes(launch, now: datetime) -> tuple[str, datetime] | None:
+    """(title, since) while Granola is open for the meeting the watcher started it for."""
+    if launch is None or not launch.seen_running or launch.missing_since is not None or now >= launch.expires_at:
+        return None
+    return launch.title, launch.launched_at
 
 
 def when(moment: datetime, now: datetime) -> str:
@@ -196,6 +203,7 @@ class Status:
     version: str
     paused_until: datetime | None = None
     next_meeting: tuple[str, datetime] | None = None
+    taking_notes: tuple[str, datetime] | None = None
     feeds: list[FeedStatus] = field(default_factory=list)
     last_start: LastStart | None = None
     problems: list[Problem] = field(default_factory=list)
@@ -207,6 +215,9 @@ class Status:
             "paused_until": self.paused_until.isoformat() if self.paused_until else None,
             "next_meeting": {"title": self.next_meeting[0], "start": self.next_meeting[1].isoformat()}
             if self.next_meeting
+            else None,
+            "taking_notes": {"title": self.taking_notes[0], "since": self.taking_notes[1].isoformat()}
+            if self.taking_notes
             else None,
             "feeds": [feed.to_json() for feed in self.feeds],
             "last_start": self.last_start.to_json() if self.last_start else None,

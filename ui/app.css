@@ -3,13 +3,13 @@
   --bg: #fbf8f1; --rail: #f4efe4; --field: #fffdf8; --border: #e2d9c6; --field-line: #958c7b;
   --ink: #2b2924; --muted: #6f685b; --accent: #5a8a47; --accent-ink: #42703a; --btn: #4b7a3a; --btn-hover: #3f6830;
   --on-accent: #ffffff; --accent-soft: #e8efdf; --track: #e9e2d2; --hover: #f1eadb; --warn: #94501a; --warn-soft: #f6e7d6;
-  --desk: #d9dde3; --shadow: 0 12px 32px rgba(43,41,36,.16), 0 2px 6px rgba(43,41,36,.08);
+  --paused: #7c776d; --desk: #d9dde3; --shadow: 0 12px 32px rgba(43,41,36,.16), 0 2px 6px rgba(43,41,36,.08);
 }
 :root[data-theme="dark"] {
   --bg: #25231f; --rail: #1f1d1a; --field: #2c2a25; --border: #3d3a33; --field-line: #7d776a;
   --ink: #f1ece1; --muted: #b3ab9b; --accent: #93c47d; --accent-ink: #a7d493; --btn: #93c47d; --btn-hover: #a7d493;
   --on-accent: #1c2617; --accent-soft: #2c3627; --track: #3a3731; --hover: #33302a; --warn: #e9a15c; --warn-soft: #3a2c1f;
-  --desk: #16171a; --shadow: 0 12px 32px rgba(0,0,0,.5), 0 2px 6px rgba(0,0,0,.3);
+  --paused: #9a9387; --desk: #16171a; --shadow: 0 12px 32px rgba(0,0,0,.5), 0 2px 6px rgba(0,0,0,.3);
 }
 
 * { box-sizing: border-box; }
@@ -31,6 +31,7 @@ p { margin: 0; }
 .hidden { display: none !important; }
 svg.icon { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
 svg.icon.sm { width: 14px; height: 14px; stroke-width: 2; }
+svg.icon.xs { width: 12px; height: 12px; stroke-width: 2.25; }
 
 /* Buttons */
 .btn {
@@ -43,6 +44,9 @@ svg.icon.sm { width: 14px; height: 14px; stroke-width: 2; }
 .btn.primary:hover { background: var(--btn-hover); border-color: var(--btn-hover); }
 .btn.small { height: 28px; padding: 0 12px; border-radius: 14px; font-size: 12px; }
 .btn.large { height: 34px; padding: 0 20px; border-radius: 17px; }
+.btn.mini { height: 26px; padding: 0 12px; border-radius: 13px; font-size: 12px; }
+.btn.dropdown { gap: 4px; padding-right: 8px; }
+.btn[aria-expanded="true"] { background: var(--hover); }
 .btn:disabled { opacity: .5; cursor: default; background: transparent; }
 .btn.primary:disabled { background: var(--btn); }
 .icon-btn {
@@ -80,11 +84,23 @@ select.field { padding-right: 8px; }
 .nav[aria-current="page"]::before {
   content: ""; position: absolute; left: 0; top: 10px; width: 3px; height: 16px; border-radius: 2px; background: var(--accent);
 }
-.rail-status { margin-top: auto; padding: 14px 12px; display: flex; flex-direction: column; gap: 4px; border-top: 1px solid var(--border); }
+.rail-status { margin-top: auto; padding: 14px 12px; display: flex; flex-direction: column; gap: 10px; border-top: 1px solid var(--border); }
 .rail-status .state { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; }
+.rail-status .warn { color: var(--warn); }
+.rail-status .controls { gap: 8px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
-.dot.paused, .dot.stopped { background: var(--muted); }
+.dot.notes { box-shadow: 0 0 0 3px var(--accent-soft); }
+.dot.paused { background: var(--paused); }
+.dot.starting { background: var(--paused); opacity: .6; }
+.dot.stopped { background: transparent; border: 1.5px solid var(--paused); }
 .dot.attention { background: var(--warn); }
+.menu-anchor { position: relative; }
+.menu {
+  position: absolute; left: 0; bottom: calc(100% + 6px); z-index: 10; width: 168px; padding: 4px;
+  display: flex; flex-direction: column; background: var(--field); border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow);
+}
+.menu button { height: 30px; padding: 0 10px; border: none; border-radius: 5px; background: transparent; text-align: left; font-size: 13px; cursor: pointer; }
+.menu button:hover, .menu button:focus-visible { background: var(--hover); outline: none; }
 main { flex: 1; min-width: 0; padding: 26px 32px 22px; display: flex; flex-direction: column; gap: 18px; overflow-y: auto; }
 .intro { display: flex; flex-direction: column; gap: 6px; }
 .intro p { font-size: 13px; color: var(--muted); }

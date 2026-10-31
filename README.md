@@ -29,7 +29,9 @@ Left-click the tray icon, or right-click it and choose **Settings…**.
 - **Calendars:** add, test, and remove calendars. Each shows how many meetings it has in the next day, or why its downloads are failing. Secret addresses are encrypted for your Windows user (DPAPI) and never written to the log.
 - **Declined meetings** are skipped. The address comes from your calendar (a Google calendar is named after its account); add another address for aliases or Outlook calendars.
 - **Starting notes:** countdown length (with **Preview**), how recently you must have used the PC, and words that skip a meeting (`focus time`, `out of office`, and `lunch` to start with). All-day events are always skipped.
-- **About:** version, whether it's running, the last time it started Granola, and the log folder.
+- **About:** version, whether it's running (with **Quit** or **Start**), the last time it started Granola, and the log folder.
+
+The box at the foot of the side panel shows what the app is doing: watching (and the next meeting), taking notes, paused, needing attention, or not running. It has the tray menu's buttons: **Pause** (for 1 hour or the rest of today), **Resume**, **Fix**, and **Start**.
 
 Changes save as you make them, and the running app picks them up within a few seconds.
 

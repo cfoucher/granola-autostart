@@ -7,8 +7,35 @@ NOW = datetime(2026, 10, 28, 17, 0, tzinfo=timezone.utc)
 LOOKAHEAD = timedelta(minutes=10)
 
 
-def event(summary="Design review", start=NOW, minutes=30, event_id="abc123"):
-    return CalendarEvent(id=event_id, summary=summary, start=start, end=start + timedelta(minutes=minutes))
+def event(summary="Design review", start=NOW, minutes=30, event_id="abc123", skipped=False):
+    return CalendarEvent(id=event_id, summary=summary, start=start, end=start + timedelta(minutes=minutes), skipped=skipped)
+
+
+def zoom_join(**overrides) -> Snapshot:
+    return snap(in_zoom=True, zoom_session_id="9:100", zoom_age_seconds=1, **overrides)
+
+
+def test_a_skipped_meeting_never_prompts_even_when_its_zoom_call_is_joined():
+    lunch = event("Team lunch", skipped=True)
+    prompt, state = decide(snap(events=(lunch,)))
+    assert prompt is None
+    prompt, state = decide(zoom_join(events=(lunch,)), state)
+    assert prompt is None
+    assert "zoom:9:100" in state.handled
+    prompt, _state = decide(zoom_join(events=(lunch,)), state)
+    assert prompt is None
+
+
+def test_a_real_meeting_beats_a_skipped_one_for_the_same_zoom_call():
+    lunch = event("Team lunch", start=NOW - timedelta(minutes=10), minutes=60, event_id="lunch", skipped=True)
+    review = event("Design review", start=NOW - timedelta(minutes=2), event_id="review")
+    prompt, _state = decide(zoom_join(events=(lunch, review)))
+    assert prompt is not None and prompt.title == "Design review"
+
+
+def test_a_zoom_call_with_no_meeting_at_all_still_prompts():
+    prompt, _state = decide(zoom_join(events=()))
+    assert prompt is not None and prompt.kind == "zoom"
 
 
 def snap(**overrides) -> Snapshot:
