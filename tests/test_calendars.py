@@ -1,13 +1,12 @@
 from datetime import datetime, timedelta, timezone
 
-from calendar_feed import CalendarEvent, merge_events
-from settings import Settings
+from granola_autostart.calendar_feed import CalendarEvent, merge_events
+from granola_autostart.settings import Settings
 
 
-def test_calendar_urls_keeps_the_primary_and_extra_feeds():
+def test_calendar_urls_drops_blanks_and_repeats():
     settings = Settings(
-        ics_url="https://calendar.example/primary.ics",
-        ics_urls=("https://calendar.example/watch.ics", "https://calendar.example/primary.ics", ""),
+        ics_urls=(" https://calendar.example/primary.ics", "https://calendar.example/watch.ics", "https://calendar.example/primary.ics", ""),
     )
     assert settings.calendar_urls() == [
         "https://calendar.example/primary.ics",

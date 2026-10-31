@@ -1,4 +1,6 @@
-"""Countdown card. Timeout or Start now starts Granola. Cancel does not.
+"""Countdown card. It exits 0 when the countdown runs out or Start now is clicked, and the watcher then
+starts Granola; Cancel exits 1. A card that fails exits 2 after logging to notice-log.txt, and the
+watcher starts notes anyway, except when it was asking to restart them after Granola closed.
 
 The card never takes keyboard focus, so typing in the current app is not interrupted.
 """
@@ -8,18 +10,17 @@ from __future__ import annotations
 import argparse
 import ctypes
 import math
-import os
 import time
 import tkinter as tk
 import tkinter.font as tkfont
-import winreg
 from ctypes import wintypes
 
 from PIL import Image, ImageDraw, ImageTk
 
+from .winui import app_theme, per_monitor_dpi, set_window_attribute
+
 ES_CONTINUOUS = 0x80000000
 ES_DISPLAY_REQUIRED = 0x00000002
-THEME: str | None = None  # "light" | "dark" | None for the Windows app theme
 MAX_TITLE = 200
 RING_STEPS = 120
 # A click already on its way to that corner when the card appears must not skip the countdown.
@@ -73,19 +74,6 @@ class _MONITORINFO(ctypes.Structure):
     ]
 
 
-def _enable_per_monitor_dpi() -> None:
-    try:
-        # Per-monitor v2 so a 150% laptop and a 100% external display each size the card correctly.
-        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
-            return
-    except Exception:
-        pass
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
-        pass
-
-
 def _monitor_at_cursor() -> tuple[int, int, int, int, int]:
     """Work area of the monitor under the pointer, plus that monitor's DPI."""
     user32 = ctypes.windll.user32
@@ -119,16 +107,6 @@ def _monitor_at_cursor() -> tuple[int, int, int, int, int]:
     return work.left, work.top, work.right, work.bottom, int(dpi_y.value or 96)
 
 
-def _theme() -> str:
-    if THEME in PALETTES:
-        return THEME
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
-            return "light" if winreg.QueryValueEx(key, "AppsUseLightTheme")[0] else "dark"
-    except OSError:
-        return "light"
-
-
 def _wrapper_hwnd(root: tk.Tk) -> int:
     user32 = ctypes.windll.user32
     user32.GetParent.argtypes = [wintypes.HWND]
@@ -149,12 +127,8 @@ def _style_card(hwnd: int, *, border: str) -> None:
     user32.SetClassLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_size_t]
     user32.SetClassLongPtrW(hwnd, -26, user32.GetClassLongPtrW(hwnd, -26) | 0x00020000)
     try:
-        dwm = ctypes.windll.dwmapi
-        round_corners = ctypes.c_int(2)
-        dwm.DwmSetWindowAttribute(wintypes.HWND(hwnd), 33, ctypes.byref(round_corners), ctypes.sizeof(round_corners))
-        r, g, b = (int(border[i : i + 2], 16) for i in (1, 3, 5))
-        colorref = ctypes.c_uint(r | (g << 8) | (b << 16))
-        dwm.DwmSetWindowAttribute(wintypes.HWND(hwnd), 34, ctypes.byref(colorref), ctypes.sizeof(colorref))
+        set_window_attribute(hwnd, 33, 2)  # DWMWA_WINDOW_CORNER_PREFERENCE: round
+        set_window_attribute(hwnd, 34, border)  # DWMWA_BORDER_COLOR
     except Exception:
         pass
 
@@ -228,17 +202,18 @@ def _ring_image(size: int, stroke: float, fraction: float, track: str, accent: s
     return ImageTk.PhotoImage(img.resize((size, size), Image.LANCZOS))
 
 
-def show_notice(title: str, seconds: int, *, kind: str = "calendar", auto: str | None = None) -> bool:
+def show_notice(title: str, seconds: int, *, kind: str = "calendar") -> bool:
     """Return True when the countdown finishes or Start now is clicked, False when the user cancels."""
     title = " ".join(title.split())[:MAX_TITLE] or "Meeting"
-    _enable_per_monitor_dpi()
+    # Per-monitor so a 150% laptop and a 100% external display each size the card correctly.
+    per_monitor_dpi()
     left, top, right, bottom, dpi = _monitor_at_cursor()
     scale = max(1.0, dpi / 96)
 
     def px(value: float) -> int:
         return round(value * scale)
 
-    colors = PALETTES[_theme()]
+    colors = PALETTES[app_theme()]
     root = tk.Tk()
     root.tk.call("tk", "scaling", dpi / 72.0)
     root.withdraw()
@@ -405,13 +380,7 @@ def show_notice(title: str, seconds: int, *, kind: str = "calendar", auto: str |
     root.deiconify()
     root.lift()
     shown_at["at"] = time.monotonic()
-    if os.environ.get("GRANOLA_NOTICE_DEBUG"):
-        print(f"monitor {left},{top}-{right},{bottom} dpi={dpi} notice {width}x{height} at {x},{top_y}", flush=True)
     tick()
-    if auto == "cancel":
-        root.after(200, lambda: finish(False))
-    elif auto == "start":
-        root.after(200, lambda: finish(True))
     root.mainloop()
     root.destroy()
     return bool(state["value"])
@@ -430,19 +399,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--title", required=True)
     parser.add_argument("--seconds", type=int, default=10)
     parser.add_argument("--kind", default="calendar")
-    parser.add_argument("--auto", choices=("cancel", "start"))
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    """0 to start Granola, 1 for Cancel. __main__ turns a failure into exit code 2, with the reason logged."""
     args = build_parser().parse_args(argv)
     keep_display_on()
-    try:
-        started = show_notice(args.title, args.seconds, kind=args.kind, auto=args.auto)
-    except Exception:
-        return 2
-    return 0 if started else 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    return 0 if show_notice(args.title, args.seconds, kind=args.kind) else 1

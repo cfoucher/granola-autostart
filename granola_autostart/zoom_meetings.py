@@ -6,10 +6,12 @@ import ctypes
 from ctypes import wintypes
 from datetime import datetime, timedelta, timezone
 
+# Zoom window titles that name Zoom rather than the meeting.
+GENERIC_ZOOM_TITLES = {"zoom", "zoom meeting", "zoom workplace", "zoom webinar", "meeting chat"}
+MAX_TITLE = 200
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 TH32CS_SNAPPROCESS = 0x00000002
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
-GENERIC_ZOOM_WINDOW_TITLES = {"zoom", "zoom meeting", "zoom workplace", "zoom webinar"}
 
 kernel32 = ctypes.windll.kernel32
 user32 = ctypes.windll.user32
@@ -126,6 +128,12 @@ def granola_running(table: ProcessTable | None = None) -> bool:
     return bool(pids_named("Granola.exe", table))
 
 
+def best_window_title(titles: list[str]) -> str | None:
+    """The meeting's name among Zoom's window titles: the longest one that isn't just Zoom's own name."""
+    usable = [title.strip() for title in titles if title.strip() and title.strip().casefold() not in GENERIC_ZOOM_TITLES]
+    return max(usable, key=len)[:MAX_TITLE] if usable else None
+
+
 def zoom_window_title(table: ProcessTable | None = None) -> str | None:
     if table is None:
         table = process_table()
@@ -146,13 +154,9 @@ def zoom_window_title(table: ProcessTable | None = None) -> str | None:
             return True
         buffer = ctypes.create_unicode_buffer(length + 1)
         user32.GetWindowTextW(hwnd, buffer, length + 1)
-        if buffer.value.strip():
-            titles.append(buffer.value.strip())
+        titles.append(buffer.value)
         return True
 
     enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     user32.EnumWindows(enum_proc(callback), 0)
-    usable = [title for title in titles if title.casefold() not in GENERIC_ZOOM_WINDOW_TITLES]
-    if not usable:
-        return None
-    return max(usable, key=len)
+    return best_window_title(titles)

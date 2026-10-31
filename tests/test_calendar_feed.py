@@ -1,11 +1,26 @@
 import gzip
+import io
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 import recurring_ical_events
 from icalendar import Calendar
 
-from calendar_feed import _gunzip_capped, events_between, feed_owner, my_addresses, normalize_feed_url, prefilter_ics
+from granola_autostart import calendar_feed
+from granola_autostart.calendar_feed import (
+    _gunzip_capped,
+    _HttpsOnlyRedirects,
+    _read_capped,
+    events_between,
+    feed_owner,
+    my_addresses,
+    normalize_feed_url,
+    prefilter_ics,
+)
 
 ICS = """BEGIN:VCALENDAR
 VERSION:2.0
@@ -207,3 +222,191 @@ def test_gzip_bodies_are_capped():
     assert _gunzip_capped(body, 1000) == b"A" * 1000
     with pytest.raises(ValueError):
         _gunzip_capped(body, 999)
+
+
+def test_downloads_are_capped_across_reads():
+    # The body arrives in 64 KiB reads, so this one only goes over the cap on its second.
+    body = b"A" * (100 * 1024)
+    deadline = time.monotonic() + 60
+    assert _read_capped(io.BytesIO(body), len(body), deadline) == body
+    with pytest.raises(ValueError):
+        _read_capped(io.BytesIO(body), len(body) - 1, deadline)
+
+
+def test_redirects_may_not_leave_https():
+    handler = _HttpsOnlyRedirects()
+    with pytest.raises(urllib.error.HTTPError) as error:
+        handler.redirect_request(urllib.request.Request("https://a/x"), None, 302, "Found", {}, "http://a/x")
+    assert error.value.code == 302
+    moved = handler.redirect_request(urllib.request.Request("https://a/x"), None, 302, "Found", {}, "https://b/y")
+    assert moved.full_url == "https://b/y"
+
+
+def _calendar(events: str) -> str:
+    return f"BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//granola-autostart//test//EN\n{events}END:VCALENDAR\n"
+
+
+PACIFIC_SERIES = _calendar(
+    """BEGIN:VTIMEZONE
+TZID:America/Los_Angeles
+BEGIN:DAYLIGHT
+TZOFFSETFROM:-0800
+TZOFFSETTO:-0700
+TZNAME:PDT
+DTSTART:19700308T020000
+RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU
+END:DAYLIGHT
+BEGIN:STANDARD
+TZOFFSETFROM:-0700
+TZOFFSETTO:-0800
+TZNAME:PST
+DTSTART:19701101T020000
+RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU
+END:STANDARD
+END:VTIMEZONE
+BEGIN:VEVENT
+UID:standup@google.com
+SUMMARY:Standup
+RRULE:FREQ=WEEKLY;COUNT=4
+DTSTART;TZID=America/Los_Angeles:20261021T100000
+DTEND;TZID=America/Los_Angeles:20261021T103000
+END:VEVENT
+"""
+)
+
+
+def test_a_pacific_series_keeps_its_local_time_when_daylight_saving_ends():
+    start = datetime(2026, 10, 27, tzinfo=timezone.utc)
+    events = events_between(PACIFIC_SERIES, start, start + timedelta(days=10))
+    assert [event.id for event in events] == ["standup_20261028T170000Z", "standup_20261104T180000Z"]
+    assert [event.start for event in events] == [
+        datetime(2026, 10, 28, 17, 0, tzinfo=timezone.utc),
+        datetime(2026, 11, 4, 18, 0, tzinfo=timezone.utc),
+    ]
+    assert [event.end - event.start for event in events] == [timedelta(minutes=30)] * 2
+
+
+SERIES_WITH_GAPS = _calendar(
+    """BEGIN:VEVENT
+UID:excluded@google.com
+SUMMARY:Excluded weekly
+RRULE:FREQ=WEEKLY;COUNT=3
+EXDATE:20261028T170000Z
+DTSTART:20261021T170000Z
+DTEND:20261021T173000Z
+END:VEVENT
+BEGIN:VEVENT
+UID:called-off@google.com
+SUMMARY:Called-off weekly
+RRULE:FREQ=WEEKLY;COUNT=3
+DTSTART:20261021T180000Z
+DTEND:20261021T183000Z
+END:VEVENT
+BEGIN:VEVENT
+UID:called-off@google.com
+RECURRENCE-ID:20261028T180000Z
+SUMMARY:Called-off weekly
+STATUS:CANCELLED
+DTSTART:20261028T180000Z
+DTEND:20261028T183000Z
+END:VEVENT
+"""
+)
+
+
+def test_an_excluded_date_removes_only_that_occurrence():
+    start = datetime(2026, 10, 20, tzinfo=timezone.utc)
+    events = events_between(SERIES_WITH_GAPS, start, start + timedelta(days=21))
+    assert [event.id for event in events if event.summary == "Excluded weekly"] == [
+        "excluded_20261021T170000Z",
+        "excluded_20261104T170000Z",
+    ]
+
+
+def test_a_cancelled_occurrence_is_dropped_but_the_rest_of_the_series_stays():
+    start = datetime(2026, 10, 20, tzinfo=timezone.utc)
+    events = events_between(SERIES_WITH_GAPS, start, start + timedelta(days=21))
+    assert [event.id for event in events if event.summary == "Called-off weekly"] == [
+        "called-off_20261021T180000Z",
+        "called-off_20261104T180000Z",
+    ]
+
+
+def test_crlf_line_endings_parse_the_same_as_lf():
+    start = datetime(2026, 10, 28, 16, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=8)
+    with_lf = events_between(FAR_AWAY, start, end)
+    with_crlf = events_between(FAR_AWAY.replace("\n", "\r\n"), start, end)
+    assert len(with_lf) >= 3
+    assert with_crlf == with_lf
+    assert [event.key() for event in with_crlf] == [event.key() for event in with_lf]
+
+
+NO_ENDS = _calendar(
+    """BEGIN:VEVENT
+UID:open-ended@google.com
+SUMMARY:Open ended
+DTSTART:20261028T170000Z
+END:VEVENT
+BEGIN:VEVENT
+UID:timed@google.com
+SUMMARY:Forty-five minutes
+DTSTART:20261028T190000Z
+DURATION:PT45M
+END:VEVENT
+BEGIN:VEVENT
+UID:all-day@google.com
+SUMMARY:All day
+DTSTART;VALUE=DATE:20261028
+END:VEVENT
+"""
+)
+
+
+def test_a_meeting_without_an_end_lasts_an_hour():
+    start = datetime(2026, 10, 28, 16, 0, tzinfo=timezone.utc)
+    events = events_between(NO_ENDS, start, start + timedelta(hours=8))
+    lengths = {event.summary: event.end - event.start for event in events}
+    assert lengths == {"Open ended": timedelta(hours=1), "Forty-five minutes": timedelta(minutes=45)}
+    # A window that opens part-way through still finds it.
+    under_way = events_between(NO_ENDS, datetime(2026, 10, 28, 17, 30, tzinfo=timezone.utc), start + timedelta(hours=2))
+    assert [event.summary for event in under_way] == ["Open ended"]
+
+
+FLOATING = _calendar(
+    """BEGIN:VEVENT
+UID:before@example.com
+SUMMARY:Before the change
+DTSTART:20261028T120000
+DTEND:20261028T130000
+END:VEVENT
+BEGIN:VEVENT
+UID:after@example.com
+SUMMARY:After the change
+DTSTART:20261104T120000
+DTEND:20261104T130000
+END:VEVENT
+"""
+)
+
+
+def test_a_floating_time_follows_the_pcs_daylight_saving_rule_for_its_date(monkeypatch):
+    pacific = ZoneInfo("America/Los_Angeles")
+    monkeypatch.setattr(calendar_feed, "_local_time", lambda value: value.replace(tzinfo=pacific))
+    start = datetime(2026, 10, 27, tzinfo=timezone.utc)
+    events = events_between(FLOATING, start, start + timedelta(days=10))
+    assert [event.start for event in events] == [
+        datetime(2026, 10, 28, 19, 0, tzinfo=timezone.utc),
+        datetime(2026, 11, 4, 20, 0, tzinfo=timezone.utc),
+    ]
+    assert [event.end - event.start for event in events] == [timedelta(hours=1)] * 2
+
+
+def test_a_floating_time_the_pc_cannot_place_keeps_todays_offset(monkeypatch):
+    def unplaceable(value):
+        raise OSError(22, "Invalid argument")
+
+    monkeypatch.setattr(calendar_feed, "_local_time", unplaceable)
+    start = datetime(2026, 10, 27, tzinfo=timezone.utc)
+    events = events_between(FLOATING, start, start + timedelta(days=10))
+    assert [event.start.replace(tzinfo=None) for event in events] == [datetime(2026, 10, 28, 12), datetime(2026, 11, 4, 12)]

@@ -7,35 +7,8 @@ import json
 import logging
 import urllib.parse
 from ctypes import wintypes
-from datetime import timedelta
 
 log = logging.getLogger("granola_autostart")
-
-GENERIC_ZOOM_TITLES = {
-    "zoom",
-    "zoom meeting",
-    "zoom workplace",
-    "zoom webinar",
-    "meeting chat",
-}
-
-
-def meeting_title(zoom_title: str | None) -> str:
-    cleaned = (zoom_title or "").strip()
-    if not cleaned or cleaned.casefold() in GENERIC_ZOOM_TITLES:
-        return "Zoom meeting"
-    return cleaned[:200]
-
-
-def adhoc_payload(title: str, session_id: str, now) -> dict:
-    end = now + timedelta(hours=1)
-    safe_id = session_id.replace(":", "-")
-    return {
-        "id": f"zoom-{safe_id}",
-        "summary": title,
-        "start": {"dateTime": now.isoformat()},
-        "end": {"dateTime": end.isoformat()},
-    }
 
 
 def build_url(event: dict | None) -> str:

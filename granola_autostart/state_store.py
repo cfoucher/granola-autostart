@@ -6,11 +6,10 @@ import json
 import logging
 from datetime import datetime
 
-from decide import ActiveLaunch, WatcherState
-from settings import state_path
+from .decide import ActiveLaunch, WatcherState
+from .settings import state_path, write_json
 
 log = logging.getLogger("granola_autostart")
-_last_written: str | None = None
 
 
 def load_state() -> tuple[WatcherState, datetime | None]:
@@ -46,13 +45,14 @@ def _parse(raw: dict) -> tuple[WatcherState, datetime | None]:
             warned=bool(launch.get("warned")),
             zoom_session_id=launch.get("zoom_session_id"),
             missing_since=_dt(missing) if missing else None,
+            failed=bool(launch.get("failed")),
+            call_session=launch.get("call_session"),
         )
     pause = raw.get("pause_until")
     return state, _dt(pause) if pause else None
 
 
 def save_state(state: WatcherState, pause_until: datetime | None) -> None:
-    global _last_written
     launch = state.active_launch
     payload = {
         "version": 1,
@@ -74,21 +74,15 @@ def save_state(state: WatcherState, pause_until: datetime | None) -> None:
             "warned": launch.warned,
             "zoom_session_id": launch.zoom_session_id,
             "missing_since": launch.missing_since.isoformat() if launch.missing_since else None,
+            "failed": launch.failed,
+            "call_session": launch.call_session,
         },
     }
-    text = json.dumps(payload, indent=2) + "\n"
-    path = state_path()
-    if _last_written == f"{path}\n{text}" and path.exists():
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(text, encoding="utf-8")
-    temporary.replace(path)
-    _last_written = f"{path}\n{text}"
+    write_json(state_path(), payload, skip_unchanged=True)
 
 
 def _dt(value: str) -> datetime:
     parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        return parsed.astimezone()  # this PC's local time, with the daylight-saving rule for that date
     return parsed

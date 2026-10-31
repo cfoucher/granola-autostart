@@ -18,6 +18,7 @@ COMMANDS = ("pause-hour", "pause-today", "resume", "quit")
 PREFIX = "Local\\GranolaAutostart-"
 EVENT_MODIFY_STATE = 0x0002
 WAIT_MS = 1000
+WAIT_FAILED = 0xFFFFFFFF
 
 
 def _kernel32():
@@ -55,8 +56,14 @@ def listen(handlers: dict[str, Callable[[], None]], stop: threading.Event) -> No
     handles = [kernel32.CreateEventW(None, False, False, PREFIX + name) for name in names]
     waitable = (wintypes.HANDLE * len(handles))(*handles)
     try:
+        if not all(handles):
+            log.error("Settings can't pause, resume, or quit this watcher: its events could not be created")
+            return
         while not stop.is_set():
             index = kernel32.WaitForMultipleObjects(len(handles), waitable, False, WAIT_MS)
+            if index == WAIT_FAILED:
+                log.error("stopped listening for Settings' commands: the wait failed")
+                return
             if index < len(handles):
                 log.info("%s from Settings", names[index])
                 try:
@@ -64,5 +71,5 @@ def listen(handlers: dict[str, Callable[[], None]], stop: threading.Event) -> No
                 except Exception:
                     log.exception("could not %s", names[index])
     finally:
-        for handle in handles:
+        for handle in filter(None, handles):
             kernel32.CloseHandle(handle)
