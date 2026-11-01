@@ -1,7 +1,11 @@
 import json
+import logging
 import os
+import sys
 import time
+import urllib.error
 from datetime import datetime, timedelta, timezone
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -285,3 +289,283 @@ def test_setup_and_add_save_a_webcal_address_as_https(api):
     api.remove_calendar(api.load()["settings"]["calendars"][0]["id"])
     api.add_calendar(webcal)
     assert load_settings().calendar_urls() == [GOOD]
+
+
+def test_a_day_or_more_ago_shows_the_date():
+    assert settings_app.ago(FIXED - timedelta(days=2), FIXED) == "on Wed 28 Oct"
+
+
+def test_test_says_why_an_address_did_not_work_without_repeating_it(api, monkeypatch):
+    def refused(url, timeout=30):
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+
+    def unreadable(*_args):
+        raise ValueError("no DTSTART")
+
+    monkeypatch.setattr(settings_app, "fetch_ics", refused)
+    result = api.test_address(GOOD)
+    assert result == {"ok": False, "error": "Couldn't read that address (404 Not Found). Check you copied all of it."}
+    monkeypatch.setattr(settings_app, "fetch_ics", lambda url, timeout=30: ics("Work"))
+    monkeypatch.setattr(settings_app, "summarize_feed", unreadable)
+    assert api.test_address(GOOD) == {"ok": False, "error": "That address returned a calendar this app couldn't read."}
+
+
+def test_a_calendar_added_twice_is_kept_once(api):
+    api.add_calendar(GOOD)
+    assert len(api.add_calendar(GOOD.replace("https://", "webcal://"))["settings"]["calendars"]) == 1
+
+
+def test_an_idle_time_not_on_offer_is_ignored(api):
+    assert api.set_idle(3)["settings"]["idle_minutes"] == Settings().idle_seconds // 60
+
+
+def test_testing_a_calendar_while_the_config_is_broken_says_it_is_gone(api):
+    config_path().write_text("{ broken", encoding="utf-8")
+    assert api.test_calendar(feed_id(GOOD)) == {"ok": False, "error": "That calendar was removed."}
+
+
+def test_links_open_in_the_browser_only_when_they_are_https(api, monkeypatch, spawned):
+    opened = []
+    monkeypatch.setattr(os, "startfile", opened.append)
+    monkeypatch.setattr(processes, "open_log_folder", lambda: opened.append("logs"))
+    api.open_link("https://github.com/cfoucher/granola-autostart")
+    api.open_link("file:///C:/Windows/System32/calc.exe")
+    api.open_logs()
+    api.open_config()
+    assert opened == ["https://github.com/cfoucher/granola-autostart", "logs"]
+    assert spawned == [["notepad.exe", str(config_path())]]
+
+
+def test_with_no_watcher_listening_pause_and_quit_do_not_wait(api, monkeypatch):
+    monkeypatch.setattr(settings_app.commands, "send", lambda command: False)
+    monkeypatch.setattr(settings_app, "_wait_for", lambda *_args, **_kwargs: pytest.fail("waited for a watcher that isn't there"))
+    api.pause("hour")
+    api.resume()
+    assert api.quit_app()["status"]["running"]
+
+
+def test_waiting_ends_once_done_or_when_the_time_is_up(monkeypatch):
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(settings_app, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=lambda seconds: setattr(clock, "now", clock.now + seconds)))
+    answers = iter([False, False, True])
+    assert settings_app._wait_for(lambda: next(answers))
+    assert clock.now == pytest.approx(0.2)
+    assert not settings_app._wait_for(lambda: False, seconds=1)
+    assert 1.1 < clock.now < 1.4
+
+
+class Window:
+    def __init__(self):
+        self.calls = []
+
+    def set_title(self, title):
+        self.calls.append(("title", title))
+
+    def resize(self, width, height):
+        self.calls.append(("size", width, height))
+
+    def destroy(self):
+        self.calls.append("destroyed")
+
+
+def test_setup_s_done_retitles_resizes_and_recentres_its_window(api, monkeypatch):
+    window = Window()
+    api._window = window
+    api.page = "setup"
+    monkeypatch.setattr(settings_app, "_center_on_primary", lambda window: window.calls.append("centred"))
+    api.open_settings()
+    assert window.calls == [("title", "Granola Autostart settings"), ("size", 796, 660), "centred"]
+
+
+def test_run_setup_again_hands_over_to_a_setup_window(api, monkeypatch, spawned):
+    released = []
+    monkeypatch.setattr(processes, "release_mutex", released.append)
+    window = Window()
+    api._window = window
+    api.run_setup()
+    assert released == [processes.SETTINGS_MUTEX] and spawned[-1][-1] == "--setup" and window.calls == ["destroyed"]
+    api._window = None
+    api.close()  # before the window exists: nothing to close
+
+
+def fake_user32(monkeypatch, **calls) -> None:
+    monkeypatch.setattr(settings_app, "ctypes", SimpleNamespace(windll=SimpleNamespace(user32=SimpleNamespace(**calls))))
+
+
+def test_a_second_window_brings_the_open_settings_or_setup_forward(monkeypatch):
+    calls = []
+    windows = {"Set up Granola Autostart": 0x77}
+    fake_user32(
+        monkeypatch,
+        FindWindowW=lambda _class, title: windows.get(title),
+        ShowWindow=lambda hwnd, command: calls.append(("restore", hwnd, command)),
+        SetForegroundWindow=lambda hwnd: calls.append(("front", hwnd)),
+    )
+    settings_app._bring_forward()
+    assert calls == [("restore", 0x77, 9), ("front", 0x77)]
+    windows.clear()
+    calls.clear()
+    settings_app._bring_forward()  # it closed in the meantime
+    assert calls == []
+
+
+def native_window(handle: int = 0x42, **form) -> SimpleNamespace:
+    return SimpleNamespace(native=SimpleNamespace(Handle=SimpleNamespace(ToInt64=lambda: handle), **form))
+
+
+def test_the_title_bar_follows_the_theme_and_shows_the_app_icon_from_source(monkeypatch):
+    attributes, messages = [], []
+    monkeypatch.setattr(settings_app, "set_window_attribute", lambda hwnd, attribute, value: attributes.append((hwnd, attribute, value)))
+    fake_user32(
+        monkeypatch,
+        LoadImageW=lambda *_args: 0x55,
+        SendMessageW=lambda hwnd, message, which, icon: messages.append((hwnd.value, message, which, icon)),
+    )
+    monkeypatch.setattr(processes, "FROZEN", False)
+    (settings_app.app_dir() / "app.ico").write_bytes(b"ico")
+    settings_app._style_title_bar(native_window(), dark=True)
+    assert messages == [(0x42, 0x80, 0, 0x55), (0x42, 0x80, 1, 0x55)]  # WM_SETICON, small and big
+    assert attributes == [(0x42, 20, 1), (0x42, 35, "#1f1d1a"), (0x42, 36, "#f1ece1"), (0x42, 34, "#3d3a33")]
+    monkeypatch.setattr(processes, "FROZEN", True)  # the packaged exe carries its own icon
+    messages.clear()
+    attributes.clear()
+    settings_app._style_title_bar(native_window(), dark=False)
+    assert messages == [] and attributes[0] == (0x42, 20, 0)
+
+
+def test_a_title_bar_windows_will_not_colour_is_left_as_it_is():
+    settings_app._style_title_bar(SimpleNamespace(native=None), dark=True)
+
+
+@pytest.fixture
+def dotnet(monkeypatch) -> SimpleNamespace:
+    """pythonnet's System namespaces, faked: Invoke runs the call at once, as the window's UI thread would."""
+    screen = SimpleNamespace(X=0, Y=40, Width=1920, Height=1040)  # the primary monitor's work area, below a top taskbar
+
+    class Func:
+        def __class_getitem__(cls, _types):
+            return lambda call: call
+
+    system, windows, forms, drawing = (ModuleType(name) for name in ("System", "System.Windows", "System.Windows.Forms", "System.Drawing"))
+    system.Func, system.Type, system.Windows, system.Drawing = Func, object, windows, drawing
+    windows.Forms = forms
+    forms.Screen = SimpleNamespace(PrimaryScreen=SimpleNamespace(WorkingArea=screen))
+    forms.FormStartPosition = SimpleNamespace(Manual="manual")
+    drawing.Point = lambda x, y: (x, y)
+    for module in (system, windows, forms, drawing):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    return screen
+
+
+def form(width: int, height: int) -> SimpleNamespace:
+    settings = SimpleNamespace(AreDefaultContextMenusEnabled=False)
+    return SimpleNamespace(
+        Width=width,
+        Height=height,
+        StartPosition="centre on the pointer's screen",
+        Location=None,
+        Invoke=lambda call: call(),
+        webview=SimpleNamespace(CoreWebView2=SimpleNamespace(Settings=settings)),
+    )
+
+
+def test_a_new_window_opens_in_the_middle_of_the_primary_monitor(dotnet):
+    window = SimpleNamespace(native=form(796, 660))
+    settings_app._center_on_primary(window)
+    assert (window.native.StartPosition, window.native.Location) == ("manual", (562, 230))
+    tall = SimpleNamespace(native=form(796, 1200))
+    settings_app._center_on_primary(tall)
+    assert tall.native.Location == (562, 40)  # the title bar stays on screen
+
+
+def test_text_fields_get_their_right_click_menu_back(dotnet):
+    window = SimpleNamespace(native=form(796, 660))
+    settings_app._enable_text_field_menus(window)
+    assert window.native.webview.CoreWebView2.Settings.AreDefaultContextMenusEnabled is True
+
+
+def test_without_pythonnet_the_window_still_opens_uncentred_and_without_menus(monkeypatch, caplog):
+    monkeypatch.setitem(sys.modules, "System", None)
+    window = SimpleNamespace(native=form(796, 660))
+    settings_app._center_on_primary(window)
+    settings_app._enable_text_field_menus(window)
+    assert window.native.Location is None and not window.native.webview.CoreWebView2.Settings.AreDefaultContextMenusEnabled
+    assert "window not centered" in caplog.text and "right-click menus stay off" in caplog.text
+
+
+class Event:
+    """pywebview's window events: handlers are added with +=."""
+
+    def __init__(self):
+        self.handlers = []
+
+    def __iadd__(self, handler):
+        self.handlers.append(handler)
+        return self
+
+    def fire(self):
+        for handler in self.handlers:
+            handler()
+
+
+@pytest.fixture
+def webview(monkeypatch, spawned) -> SimpleNamespace:
+    """pywebview, faked: the windows it would have opened, and what the window's events did."""
+    fake = SimpleNamespace(windows=[], started=[], broken=False, styled=[], spawned=spawned)
+
+    def create_window(title, **options):
+        events = SimpleNamespace(before_show=Event(), shown=Event(), loaded=Event())
+        fake.windows.append(SimpleNamespace(title=title, options=options, events=events))
+        return fake.windows[-1]
+
+    def start(**options):
+        fake.started.append(options)
+        if fake.broken:
+            raise RuntimeError("the WebView2 runtime is missing")
+
+    module = ModuleType("webview")
+    module.create_window, module.start = create_window, start
+    monkeypatch.setitem(sys.modules, "webview", module)
+    monkeypatch.setattr(settings_app, "setup_logging", lambda name: logging.getLogger("granola_autostart"))
+    monkeypatch.setattr(processes, "hold_mutex", lambda name: True)
+    monkeypatch.setattr(settings_app, "app_theme", lambda: "dark")
+    for name in ("_center_on_primary", "_enable_text_field_menus"):
+        monkeypatch.setattr(settings_app, name, lambda window, name=name: fake.styled.append(name))
+    monkeypatch.setattr(settings_app, "_style_title_bar", lambda window, dark: fake.styled.append(("_style_title_bar", dark)))
+    return fake
+
+
+def test_settings_opens_its_page_in_a_dark_window_and_starts_a_quit_app(webview):
+    assert settings_app.main(["--section=about"]) == 0
+    [window] = webview.windows
+    assert window.title == "Granola Autostart settings"
+    assert (window.options["width"], window.options["height"], window.options["background_color"]) == (796, 660, "#25231f")
+    assert window.options["url"].endswith("/web/index.html") and window.options["js_api"].section == "about"
+    assert window.options["js_api"]._window is window
+    assert webview.started == [{"gui": "edgechromium", "private_mode": True}]
+    assert webview.spawned[-1][-1] == "--supervise"
+    for event in ("before_show", "shown", "loaded"):
+        getattr(window.events, event).fire()
+    assert webview.styled == ["_center_on_primary", ("_style_title_bar", True), "_enable_text_field_menus"]
+
+
+def test_setup_opens_its_own_page_without_starting_the_watcher(webview):
+    assert settings_app.main(["--setup"]) == 0
+    [window] = webview.windows
+    assert (window.title, window.options["width"], window.options["height"]) == ("Set up Granola Autostart", 656, 680)
+    assert window.options["js_api"].page == "setup" and webview.spawned == []
+
+
+def test_a_second_settings_window_brings_the_first_forward_instead(webview, monkeypatch):
+    forward = []
+    monkeypatch.setattr(processes, "hold_mutex", lambda name: False)
+    monkeypatch.setattr(settings_app, "_bring_forward", lambda: forward.append(True))
+    assert settings_app.main([]) == 0
+    assert forward == [True] and webview.windows == []
+
+
+def test_without_webview2_settings_opens_config_json_instead(webview, monkeypatch):
+    monkeypatch.setattr(processes, "watcher_running", lambda: True)
+    webview.broken = True
+    assert settings_app.main([]) == 1
+    assert webview.spawned == [["notepad.exe", str(config_path())]]
