@@ -1,6 +1,7 @@
 # Bumps the version in granola_autostart/__init__.py, commits it to main, and tags it. The tag starts the Build
 # workflow, which tests, builds the installer, and attaches it to a GitHub release.
-# Run it from the Actions tab (or `gh workflow run release.yml -f bump=minor`). Ubuntu, because nothing here needs Windows.
+# Run it from the Actions tab (or `gh workflow run release.yml -f bump=minor`). The Dependabot workflow also runs it, with
+# a patch bump, once Dependabot's Python updates have merged. Ubuntu, because nothing here needs Windows.
 # It pushes with the RELEASE_DEPLOY_KEY secret, a write deploy key: the ruleset on main lets deploy keys past its
 # pull-request rule, which the workflow's own token can't be exempted from, and their pushes start other workflows,
 # which the token's pushes don't. A retry whose tag already exists pushes nothing, so it dispatches Build itself.

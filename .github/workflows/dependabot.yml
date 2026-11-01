@@ -1,0 +1,106 @@
+# Merges Dependabot's safe updates and releases them with a patch bump.
+# A Python update that isn't a major version gets auto-merge, so it merges by itself once the required checks pass.
+# GitHub Actions updates wait for you, since the workflow's token can't merge changes to workflow files and they don't
+# change the installer; so do major versions, which deserve a look.
+# A merge made with the workflow's token starts no other workflows, so an hourly run does the rest. When everything on
+# main since the last version tag came from Dependabot, a Python update among it, it runs Release with a patch bump;
+# changes of your own leave the release to you. Otherwise it brings an auto-merging Dependabot pull request that fell
+# behind main up to date, as the ruleset on main requires, and dispatches Build on it, since that push starts no checks
+# either.
+name: Dependabot
+
+on:
+  pull_request:
+  schedule:
+    - cron: "41 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  auto-merge:
+    if: github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - id: metadata
+        uses: dependabot/fetch-metadata@v3
+      # update-type is the biggest change in the pull request, so a group with one major version in it waits too.
+      - name: Enable auto-merge
+        if: >-
+          steps.metadata.outputs.package-ecosystem == 'pip' &&
+          (steps.metadata.outputs.update-type == 'version-update:semver-minor' ||
+           steps.metadata.outputs.update-type == 'version-update:semver-patch')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --auto --merge "$PR_URL"
+
+  follow-up:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: dependabot-follow-up
+    permissions:
+      contents: write
+      pull-requests: write # update-branch
+      actions: write # dispatch Release and Build
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # main's history since the last tag
+      - name: Release merged updates, or bring waiting ones up to date
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag=$(git describe --tags --abbrev=0 --match 'v*' origin/main)
+          python=false
+          others=false
+          for sha in $(git rev-list --first-parent "$tag..origin/main"); do
+            pr=$(gh api "repos/$GH_REPO/commits/$sha/pulls" --jq 'map(select(.merged_at)) | first | "\(.user.login) \(.head.ref)"')
+            case "$pr" in
+              "dependabot[bot] dependabot/pip/"*) python=true ;;
+              "dependabot[bot] "*) ;;
+              *) others=true ;;
+            esac
+          done
+
+          if [ "$python" = true ] && [ "$others" = true ]; then
+            echo "Dependabot's Python updates since $tag will go out with your next release." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$python" = true ]; then
+            # One Release for these commits: not a second while one runs, nor a retry of one that failed, which needs a look.
+            last_release=$(gh run list --workflow release.yml --limit 1 --json createdAt --jq '.[0].createdAt // empty')
+            if [ -n "$last_release" ] && [ "$(date -d "$last_release" +%s)" -gt "$(git log -1 --format=%ct origin/main)" ]; then
+              echo "Release already ran after the newest commit on main, so it isn't started again." >> "$GITHUB_STEP_SUMMARY"
+            else
+              gh workflow run release.yml --ref main -f bump=patch
+              echo "Started Release with a patch bump for Dependabot's updates since $tag." >> "$GITHUB_STEP_SUMMARY"
+              exit 0 # its version bump moves main again, so updating branches waits for the next run
+            fi
+          fi
+
+          gh pr list --author app/dependabot --json number,headRefName,headRefOid,mergeStateStatus,autoMergeRequest \
+            --jq '.[] | select(.autoMergeRequest and .mergeStateStatus == "BEHIND") | "\(.number) \(.headRefName) \(.headRefOid)"' |
+          while read -r number branch head; do
+            if ! gh api -X PUT "repos/$GH_REPO/pulls/$number/update-branch" -f expected_head_sha="$head" --silent; then
+              echo "::warning::Couldn't bring #$number up to date with main. Use Update branch on it."
+              continue
+            fi
+            # The update lands a moment later; build it once it has.
+            updated=false
+            for _ in $(seq 30); do
+              sleep 2
+              if [ "$(gh api "repos/$GH_REPO/pulls/$number" --jq .head.sha)" != "$head" ]; then updated=true; break; fi
+            done
+            if [ "$updated" = true ]; then
+              gh workflow run build.yml --ref "$branch"
+              echo "Brought #$number up to date with main and started Build on it." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::warning::#$number didn't move after updating it with main. Use Update branch on it."
+            fi
+          done
