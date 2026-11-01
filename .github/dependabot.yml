@@ -14,6 +14,14 @@ updates:
     # A bare number, which Dependabot would otherwise read as a requirement.
     exclude-paths:
       - coverage-floor.txt
+    # Versions the packages that need these don't allow yet, so a pull request for them could only fail. Drop a line
+    # once its package allows the version: Windows-Toasts pins winrt-* ~=3.0, and recurring-ical-events wants
+    # python-dateutil<3.
+    ignore:
+      - dependency-name: winrt-*
+        versions: [">=4"]
+      - dependency-name: python-dateutil
+        versions: [">=3"]
     groups:
       python:
         patterns: ["*"]
