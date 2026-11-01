@@ -1,7 +1,8 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
-# CodeRabbit reviews every pull request and is the approval the ruleset on main requires. It asks for changes when it
-# has something to fix and approves once that's resolved and it has reviewed the latest commit; a push dismisses the
-# approval, so it reviews and approves again. It says what's wrong and how to fix it, and leaves out the extras.
+# CodeRabbit reviews every pull request once it's out of draft, and is the approval the ruleset on main requires. It
+# asks for changes when it has something to fix and approves once that's resolved and it has reviewed the latest
+# commit; a push dismisses the approval, so it reviews and approves again. It says what's wrong and how to fix it, and
+# leaves out the extras.
 language: en-US
 tone_instructions: >-
   Be terse. Flag only real problems: bugs, regressions, security holes, missed edge cases, missing tests. For each, say

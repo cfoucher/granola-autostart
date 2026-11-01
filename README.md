@@ -117,7 +117,7 @@ The pre-push hook refuses a push to `main` and checks every commit being pushed,
 - **checks**: `ruff check` (errors such as undefined names and unused imports, not style), the tests and the floor (a rise must raise the floor here too), and diff coverage: the tests must run at least 80% of the lines a pull request adds or changes in `granola_autostart/`. To see that before pushing, run `.venv\Scripts\python -m coverage xml`, then `.venv\Scripts\diff-cover coverage.xml --compare-branch=origin/main`.
 - **installer**: builds the installer.
 
-The ruleset also needs one approval, which comes from CodeRabbit (`.coderabbit.yaml`). It reviews each pull request, asks for changes when it finds something to fix, and approves once its comments are resolved and it has reviewed the latest commit. A new push dismisses the approval until CodeRabbit has reviewed that commit too. To overrule a comment, reply to it or resolve its thread.
+The ruleset also needs one approval, which comes from CodeRabbit (`.coderabbit.yaml`). It reviews each pull request once it's out of draft, asks for changes when it finds something to fix, and approves once its comments are resolved and it has reviewed the latest commit. A new push dismisses the approval until CodeRabbit has reviewed that commit too. To overrule a comment, reply to it or resolve its thread.
 
 ### Layout
 
