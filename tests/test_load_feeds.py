@@ -1,10 +1,14 @@
+import http.client
+import logging
 import threading
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 
-from granola_autostart import calendar_cache
+from granola_autostart import calendar_cache, calendar_feed
 from granola_autostart.settings import Settings
 
 NOW = datetime(2026, 10, 28, 16, 0, tzinfo=timezone.utc)
@@ -96,6 +100,48 @@ def test_the_cache_reports_each_calendars_health(feeds, cache):
     feeds[WATCH] = WATCH_ICS
     cache._refresh(settings, cache._generation, NOW)
     assert cache.feed_statuses([WATCH])[0].failures == 0
+
+
+SECRET = "https://calendar.google.com/calendar/ical/me%40example.com/private-0123456789abcdef/basic.ics"
+
+
+def _redirect_to_http():
+    handler = calendar_feed._HttpsOnlyRedirects()
+    request = urllib.request.Request(SECRET)
+    try:
+        handler.redirect_request(request, None, 302, "Found", {}, "http://calendar.google.com/elsewhere")
+    except urllib.error.HTTPError as error:
+        return error
+    raise AssertionError("the redirect was allowed")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        urllib.error.HTTPError(SECRET, 403, "Forbidden", {}, None),
+        urllib.error.URLError(f"unknown url type: {SECRET}"),
+        http.client.InvalidURL(f"URL can't contain control characters. {SECRET!r} (found at least ' ')"),
+        ValueError(f"bad calendar {SECRET}"),
+        OSError(f"cannot reach {SECRET}"),
+        _redirect_to_http(),
+    ],
+    ids=["http-error", "url-error", "invalid-url", "value-error", "os-error", "redirect-refused"],
+)
+def test_a_failed_download_never_puts_the_address_in_the_log_or_status(error, cache, monkeypatch, caplog):
+    def fetch(url):
+        raise error
+
+    monkeypatch.setattr(calendar_cache, "fetch_ics", fetch)
+    settings = Settings(ics_urls=(SECRET,))
+    with caplog.at_level(logging.DEBUG, logger="granola_autostart"):
+        cache._refresh(settings, cache._generation, NOW)
+    [feed] = cache.feed_statuses([SECRET])
+    assert feed.failures == 1
+    assert "calendar feed 1 failed" in caplog.text
+    for text in (caplog.text, feed.last_error, repr(feed)):
+        assert SECRET not in text
+        assert "private-0123456789abcdef" not in text
+        assert "example.com" not in text
 
 
 def test_a_calendar_that_fails_keeps_its_last_meetings(feeds, cache):

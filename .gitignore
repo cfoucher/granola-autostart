@@ -9,3 +9,8 @@ __pycache__/
 .pytest_cache/
 *.pyc
 config.json
+.coverage
+.coverage.*
+coverage.xml
+diff-cover.md
+htmlcov/

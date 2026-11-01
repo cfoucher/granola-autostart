@@ -1,7 +1,8 @@
-# Tests, then an installer, for pushes to main, version tags, pull requests, and manual runs.
-# Windows runners, because the tests and the build use winreg and ctypes.windll. The repo is private, so
-# runner time comes out of GitHub Free's monthly allowance, where Windows minutes count double: one Windows
-# job per run, cancelled when superseded, and none for changes to Markdown files alone.
+# Checks and an installer, for pushes to main, version tags, pull requests, and manual runs.
+# Windows runners, because the tests and the build use winreg and ctypes.windll. Two jobs, both required to merge
+# a pull request by the ruleset on main: checks (ruff, the tests under the coverage ratchet, and on pull requests
+# diff coverage) and installer. Every pull request runs both, Markdown-only ones too, since a required check that
+# never runs would block the merge; a push to main that changes only Markdown skips them.
 name: Build
 
 on:
@@ -10,7 +11,6 @@ on:
     tags: ["v*"]
     paths-ignore: ["**.md"]
   pull_request:
-    paths-ignore: ["**.md"]
   workflow_dispatch:
 
 permissions:
@@ -21,6 +21,37 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  checks:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # diff-cover compares the pull request with its base branch
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            requirements*.txt
+            constraints.txt
+      - run: python -m pip install -r requirements-dev.txt -c constraints.txt
+      - run: python -m ruff check --output-format=github
+      # Strict on pull requests: coverage that rose must raise coverage-floor.txt too. Elsewhere it only may not
+      # fall, so a floor left behind by two merges can't hold up a release.
+      - name: Tests and coverage ratchet
+        run: python tools/coverage_ratchet.py ${{ github.event_name == 'pull_request' && '--strict' || '' }}
+      - name: Diff coverage
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          python -m coverage xml -q -o coverage.xml
+          diff-cover coverage.xml --compare-branch="origin/$GITHUB_BASE_REF" --fail-under=80 --markdown-report=diff-cover.md
+      - name: Diff coverage summary
+        if: always() && hashFiles('diff-cover.md') != ''
+        shell: bash
+        run: cat diff-cover.md >> "$GITHUB_STEP_SUMMARY"
+
   installer:
     runs-on: windows-latest
     timeout-minutes: 30
@@ -34,7 +65,6 @@ jobs:
             requirements*.txt
             constraints.txt
       - run: python -m pip install -r requirements-build.txt -c constraints.txt
-      - run: python -m pytest -q
       - name: Check the tag matches the package version
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
@@ -52,9 +82,9 @@ jobs:
           if-no-files-found: error
 
   release:
-    # A version tag keeps its installer on a GitHub release. Linux is enough to upload a file, and cheaper.
+    # A version tag keeps its installer on a GitHub release, once the checks pass too. Linux is enough to upload a file.
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: installer
+    needs: [checks, installer]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

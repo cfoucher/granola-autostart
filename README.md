@@ -65,6 +65,22 @@ Granola's own one-minute reminder is unchanged. Clicking that reminder still ope
 
 Files: `%LOCALAPPDATA%\granola-autostart` holds `config.json`, `state.json`, `status.json`, and the logs (`log.txt`, `supervisor-log.txt`, `settings-log.txt`, `cli-log.txt`, and `notice-log.txt` if the countdown card ever fails). Logs record meeting titles, never calendar addresses.
 
+## Security
+
+A secret calendar address works like a password: anyone who has it can read your whole calendar. Here is how the app handles it, and where that protection stops.
+
+**What is protected.** Calendar addresses are encrypted in `config.json` with the Windows Data Protection API (DPAPI), through `CryptProtectData`. DPAPI means the app stores no key: Windows derives it from your sign-in. Microsoft describes DPAPI as [encrypting data with the current user's account, without you generating or storing a key](https://learn.microsoft.com/en-us/dotnet/standard/security/how-to-use-data-protection), and documents its behaviour and limits in the [`CryptProtectData` reference](https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata). Neither page says DPAPI is *the* recommended way to store a per-user app's secrets; it is the built-in Windows mechanism for this job, and a common choice for it.
+
+Addresses never appear in the logs, `status.json` (feeds there are named by a hash) or error messages. Downloads must use HTTPS, are refused if redirected to plain HTTP, and are capped in size and time. A test (`test_a_failed_download_never_puts_the_address_in_the_log_or_status`) fails every kind of download error on purpose and checks the address appears nowhere.
+
+**What this does not protect against:**
+
+- **Other programs running as you.** DPAPI ties the data to your Windows account, so any program running under it can decrypt the address. The app also mixes in a fixed extra string, but it is in the source code, so it only stops programs that don't know it. It is not a second secret. Microsoft's pages don't cover this case, so don't read them as saying DPAPI defends against it.
+- **Someone who knows your Windows password.** The key comes from your sign-in, so your account's security is the app's security. Use a strong password or Windows Hello, and turn on BitLocker so a stolen laptop's disk can't be read offline.
+- **Another PC or account.** Copying `config.json` elsewhere doesn't work, by design. The app tells you to clear the `ics_urls_protected` list and add your calendars again.
+- **Everything else in the folder.** Only the addresses are encrypted. `config.json` settings, `state.json`, `status.json` and the logs are plain text in `%LOCALAPPDATA%\granola-autostart`, and the logs record meeting titles.
+- **A leaked address.** The app can't revoke it. If you think one has leaked, reset it at the source: in Google Calendar, **Integrate calendar**, **Reset** next to the secret address; in Outlook, unpublish the calendar and publish it again. Then paste the new address into Settings.
+
 ## Development
 
 Use Python 3.13, as CI and the installer do:
@@ -72,6 +88,7 @@ Use Python 3.13, as CI and the installer do:
 ```powershell
 python -m venv .venv
 .venv\Scripts\pip install -r requirements-build.txt -c constraints.txt
+git config core.hooksPath .githooks   # the pre-push checks, below
 .venv\Scripts\python -m pytest
 ```
 
@@ -86,6 +103,20 @@ Running from source, in the checkout folder:
 
 Only one watcher runs at a time, so stop an installed copy first (right-click the tray icon, **Quit**). `--install` and `--uninstall` set up a source checkout to start at sign-in, in the same startup entry the installer uses, so they replace and remove an installed copy's.
 
+### Tests and coverage
+
+Coverage may never fall. `coverage-floor.txt` holds the lowest total coverage allowed (statements and branches), and it only moves up:
+
+```powershell
+.venv\Scripts\python tools\coverage_ratchet.py            # the tests under coverage, held to the floor
+.venv\Scripts\python tools\coverage_ratchet.py --update   # raise the floor after adding tests
+```
+
+The pre-push hook refuses a push to `main` and checks every commit being pushed, as committed: ruff, the tests, and the floor. When coverage rose, it writes the new floor to `coverage-floor.txt` and stops the push, so that the raised floor is committed too. `git push --no-verify` skips the hook, but pull requests run the same checks, and a ruleset on `main` won't merge one until both pass:
+
+- **checks**: `ruff check` (errors such as undefined names and unused imports, not style), the tests and the floor (a rise must raise the floor here too), and diff coverage: the tests must run at least 80% of the lines a pull request adds or changes in `granola_autostart/`. To see that before pushing, run `.venv\Scripts\python -m coverage xml`, then `.venv\Scripts\diff-cover coverage.xml --compare-branch=origin/main`.
+- **installer**: builds the installer.
+
 ### Layout
 
 - `granola_autostart/` is the app, one package. `__main__.py` starts every mode, from source and in the packaged exe.
@@ -98,6 +129,7 @@ Only one watcher runs at a time, so stop an installed copy first (right-click th
   - `status.py`, `notify.py`, `icon.py`, `winui.py`, `commands.py`: what the tray and Settings show, notifications, the icon, the Windows theme and window colours, and Settings' Pause, Resume, and Quit.
   - `settings.py`, `secret_box.py`: config, file paths and writes, and the encryption for calendar addresses.
 - `tests/`: pytest.
+- `tools/`: the coverage ratchet and the pre-push checks, which `.githooks/pre-push` runs. `coverage-floor.txt` is the ratchet's floor.
 - `packaging/`: the PyInstaller spec and its entry script (`entry.py`), the Inno Setup script, and the icon drawing for both. `build.ps1` runs them.
 - `constraints.txt`: the exact package versions builds use; its header says how to upgrade them.
 
@@ -109,6 +141,6 @@ With the build requirements and Inno Setup 7 (6 also works) installed:
 .\build.ps1
 ```
 
-It runs the tests, builds `dist\GranolaAutostart\` with PyInstaller, then `dist\GranolaAutostart-<version>-setup.exe`. One `GranolaAutostart.exe` runs every mode: the watcher, `--supervise`, `--notice`, `--settings`, `--setup`, and `--stop`.
+It runs the tests under the coverage ratchet, builds `dist\GranolaAutostart\` with PyInstaller, then `dist\GranolaAutostart-<version>-setup.exe`. One `GranolaAutostart.exe` runs every mode: the watcher, `--supervise`, `--notice`, `--settings`, `--setup`, and `--stop`.
 
-GitHub Actions runs the tests and builds the installer for pull requests, pushes to `main`, and version tags, keeping it for 7 days. Changes to Markdown files alone don't start a build. A tag such as `v1.0.0` must match `__version__` in `granola_autostart/__init__.py`, and also creates a GitHub release with the installer attached.
+GitHub Actions runs the checks and builds the installer for pull requests, pushes to `main`, and version tags, keeping the installer for 7 days. A push to `main` that changes only Markdown files doesn't start a build; a pull request always does. A tag such as `v1.0.0` must match `__version__` in `granola_autostart/__init__.py`, and also creates a GitHub release with the installer attached.

@@ -1,8 +1,9 @@
-# Bumps the version in granola_autostart/__init__.py, commits it to main, tags it, and starts the Build workflow
-# on the tag, which tests, builds the installer, and attaches it to a GitHub release.
+# Bumps the version in granola_autostart/__init__.py, commits it to main, and tags it. The tag starts the Build
+# workflow, which tests, builds the installer, and attaches it to a GitHub release.
 # Run it from the Actions tab (or `gh workflow run release.yml -f bump=minor`). Ubuntu, because nothing here needs Windows.
-# Pushes made with the workflow's token do not trigger other workflows, but a workflow_dispatch does, which is why
-# the last step dispatches Build on the new tag instead of relying on the tag push.
+# It pushes with the RELEASE_DEPLOY_KEY secret, a write deploy key: the ruleset on main lets deploy keys past its
+# pull-request rule, which the workflow's own token can't be exempted from, and their pushes start other workflows,
+# which the token's pushes don't. A retry whose tag already exists pushes nothing, so it dispatches Build itself.
 name: Release
 
 on:
@@ -15,7 +16,7 @@ on:
         default: minor
 
 permissions:
-  contents: write
+  contents: read # pushes use the deploy key
   actions: write
 
 concurrency:
@@ -29,6 +30,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+        with:
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
       - name: Bump, commit, and tag
         id: bump
         env:
@@ -47,6 +50,7 @@ jobs:
           new="$major.$minor.$patch"
           tag_exists=false
           git ls-remote --exit-code --tags origin "refs/tags/v$new" > /dev/null && tag_exists=true
+          pushed=true
           if [ "$BUMP" = none ]; then
             # Retry the current version: reuse its tag, or create it on this commit if the bump never got that far.
             if [ "$tag_exists" = false ]; then
@@ -54,6 +58,8 @@ jobs:
               git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
               git tag "v$new"
               git push origin "v$new"
+            else
+              pushed=false
             fi
           else
             [ "$tag_exists" = false ] || { echo "::error::tag v$new already exists"; exit 1; }
@@ -65,7 +71,9 @@ jobs:
             git push --atomic origin HEAD:main "v$new"
           fi
           echo "tag=v$new" >> "$GITHUB_OUTPUT"
-      - name: Build and release the tag
+          echo "pushed=$pushed" >> "$GITHUB_OUTPUT"
+      - name: Build and release the existing tag
+        if: steps.bump.outputs.pushed == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run build.yml --repo "$GITHUB_REPOSITORY" --ref "${{ steps.bump.outputs.tag }}"

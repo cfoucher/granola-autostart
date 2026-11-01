@@ -1,5 +1,23 @@
 [tool.pytest.ini_options]
-pythonpath = ["."]
+pythonpath = [".", "tools"]
 testpaths = ["tests"]
 # A guard in tests/conftest.py tripped on a background thread must fail the run, not just warn.
 filterwarnings = ["error::pytest.PytestUnhandledThreadExceptionWarning"]
+
+[tool.coverage.run]
+# Every module counts, even one no test imports (at 0%).
+source = ["granola_autostart"]
+branch = true
+
+[tool.coverage.report]
+precision = 2
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+target-version = "py313"
+
+[tool.ruff.lint]
+# Errors only (undefined names, unused imports, syntax), not style: the classic default, pinned because newer
+# ruff releases widen theirs.
+select = ["E4", "E7", "E9", "F"]
