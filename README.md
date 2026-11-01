@@ -117,6 +117,8 @@ The pre-push hook refuses a push to `main` and checks every commit being pushed,
 - **checks**: `ruff check` (errors such as undefined names and unused imports, not style), the tests and the floor (a rise must raise the floor here too), and diff coverage: the tests must run at least 80% of the lines a pull request adds or changes in `granola_autostart/`. To see that before pushing, run `.venv\Scripts\python -m coverage xml`, then `.venv\Scripts\diff-cover coverage.xml --compare-branch=origin/main`.
 - **installer**: builds the installer.
 
+The ruleset also needs one approval, which comes from CodeRabbit (`.coderabbit.yaml`). It reviews each pull request, asks for changes when it finds something to fix, and approves once its comments are resolved and it has reviewed the latest commit. A new push dismisses the approval until CodeRabbit has reviewed that commit too. To overrule a comment, reply to it or resolve its thread.
+
 ### Layout
 
 - `granola_autostart/` is the app, one package. `__main__.py` starts every mode, from source and in the packaged exe.
@@ -145,4 +147,4 @@ It runs the tests under the coverage ratchet, builds `dist\GranolaAutostart\` wi
 
 GitHub Actions runs the checks and builds the installer for pull requests, pushes to `main`, and version tags, keeping the installer for 7 days. A push to `main` that changes only Markdown files doesn't start a build; a pull request always does. A tag such as `v1.0.0` must match `__version__` in `granola_autostart/__init__.py`, and also creates a GitHub release with the installer attached.
 
-Dependabot opens pull requests each week for newer Python packages and GitHub Actions. The Dependabot workflow merges a Python update that isn't a major version once its checks pass, and then runs the Release workflow with a patch bump, unless `main` also has unreleased changes of your own. GitHub Actions updates and major versions wait for you to merge them.
+Dependabot opens pull requests each week for newer Python packages and GitHub Actions. The Dependabot workflow merges a Python update that isn't a major version once its checks pass and CodeRabbit approves it, and then runs the Release workflow with a patch bump, unless `main` also has unreleased changes of your own. GitHub Actions updates and major versions wait for you to merge them.

@@ -1,5 +1,6 @@
 # Merges Dependabot's safe updates and releases them with a patch bump.
-# A Python update that isn't a major version gets auto-merge, so it merges by itself once the required checks pass.
+# A Python update that isn't a major version gets auto-merge, so it merges by itself once the required checks pass and
+# CodeRabbit approves it.
 # GitHub Actions updates wait for you, since the workflow's token can't merge changes to workflow files and they don't
 # change the installer; so do major versions, which deserve a look.
 # A merge made with the workflow's token starts no other workflows, so an hourly run does the rest. When everything on

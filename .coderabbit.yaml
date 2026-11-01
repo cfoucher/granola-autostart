@@ -1,0 +1,70 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit reviews every pull request and is the approval the ruleset on main requires. It asks for changes when it
+# has something to fix and approves once that's resolved and it has reviewed the latest commit; a push dismisses the
+# approval, so it reviews and approves again. It says what's wrong and how to fix it, and leaves out the extras.
+language: en-US
+tone_instructions: >-
+  Be terse. Flag only real problems: bugs, regressions, security holes, missed edge cases, missing tests. For each, say
+  what is wrong and how to fix it, in a sentence or two. No praise, recaps, restating the diff, or style nitpicks.
+early_access: false
+
+reviews:
+  profile: chill
+  auto_approvals:
+    enabled: true
+    # "@coderabbitai approve" and "resolve" would let a pull request's author skip the review. To overrule a comment,
+    # reply to it or resolve its thread; CodeRabbit approves once none are left open.
+    allow_author_approval: false
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: true
+    # Never stop reviewing new pushes: without a review of the latest commit there's no approval, and no merge.
+    auto_pause_after_reviewed_commits: 0
+
+  # Off: the pull request summary in the description, and everything in the walkthrough beyond the files' changes.
+  high_level_summary: false
+  review_info: false
+  changed_files_summary: false
+  sequence_diagrams: false
+  estimate_code_review_effort: false
+  assess_linked_issues: false
+  related_issues: false
+  related_prs: false
+  suggested_labels: false
+  suggested_reviewers: false
+  in_progress_fortune: false
+  poem: false
+
+  # A failing check would hold back the approval too, and none of these fit how this project works.
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+    title:
+      mode: "off"
+    description:
+      mode: "off"
+    issue_assessment:
+      mode: "off"
+
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+
+  # ruff (with pyproject.toml's rules) covers Python, and actionlint the workflows; these would only add style notes.
+  tools:
+    pylint:
+      enabled: false
+    flake8:
+      enabled: false
+    yamllint:
+      enabled: false
+    markdownlint:
+      enabled: false
+    languagetool:
+      enabled: false
+
+chat:
+  art: false
