@@ -1,9 +1,13 @@
+import ctypes
 import json
 import urllib.parse
+from types import SimpleNamespace
 
 import pytest
 
+from granola_autostart import granola_launch
 from granola_autostart.granola_launch import build_url, launch
+from granola_autostart.granola_launch import shell_execute as real_shell_execute
 
 
 def decoded_params(url: str) -> dict:
@@ -54,3 +58,29 @@ def test_only_granola_links_are_opened():
     with pytest.raises(ValueError):
         launch("https://example.com/", dry_run=False)
     launch(build_url(None), dry_run=True)  # logged, never opened
+
+
+def test_a_real_launch_hands_the_link_to_windows(monkeypatch):
+    opened = []
+    monkeypatch.setattr(granola_launch, "shell_execute", opened.append)
+    launch(build_url(None), dry_run=False)
+    assert opened == [build_url(None)]
+
+
+def shell(monkeypatch, result) -> list[tuple]:
+    """ShellExecuteW, answering ``result``: above 32 opened, 32 and below a Windows error."""
+    calls = []
+    shell32 = SimpleNamespace(ShellExecuteW=lambda *args: calls.append(args) or result)
+    monkeypatch.setattr(granola_launch, "ctypes", SimpleNamespace(windll=SimpleNamespace(shell32=shell32), c_int=ctypes.c_int, c_void_p=ctypes.c_void_p))
+    return calls
+
+
+def test_windows_opens_the_link_or_says_why_it_could_not(monkeypatch):
+    url = build_url(None)
+    calls = shell(monkeypatch, 42)
+    real_shell_execute(url)
+    assert calls == [(None, "open", url, None, None, 1)]
+    for result, code in ((31, 31), (2, 2), (None, 0)):  # 31: nothing handles granola://, as without Granola
+        shell(monkeypatch, result)
+        with pytest.raises(OSError, match=rf"\(ShellExecute error {code}\)"):
+            real_shell_execute(url)
