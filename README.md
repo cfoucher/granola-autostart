@@ -131,7 +131,7 @@ The pre-push hook refuses a push to `main` and checks every commit being pushed,
 - `tests/`: pytest.
 - `tools/`: the coverage ratchet and the pre-push checks, which `.githooks/pre-push` runs. `coverage-floor.txt` is the ratchet's floor.
 - `packaging/`: the PyInstaller spec and its entry script (`entry.py`), the Inno Setup script, and the icon drawing for both. `build.ps1` runs them.
-- `constraints.txt`: the exact package versions builds use; its header says how to upgrade them.
+- `constraints.txt`: the exact package versions builds use; Dependabot (`.github/dependabot.yml`) opens weekly pull requests to bump them, and its header says how to refresh them by hand.
 
 ### Building the installer
 

@@ -1,0 +1,27 @@
+# Dependabot opens pull requests each week for newer Python packages and GitHub Actions. They go through the same
+# checks as any other pull request (the ruleset on main), so an update that breaks the tests or the build can't merge.
+# Minor and patch updates come grouped, one pull request per ecosystem; a major update gets a pull request of its own.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    # Bump the exact pins in constraints.txt, and move a >= floor in requirements*.txt only when a new version falls
+    # outside it.
+    versioning-strategy: increase-if-necessary
+    # A bare number, which Dependabot would otherwise read as a requirement.
+    exclude-paths:
+      - coverage-floor.txt
+    groups:
+      python:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
