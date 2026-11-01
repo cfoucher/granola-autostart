@@ -1,0 +1,6 @@
+#!/bin/sh
+# Runs tools/pre_push.py, with the checkout's .venv Python when there is one. Set up once per clone with
+#   git config core.hooksPath .githooks
+python=python
+[ -x .venv/Scripts/python.exe ] && python=.venv/Scripts/python.exe
+exec "$python" tools/pre_push.py "$@"

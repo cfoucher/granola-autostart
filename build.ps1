@@ -1,10 +1,11 @@
 <#
-Build the installer: tests, then the PyInstaller one-folder app, then the Inno Setup installer.
+Build the installer: the tests under the coverage ratchet, then the PyInstaller one-folder app, then the Inno Setup
+installer.
 
 Needs requirements-build.txt installed with -c constraints.txt (in .venv, or on PATH as in CI) and Inno Setup 7
 (6 also works).
     .\build.ps1              # everything
-    .\build.ps1 -SkipTests   # CI, which runs the tests in an earlier step
+    .\build.ps1 -SkipTests   # CI, which runs the tests in its checks job
 The installer lands in dist\GranolaAutostart-<version>-setup.exe.
 #>
 param([switch]$SkipTests)
@@ -37,7 +38,7 @@ Push-Location $PSScriptRoot
 try {
     $python = if (Test-Path ".venv\Scripts\python.exe") { (Resolve-Path ".venv\Scripts\python.exe").Path } else { "python" }
 
-    if (-not $SkipTests) { Invoke-Step "tests" { & $python -m pytest -q } }
+    if (-not $SkipTests) { Invoke-Step "tests and coverage" { & $python tools\coverage_ratchet.py } }
 
     $version = (& $python -c "from granola_autostart import __version__; print(__version__)")
     if ($LASTEXITCODE -ne 0) { throw "could not read the version from granola_autostart" }
