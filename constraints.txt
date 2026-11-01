@@ -1,5 +1,7 @@
 # The exact versions the app is built and tested with. CI and the README's setup install with -c constraints.txt,
-# so a release built later gets these, not whatever is newest. To upgrade: make a fresh .venv, run
+# so a release built later gets these, not whatever is newest. Dependabot bumps them in weekly pull requests
+# (.github/dependabot.yml), but it never adds a package a new version starts needing, or drops one nothing needs any
+# more. To refresh the whole set by hand: make a fresh .venv, run
 #   .venv\Scripts\pip install -U --upgrade-strategy eager -r requirements-build.txt
 # (no -c), run the tests and build.ps1, then replace the lines below this note with the output of
 #   .venv\Scripts\python -m pip freeze
