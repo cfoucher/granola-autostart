@@ -70,6 +70,8 @@ def check(commit: str, head: str) -> bool:
 
 
 def main() -> int:
+    # Git pipes a hook's output, so without this the headings land after the ruff and pytest output they introduce.
+    sys.stdout.reconfigure(line_buffering=True)
     commits, to_main = pushed_commits(sys.stdin)
     if to_main:
         print("Changes reach main through a pull request (git push --no-verify to override).", file=sys.stderr)
