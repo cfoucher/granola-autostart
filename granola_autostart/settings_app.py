@@ -69,6 +69,7 @@ CALL_NAMES = {"zoom": "Zoom", "teams": "Microsoft Teams", "meet": "Google Meet"}
 SECTION_ALIASES = {"about": "general"}
 STARTING_SECONDS = 30  # after this window starts the watcher, how long "Starting…" shows before it counts as not running
 RESTARTING_SECONDS = 30  # a supervisor with no watcher for longer is restarting one that keeps failing
+EDITING_COMMANDS = ("undo", "redo", "cut", "copy", "paste", "selectAll")  # the right-click menu items kept, by WebView2's names
 _EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 NOT_AN_ADDRESS = "That doesn't look like an email address."
 
@@ -778,22 +779,63 @@ def _center_on_primary(window) -> None:
         log.warning("window not centered (%s)", type(error).__name__)
 
 
-def _enable_text_field_menus(window) -> None:
-    """Right-click Cut, Copy, and Paste in text fields.
+def _editing_menu_items(items) -> list:
+    """WebView2's right-click menu items cut down to the editing commands, in their order.
 
-    pywebview switches WebView2's own context menu off outside debug mode. It is switched back on
-    here, on the window's UI thread, and web/app.js keeps it to text fields so pages never offer Back or Reload.
+    A separator stays only where one divided kept items, so none leads, trails, or doubles up.
     """
+    kept = []
+    divider = None  # the last separator since the last kept item
+    for item in items:
+        if str(item.Kind) == "Separator":  # pythonnet gives a .NET enum value as its name
+            divider = item
+        elif item.Name in EDITING_COMMANDS:
+            if kept and divider is not None:
+                kept.append(divider)
+            kept.append(item)
+            divider = None
+    return kept
+
+
+def _trim_context_menu(sender, args) -> None:
+    """WebView2 is about to show its right-click menu: keep only the editing commands, or no menu if there are none."""
     try:
-        from System import Func, Type  # pythonnet, already loaded by pywebview
+        menu = args.MenuItems
+        kept = _editing_menu_items(list(menu))
+        if not kept:
+            args.Handled = True
+            return
+        menu.Clear()
+        for item in kept:
+            menu.Add(item)
+    except Exception as error:
+        log.warning("right-click menu left as it is (%s)", type(error).__name__)
 
-        form = window.native
 
-        def enable():
-            form.webview.CoreWebView2.Settings.AreDefaultContextMenusEnabled = True
+def _enable_text_field_menus(window) -> None:
+    """Right-click Undo, Redo, Cut, Copy, Paste, and Select all in text fields.
 
-        form.Invoke(Func[Type](enable))
-        log.info("text field context menus enabled")
+    pywebview switches WebView2's own context menu off as it starts loading the page, and WebView2 applies a
+    settings change made after that only at the next page load, which this one-page app never has. So the menu is
+    switched back on from the control's own ready event, subscribed in before_show so that it runs just after
+    pywebview's handler of that event. Only the editing commands are kept, and web/app.js keeps the menu to text
+    fields, so pages never offer Back, Reload, or the rest.
+    """
+
+    def ready(sender, args):
+        # This is a .NET event handler on the window's UI thread: nothing may escape it.
+        try:
+            if not args.IsSuccess:
+                return  # pywebview has logged why
+            core = sender.CoreWebView2
+            core.Settings.AreDefaultContextMenusEnabled = True
+            core.ContextMenuRequested += _trim_context_menu
+            log.info("text field context menus enabled")
+        except Exception as error:
+            log.warning("right-click menus stay off (%s)", type(error).__name__)
+
+    try:
+        window.native.webview.CoreWebView2InitializationCompleted += ready
     except Exception as error:
         log.warning("right-click menus stay off (%s)", type(error).__name__)
 
@@ -828,8 +870,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     api._window = window
     window.events.before_show += lambda: _center_on_primary(window)
+    window.events.before_show += lambda: _enable_text_field_menus(window)
     window.events.shown += lambda: _style_title_bar(window, api._theme == "dark")
-    window.events.loaded += lambda: _enable_text_field_menus(window)
     try:
         webview.start(gui="edgechromium", private_mode=True)
     except Exception:

@@ -977,7 +977,8 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
-// WebView2's own right-click menu gives text fields Cut, Copy, and Paste. Anywhere else it would offer Back and Reload.
+// WebView2's own right-click menu (trimmed to the editing commands in settings_app.py) gives text fields Cut, Copy,
+// and Paste. Anywhere else it would offer Back and Reload.
 document.addEventListener("contextmenu", (event) => {
   if (!event.target.closest("input, textarea")) event.preventDefault();
 });
