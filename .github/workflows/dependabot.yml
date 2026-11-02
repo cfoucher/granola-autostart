@@ -1,4 +1,5 @@
-# Merges Dependabot's safe updates and releases them with a patch bump.
+# Merges Dependabot's safe updates and releases them with a patch bump. It starts on every pull request, but acts only
+# on Dependabot's, so other pull requests list its jobs as skipped.
 # A Python update that isn't a major version gets auto-merge, so it merges by itself once the required checks pass and
 # CodeRabbit approves it.
 # GitHub Actions updates wait for you, since the workflow's token can't merge changes to workflow files and they don't
@@ -8,7 +9,7 @@
 # changes of your own leave the release to you. Otherwise it brings an auto-merging Dependabot pull request that fell
 # behind main up to date, as the ruleset on main requires, and dispatches Build on it, since that push starts no checks
 # either.
-name: Dependabot
+name: Auto-merge
 
 on:
   pull_request:
@@ -20,6 +21,7 @@ permissions: {}
 
 jobs:
   auto-merge:
+    name: Merge a Dependabot update
     if: github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -41,6 +43,7 @@ jobs:
         run: gh pr merge --auto --merge "$PR_URL"
 
   follow-up:
+    name: Scheduled follow-up
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
