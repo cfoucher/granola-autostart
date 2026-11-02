@@ -34,7 +34,7 @@ Granola Autostart is an independent tool and is not made by Granola.
 
    Paste it, choose **Test address**, check the meetings it found, then **Finish**. Setup also says whose declined meetings are skipped, with **Add another address** for an alias.
 
-It starts again whenever you sign in to Windows, unless you turn that off in **General**. Look for the green ring with a small labyrinth in the system tray; the dot in its middle is green while it's watching.
+It starts again whenever you sign in to Windows, unless you turn that off in **General**. Look for the green ring with a spiral inside it in the system tray; the spiral is green while it's watching.
 
 ### Settings
 
@@ -63,8 +63,8 @@ Calendars are downloaded every 5 minutes while you are at the PC, and again when
 
 ### Tray and notifications
 
-- **Pause for 1 hour** or **Pause for today** — no new cards, and a countdown already on screen will not start Granola. A call joined during the pause is not asked about later. The icon's middle dot turns grey.
-- **Turn off** — nothing starts notes until you choose **Turn on**. The whole icon turns grey, with a hollow dot, and the first line reads "Off. Meetings and calls won't start notes".
+- **Pause for 1 hour** or **Pause for today** — no new cards, and a countdown already on screen will not start Granola. A call joined during the pause is not asked about later. The icon's spiral turns grey.
+- **Turn off** — nothing starts notes until you choose **Turn on**. The whole icon turns grey, and the first line reads "Off. Meetings and calls won't start notes".
 - **Install update…** — shown at the top while an update is ready, with a small blue badge on the icon. It waits while a countdown card is on screen.
 - **Resume**, **Settings…**, **Open log folder**, **About**, **Quit** (it starts again from the Start menu, or at sign-in if that switch is on).
 
@@ -74,7 +74,7 @@ Calendars are downloaded every 5 minutes while you are at the PC, and again when
 - **Pause** runs out by itself, after 1 hour or at midnight, and a restart doesn't cancel it. Calendars are still downloaded meanwhile.
 - **Quit** stops the app until you next sign in to Windows or open it from the Start menu. With **Start when you sign in to Windows** off, that is until you open it yourself.
 
-When something needs fixing, the middle dot turns orange and Windows shows a notification once:
+When something needs fixing, the spiral turns orange and Windows shows a notification once:
 
 - **Granola didn't open** 30 seconds after a start, or at once when Windows couldn't open its link. Granola's launch link is undocumented, so an update could break it; **Try again**, or open Granola yourself.
 - **A calendar isn't updating** after 3 failed downloads in a row.

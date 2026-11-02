@@ -1,4 +1,4 @@
-"""Save the Labyrinth app icon as a multi-size .ico for the exe and the installer.
+"""Save the Spiral app icon as a multi-size .ico for the exe and the installer.
 
 Usage: python packaging/make_icon.py build/app.ico
 """

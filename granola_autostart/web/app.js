@@ -34,14 +34,19 @@ const ICONS = {
 const icon = (name, cls = "") => `<svg class="icon ${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
 const esc = (text) =>
   String(text ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
-// The Labyrinth app icon (icon.py draws the same thing for the exe, tray, and notifications).
+// The Spiral app icon (icon.py draws the same thing for the exe, tray, and notifications).
 const appMark = (size) =>
   `<svg width="${size}" height="${size}" viewBox="0 0 64 64" aria-hidden="true">` +
   `<circle cx="32" cy="32" r="31" fill="#fbf8f1" stroke="#e2d9c6" stroke-width="1"/>` +
   `<circle cx="32" cy="32" r="27" fill="none" stroke="#e9e2d2" stroke-width="5"/>` +
   `<circle cx="32" cy="32" r="27" transform="rotate(-90 32 32)" fill="none" stroke="#5a8a47" stroke-width="5" stroke-linecap="round" stroke-dasharray="127.2 169.6"/>` +
-  `<g fill="none" stroke="#42703a" stroke-width="4" stroke-linecap="round"><path d="M36.6 15.63A17 17 0 1 1 27.4 15.63"/>` +
-  `<path d="M27.8 41.08A10 10 0 1 1 36.2 41.08"/><path d="M42 32H49"/></g><circle cx="32" cy="32" r="4.5" fill="#5a8a47"/></svg>`;
+  `<path d="M33.86 31.24C34.54 30.93 35.48 30.91 36.35 31.34C37.23 31.77 38.01 32.67 38.32 33.84C38.63 35.01 38.45 36.43 37.67 37.65` +
+  `C36.89 38.87 35.51 39.85 33.86 40.16C32.20 40.47 30.29 40.09 28.72 38.97C27.16 37.84 25.98 35.98 25.67 33.84` +
+  `C25.36 31.69 25.94 29.30 27.41 27.39C28.88 25.48 31.22 24.10 33.86 23.79C36.49 23.48 39.37 24.26 41.62 26.07` +
+  `C43.87 27.89 45.46 30.72 45.77 33.84C46.08 36.96 45.10 40.32 42.94 42.92C40.78 45.52 37.46 47.30 33.86 47.61` +
+  `C30.25 47.92 26.40 46.74 23.46 44.24C20.51 41.73 18.53 37.93 18.22 33.84C17.91 29.74 19.29 25.41 22.14 22.12` +
+  `C24.99 18.83 29.27 16.65 33.86 16.34" fill="none" stroke="#42703a" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>` +
+  `<circle cx="33.86" cy="31.24" r="3.4" fill="#42703a"/></svg>`;
 const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
 let data = null;

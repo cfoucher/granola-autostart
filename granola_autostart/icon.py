@@ -1,9 +1,9 @@
-"""The Labyrinth icon: the countdown card's green arc around a small labyrinth, drawn with Pillow.
+"""The Spiral icon: the countdown card's green arc around a small spiral, drawn with Pillow.
 
-The goal dot in the middle is the status light: green while watching, grey when paused, amber when
-something needs attention. Off turns the whole icon grey and hollows the dot. A blue badge at the top right
-means an update is ready to install. This one drawing makes the exe and installer icon, the tray icon, and the
-icon on notifications. It follows the 64-unit grid of the design canvas.
+The spiral is the status light: green while watching, grey when paused, amber when something needs
+attention. Off turns the arc and the spiral grey. A blue badge at the top right means an update is ready to
+install. This one drawing makes the exe and installer icon, the tray icon, and the icon on notifications. It
+follows the 64-unit grid of the design canvas.
 """
 
 from __future__ import annotations
@@ -16,18 +16,39 @@ CREAM = (251, 248, 241, 255)
 TRACK = (233, 226, 210, 255)
 GREEN = (90, 138, 71, 255)
 DEEP_GREEN = (66, 112, 58, 255)
-DOTS = {
-    "watching": GREEN,
+SPIRAL_COLOURS = {
+    "watching": DEEP_GREEN,
     "paused": (124, 119, 109, 255),
     "attention": (208, 112, 31, 255),
 }
-# Off: the arc, the labyrinth, and the ring round the hollow centre dot, all grey.
 OFF_ARC = (168, 161, 150, 255)
-OFF_MAZE = (138, 132, 120, 255)
-OFF_DOT = (124, 119, 109, 255)
+OFF_SPIRAL = (138, 132, 120, 255)
 BADGE = (47, 111, 208, 255)  # shown while an update is ready to install
 BADGE_RING = (238, 238, 238, 255)
 SUPERSAMPLE = 4
+# The spiral's radius at its inner end and at its outer end, which is at 12 o'clock.
+SPIRAL_INNER = 2.6
+SPIRAL_OUTER = 17.5
+SPIRAL_TURNS = 2
+SPIRAL_WIDTH = 4
+SPIRAL_BLOB = SPIRAL_WIDTH * 0.85  # the radius of the blob that starts the spiral
+SPIRAL_STEPS = 720
+
+
+def spiral_points() -> list[tuple[float, float]]:
+    """The spiral's centreline on the 64-unit grid, from the inner end clockwise out to 12 o'clock."""
+    total = 2 * math.pi * SPIRAL_TURNS
+    points = []
+    for step in range(SPIRAL_STEPS + 1):
+        t = total * step / SPIRAL_STEPS
+        r = SPIRAL_INNER + (SPIRAL_OUTER - SPIRAL_INNER) * t / total
+        angle = -math.pi / 2 - (total - t)
+        points.append((r * math.cos(angle), r * math.sin(angle)))
+    # Centre the outline, the line together with the blob at its inner end, not the centreline alone.
+    xs = [x for x, _ in points] + [points[0][0] - SPIRAL_BLOB, points[0][0] + SPIRAL_BLOB]
+    ys = [y for _, y in points] + [points[0][1] - SPIRAL_BLOB, points[0][1] + SPIRAL_BLOB]
+    dx, dy = 32 - (min(xs) + max(xs)) / 2, 32 - (min(ys) + max(ys)) / 2
+    return [(x + dx, y + dy) for x, y in points]
 
 
 def draw_icon(size: int = 64, status: str = "watching", badge: bool = False) -> Image.Image:
@@ -47,22 +68,27 @@ def draw_icon(size: int = 64, status: str = "watching", badge: bool = False) -> 
             for angle in (start, end):
                 disc(32 + r * math.cos(math.radians(angle)), 32 + r * math.sin(math.radians(angle)), width / 2, colour)
 
+    def spiral(colour) -> None:
+        # Joined thick line segments leave seams, so the stroke is one polygon: the centreline pushed half a
+        # width out along its normal going forward, and half a width the other way coming back.
+        points = spiral_points()
+        left, right = [], []
+        for before, here, after in zip([points[0], *points], points, [*points[1:], points[-1]]):
+            tx, ty = after[0] - before[0], after[1] - before[1]
+            length = math.hypot(tx, ty)
+            nx, ny = -ty / length * SPIRAL_WIDTH / 2, tx / length * SPIRAL_WIDTH / 2
+            left.append(((here[0] + nx) * unit, (here[1] + ny) * unit))
+            right.append(((here[0] - nx) * unit, (here[1] - ny) * unit))
+        draw.polygon(left + right[::-1], fill=colour)
+        disc(*points[-1], SPIRAL_WIDTH / 2, colour)
+        disc(*points[0], SPIRAL_BLOB, colour)
+
     off = status == "off"
-    arc, maze = (OFF_ARC, OFF_MAZE) if off else (GREEN, DEEP_GREEN)
+    arc, spiral_colour = (OFF_ARC, OFF_SPIRAL) if off else (GREEN, SPIRAL_COLOURS.get(status, DEEP_GREEN))
     disc(32, 32, 31, CREAM)
     ring(27, 0, 360, 5, TRACK, caps=False)
     ring(27, -90, 180, 5, arc)  # the countdown arc: three quarters, from 12 o'clock clockwise
-    ring(17, -74.3, 254.3, 4, maze)  # outer labyrinth ring, gap at the top
-    ring(10, 114.8, 425.2, 4, maze)  # inner ring, gap at the bottom
-    draw.line(((42 * unit, 32 * unit), (49 * unit, 32 * unit)), fill=maze, width=round(4 * unit))
-    disc(42, 32, 2, maze)
-    disc(49, 32, 2, maze)
-    if off:
-        # A hollow goal dot: a ring of radius 4 stroked 3 wide, so it covers radius 2.5 to 5.5.
-        disc(32, 32, 5.5, OFF_DOT)
-        disc(32, 32, 2.5, CREAM)
-    else:
-        disc(32, 32, 4.5, DOTS.get(status, GREEN))  # the goal dot
+    spiral(spiral_colour)
     if badge:
         # A circle of radius 11 ringed 4 wide: the ring is centred on the edge, so it covers radius 9 to 13.
         disc(52, 12, 13, BADGE_RING)
