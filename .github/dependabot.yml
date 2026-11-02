@@ -1,7 +1,7 @@
 # Dependabot opens pull requests each week for newer Python packages and GitHub Actions. They go through the same
 # checks as any other pull request (the ruleset on main), so an update that breaks the tests or the build can't merge.
 # Minor and patch updates come grouped, one pull request per ecosystem; a major update gets a pull request of its own.
-# The Dependabot workflow (workflows/dependabot.yml) merges the Python ones that aren't major versions and releases them.
+# The Auto-merge workflow (workflows/dependabot.yml) merges the Python ones that aren't major versions and releases them.
 version: 2
 updates:
   - package-ecosystem: pip
