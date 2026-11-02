@@ -167,6 +167,15 @@ def test_taking_notes_while_granola_is_open_for_the_meeting():
     assert taking_notes(None, NOW) is None
 
 
+def test_taking_notes_goes_on_past_the_meeting_s_end_while_the_user_is_still_in_its_call():
+    started = launch()
+    started.seen_running = True
+    started.overrunning = True
+    assert taking_notes(started, NOW + timedelta(minutes=30)) == ("Weekly product sync", NOW)
+    started.missing_since = NOW + timedelta(minutes=10)
+    assert taking_notes(started, NOW + timedelta(minutes=30)) is None  # Granola was closed all the same
+
+
 def test_the_next_meeting_is_never_a_skipped_one():
     lunch = CalendarEvent("lunch", "Team lunch", NOW + timedelta(minutes=30), NOW + timedelta(hours=1), skipped=True)
     review = event("Design review", NOW + timedelta(hours=1))

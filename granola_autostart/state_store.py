@@ -48,6 +48,7 @@ def _parse(raw: dict) -> tuple[WatcherState, datetime | None]:
             missing_since=_dt(missing) if missing else None,
             failed=bool(launch.get("failed")),
             call_session=_session(launch.get("call_session")),
+            overrunning=bool(launch.get("overrunning")),
         )
     pause = raw.get("pause_until")
     return state, _dt(pause) if pause else None
@@ -91,6 +92,7 @@ def save_state(state: WatcherState, pause_until: datetime | None) -> None:
             "missing_since": launch.missing_since.isoformat() if launch.missing_since else None,
             "failed": launch.failed,
             "call_session": launch.call_session,
+            "overrunning": launch.overrunning,
         },
     }
     write_json(state_path(), payload, skip_unchanged=True)

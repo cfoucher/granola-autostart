@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import subprocess
@@ -62,6 +63,25 @@ def test_control_characters_are_dropped_from_a_title_before_it_reaches_the_card(
     assert command[command.index("--notice") + 1] == f"--title={shown}"
     args = build_parser().parse_args(command[command.index("--notice") + 1 :])
     assert args.title == shown
+
+
+@pytest.mark.parametrize("mode", ["source", "packaged"])
+def test_the_meetings_a_card_lists_reach_it_as_json_with_control_characters_dropped(mode, request):
+    if mode == "packaged":
+        request.getfixturevalue("packaged")
+    listed = [("Stand\x00up\n", "09:00–09:15 · 7 guests · you@shift.com"), ('He said "hi" \\ there', "No\tguests")]
+    command = processes.notice_command("Stand-up", 10, "calendar", listed)
+    args = build_parser().parse_args(command[command.index("--notice") + 1 :])
+    assert json.loads(args.choices) == [
+        {"title": "Standup", "line": "09:00–09:15 · 7 guests · you@shift.com"},
+        {"title": 'He said "hi" \\ there', "line": "Noguests"},
+    ]
+    assert command[-1].startswith("--choices=[")
+
+
+def test_a_card_with_nothing_to_choose_gets_no_choices_argument():
+    assert not any(part.startswith("--choices") for part in processes.notice_command("Standup", 10))
+    assert not any(part.startswith("--choices") for part in processes.notice_command("Standup", 10, "crash", []))
 
 
 def test_the_packaged_exe_starts_itself_for_every_mode(packaged):

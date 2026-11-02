@@ -9,6 +9,7 @@ stick to the standard library.
 from __future__ import annotations
 
 import ctypes
+import json
 import logging
 import os
 import re
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import time
 import winreg
+from collections.abc import Sequence
 from ctypes import wintypes
 from pathlib import Path
 
@@ -44,6 +46,9 @@ STARTUP_APPROVED_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Star
 # --install from a source checkout used to create these; --uninstall still removes them.
 LEGACY_TASKS = ("Granola Autostart", "Granola Autostart Watchdog")
 QUIT_EXIT_CODE = 3  # the watcher exits with this after Quit, so the supervisor stops instead of restarting it
+# A countdown card that listed meetings exits with this plus the number of the one to start, for every one but the
+# first, which is the plain 0 (notice.py).
+CHOICE_EXIT_CODE = 10
 RESTART_DELAY_SECONDS = 3
 MAX_RESTART_DELAY_SECONDS = 300
 HEALTHY_RUN_SECONDS = 60
@@ -73,12 +78,17 @@ def app_command(*args: str) -> list[str]:
     return [str(pythonw if pythonw.exists() else sys.executable), str(MAIN), *args]
 
 
-def notice_command(title: str, seconds: int, kind: str = "calendar") -> list[str]:
+def notice_command(title: str, seconds: int, kind: str = "calendar", choices: Sequence[tuple[str, str]] = ()) -> list[str]:
+    """The countdown card's command. ``choices`` are the (title, line) pairs of the meetings it lists, when it lists any."""
     # A control character can't go in a command line (Python refuses a NUL, and the card would never start), and a line
     # break or tab has no place in a card's title, so they are dropped.
     title = _CONTROL_CHARACTERS.sub("", title)
     # "--title=" keeps a title that starts with "-" from being read as an option.
-    return app_command("--notice", f"--title={title}", f"--seconds={max(1, seconds)}", f"--kind={kind}")
+    command = app_command("--notice", f"--title={title}", f"--seconds={max(1, seconds)}", f"--kind={kind}")
+    if choices:
+        listed = [{"title": _CONTROL_CHARACTERS.sub("", name), "line": _CONTROL_CHARACTERS.sub("", line)} for name, line in choices]
+        command.append(f"--choices={json.dumps(listed)}")
+    return command
 
 
 def spawn(command: list[str]) -> None:

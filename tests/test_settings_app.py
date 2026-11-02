@@ -14,11 +14,13 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from granola_autostart import processes, settings_app, updates, winui
+from granola_autostart.secret_box import protect, unprotect
 from granola_autostart.settings import Calendar, ConfigError, Settings, config_path, load_settings, save_settings, status_path, update_path, write_json
 from granola_autostart.status import FeedStatus, LastStart, Problem, Status, end_of_today, feed_id, write_status
 
 GOOD = "https://calendar.google.com/calendar/ical/me/private-abc/basic.ics"
 WATCH = "https://calendar.google.com/calendar/ical/watch/private-def/basic.ics"
+HOME = "https://calendar.google.com/calendar/ical/home/private-ghi/basic.ics"
 NOT_AN_ADDRESS = "That doesn't look like an email address."
 # The status box is checked at a fixed time, so a minute or a midnight can't move under the test.
 FIXED = datetime(2026, 10, 30, 9, 0, tzinfo=timezone.utc)
@@ -65,6 +67,17 @@ def serving(monkeypatch, feeds: dict[str, str]) -> None:
 def declined_by(url: str):
     [calendar] = [calendar for calendar in load_settings().calendars if calendar.url == url]
     return calendar.declined_by
+
+
+def listed(api) -> list[str]:
+    """The ids of the calendars in the order the page lists them."""
+    return [calendar["id"] for calendar in api.load()["settings"]["calendars"]]
+
+
+def saved_order() -> list[str]:
+    """The calendars' addresses in the order config.json lists them."""
+    saved = json.loads(config_path().read_text(encoding="utf-8"))
+    return [unprotect(entry["address_protected"]) for entry in saved["calendars"]]
 
 
 @pytest.fixture
@@ -710,47 +723,146 @@ def test_the_page_has_words_for_every_note_python_can_send():
     assert set(re.findall(r"^  (\w+):", block, re.M)) == {"own", "list", "unchecked", "copied", "kept", "none", "pending", "off"}
 
 
+def test_the_calendars_page_says_how_meetings_that_start_together_are_picked_in_its_intro_and_in_its_summary():
+    page = (settings_app.WEB / "app.js").read_text(encoding="utf-8")
+    together = re.search(r'const TOGETHER = "(.*?)";', page)[1]
+    assert together == "If several start together, you choose on the card. It picks one with guests first, then the higher calendar."
+    assert "const INTRO = `Meetings on these calendars start notes when they begin. ${TOGETHER}`;" in page
+    assert "${calendars.filter((c) => c.enabled).length} on. ${TOGETHER}" in page
+    assert "ORDER_NOTE" not in page  # rows are no longer sorted by state, so there is nothing to say about it
+
+
+def test_every_calendar_row_has_an_arrow_each_way_that_is_disabled_at_the_end_of_the_list():
+    page = (settings_app.WEB / "app.js").read_text(encoding="utf-8")
+    assert 'const way = step < 0 ? "up" : "down";' in page and 'aria-label="Move ${esc(c.name)} ${way}"' in page  # Move {name} up, Move {name} down
+    assert "${moveButton(c, -1, at === 0)}${moveButton(c, 1, at === all.length - 1)}" in page
+    assert 'disabled ? "disabled" : ""' in page
+
+
 def test_switching_a_calendar_off_keeps_its_name_and_says_its_meetings_wont_start_notes(api):
     api.add_calendar(GOOD)
     api.add_calendar(WATCH)
     watcher_saw((GOOD, "Work", "me@example.com"), (WATCH, "Granola watch", None))
-    # An off calendar is listed last, so Work follows Granola watch while it is off.
-    watch, work = api.set_calendar_enabled(feed_id(GOOD), False)["settings"]["calendars"]
+    # An off calendar stays where it is in the list.
+    work, watch = api.set_calendar_enabled(feed_id(GOOD), False)["settings"]["calendars"]
     assert (work["enabled"], work["state"], work["line"], work["name"]) == (False, "off", "Off. Its meetings won't start notes.", "Work")
     assert (watch["enabled"], watch["state"]) == (True, "ok")
     assert [(calendar.url, calendar.enabled) for calendar in load_settings().calendars] == [(GOOD, False), (WATCH, True)]
     work = api.set_calendar_enabled(feed_id(GOOD), True)["settings"]["calendars"][0]
     assert (work["enabled"], work["state"]) == (True, "ok")
-    assert api.set_calendar_enabled(feed_id(GOOD), 0)["settings"]["calendars"][-1]["enabled"] is False  # whatever the page sends
-    assert api.set_calendar_enabled("not-a-calendar", False)["settings"]["calendars"][0]["enabled"] is True  # one that has gone
+    assert api.set_calendar_enabled(feed_id(GOOD), 0)["settings"]["calendars"][0]["enabled"] is False  # whatever the page sends
+    assert api.set_calendar_enabled("not-a-calendar", False)["settings"]["calendars"][1]["enabled"] is True  # one that has gone
 
 
-def test_calendars_needing_attention_come_first_and_ones_that_are_off_last_the_rest_as_added(api):
+def test_calendars_are_listed_in_the_saved_order_whatever_their_state(api):
     urls = [f"https://calendar.google.com/calendar/ical/{name}/private-abc/basic.ics" for name in ("a", "b", "c", "d", "e")]
     for url in urls:
         api.add_calendar(url)
     ids = [feed_id(url) for url in urls]
-
-    def listed() -> list[str]:
-        return [calendar["id"] for calendar in api.load()["settings"]["calendars"]]
-
-    # Nothing checked yet: every row is still pending, so they stay in the order they were added.
-    assert listed() == ids
+    # Nothing checked yet: every row is still pending.
+    assert listed(api) == ids
     broken = {"failures": 3, "last_error": "404 Not Found"}
     feeds = [{"id": id, "name": name, "meetings_next_day": 1, "last_ok": now().isoformat(), **(broken if name in "ce" else {})} for id, name in zip(ids, "abcde")]
     write_raw_status(feeds=feeds)
-    states = {calendar["id"]: calendar["state"] for calendar in api.load()["settings"]["calendars"]}
-    assert [states[id] for id in ids] == ["ok", "ok", "warn", "ok", "warn"]
-    # Attention first, in the order added, then the rest in the order added.
-    assert listed() == [ids[2], ids[4], ids[0], ids[1], ids[3]]
-    # Off goes last, even for a calendar that needed attention: its problem no longer applies.
+
+    def states() -> list[str]:
+        by_id = {calendar["id"]: calendar["state"] for calendar in api.load()["settings"]["calendars"]}
+        return [by_id[id] for id in ids]
+
+    # A calendar that needs attention stays where it is.
+    assert states() == ["ok", "ok", "warn", "ok", "warn"]
+    assert listed(api) == ids
+    # So does one that is off, even one that needed attention, whose problem no longer applies.
     api.set_calendar_enabled(ids[0], False)
     api.set_calendar_enabled(ids[2], False)
-    assert listed() == [ids[4], ids[1], ids[3], ids[0], ids[2]]
-    # Turning one back on puts it back among the others, and the stored order never changes.
-    api.set_calendar_enabled(ids[0], True)
-    assert listed() == [ids[4], ids[0], ids[1], ids[3], ids[2]]
+    assert states() == ["off", "ok", "off", "ok", "warn"]
+    assert listed(api) == ids
     assert [calendar.url for calendar in load_settings().calendars] == urls
+
+
+def test_a_calendar_moves_one_place_up_or_down_and_the_order_is_saved(api):
+    for url in (GOOD, WATCH, HOME):
+        api.add_calendar(url)
+    work, watch, home = (feed_id(url) for url in (GOOD, WATCH, HOME))
+    view = api.move_calendar(home, -1)
+    assert [calendar["id"] for calendar in view["settings"]["calendars"]] == [work, home, watch]  # the answer is the new list
+    assert saved_order() == [GOOD, HOME, WATCH]
+    api.move_calendar(home, -1)
+    assert (listed(api), saved_order()) == ([home, work, watch], [HOME, GOOD, WATCH])
+    api.move_calendar(work, 1)
+    assert (listed(api), saved_order()) == ([home, watch, work], [HOME, WATCH, GOOD])
+    assert [calendar.url for calendar in load_settings().calendars] == [HOME, WATCH, GOOD]  # and it is the order loaded again
+
+
+def test_moving_a_calendar_keeps_its_switch_and_its_addresses(api):
+    api.add_calendar(GOOD, ["me@example.com", "alias@example.ca"])
+    api.add_calendar(WATCH)
+    api.set_calendar_enabled(feed_id(GOOD), False)
+    api.move_calendar(feed_id(GOOD), 1)
+    assert load_settings().calendars == (Calendar(WATCH), Calendar(GOOD, False, ("me@example.com", "alias@example.ca")))
+
+
+def test_the_first_calendar_cannot_move_up_nor_the_last_down_and_a_lone_one_cannot_move(api):
+    api.add_calendar(GOOD)
+    before = config_path().read_text(encoding="utf-8")
+    api.move_calendar(feed_id(GOOD), -1)
+    api.move_calendar(feed_id(GOOD), 1)
+    assert config_path().read_text(encoding="utf-8") == before
+    api.add_calendar(WATCH)
+    api.add_calendar(HOME)
+    ids = listed(api)
+    before = config_path().read_text(encoding="utf-8")
+    assert [calendar["id"] for calendar in api.move_calendar(ids[0], -1)["settings"]["calendars"]] == ids
+    assert [calendar["id"] for calendar in api.move_calendar(ids[-1], 1)["settings"]["calendars"]] == ids
+    assert config_path().read_text(encoding="utf-8") == before  # not even saved again
+
+
+def test_a_calendar_that_has_gone_or_a_step_that_is_not_one_place_changes_nothing(api):
+    for url in (GOOD, WATCH, HOME):
+        api.add_calendar(url)
+    ids = listed(api)
+    before = config_path().read_text(encoding="utf-8")
+    for calendar_id, step in (("not-a-calendar", -1), ("not-a-calendar", 1), (ids[1], 0), (ids[1], 2), (ids[2], -2)):
+        assert [calendar["id"] for calendar in api.move_calendar(calendar_id, step)["settings"]["calendars"]] == ids
+    assert config_path().read_text(encoding="utf-8") == before
+
+
+def test_moving_a_calendar_is_logged_without_its_address(api, caplog):
+    api.add_calendar(GOOD)
+    api.add_calendar(WATCH)
+    with caplog.at_level(logging.INFO, logger="granola_autostart"):
+        api.move_calendar(feed_id(WATCH), -1)
+    assert [record.getMessage() for record in caplog.records if "moved" in record.getMessage()] == ["calendar moved from Settings"]
+    assert "calendar.google.com" not in caplog.text and feed_id(WATCH) not in caplog.text
+
+
+def test_an_address_saved_twice_is_one_calendar_so_a_move_counts_places_among_the_calendars_listed(api):
+    config = {
+        "calendars": [
+            {"address_protected": protect(GOOD)},
+            {"address_protected": protect(WATCH)},
+            {"address_protected": protect(f" {GOOD} "), "enabled": False},  # Work again, which the first entry wins over
+            {"address_protected": protect(HOME)},
+        ]
+    }
+    config_path().write_text(json.dumps(config), encoding="utf-8")
+    work, watch, home = (feed_id(url) for url in (GOOD, WATCH, HOME))
+    assert listed(api) == [work, watch, home]
+    api.move_calendar(home, -1)  # the repeat between them is not a place
+    assert (listed(api), saved_order()) == ([work, home, watch], [GOOD, HOME, WATCH])  # and it is gone from the file
+    api.move_calendar(work, -1)
+    assert saved_order() == [GOOD, HOME, WATCH]
+
+
+def test_places_are_counted_among_the_calendars_listed_even_when_the_settings_loaded_hold_a_repeat(api, monkeypatch):
+    loaded = Settings(calendars=(Calendar(GOOD), Calendar(WATCH), Calendar(f" {GOOD} ", False), Calendar(HOME)))
+    monkeypatch.setattr(settings_app, "load_settings", lambda: loaded)
+    saved = []
+    monkeypatch.setattr(settings_app, "save_settings", saved.append)
+    api.move_calendar(feed_id(HOME), -1)
+    # Home swaps with Granola watch, the calendar listed above it, not with the repeat of Work that sits between them.
+    [result] = saved
+    assert result.calendars == (Calendar(GOOD), Calendar(HOME), Calendar(WATCH))
 
 
 def test_a_calendar_that_is_off_keeps_the_rest_of_its_settings(api):

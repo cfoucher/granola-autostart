@@ -84,9 +84,9 @@ def world(monkeypatch):
     monkeypatch.setattr(watcher, "is_present", lambda limit: world.present.pop(0))
     monkeypatch.setattr(watcher, "granola_running", lambda table: world.granola)
 
-    def evaluate(now, snapshot, state, *, lookahead, fresh_call_seconds, skip_words):
+    def evaluate(now, snapshot, state, *, lookahead, fresh_call_seconds, skip_words, lead):
         world.snapshots.append(snapshot)
-        world.evaluated.append((lookahead, fresh_call_seconds, skip_words))
+        world.evaluated.append((lookahead, fresh_call_seconds, skip_words, lead))
         return world.prompts.pop(0) if world.prompts else None
 
     monkeypatch.setattr(watcher, "evaluate", evaluate)
@@ -158,16 +158,17 @@ def test_a_tick_with_no_call_has_a_snapshot_with_none(world):
     assert (snapshot.call_session_id, snapshot.call_provider, snapshot.call_age_seconds, snapshot.call_title) == (None, None, None, None)
 
 
-def test_each_tick_asks_for_the_calls_that_are_switched_on_and_gives_the_decision_the_skip_words(world):
+def test_each_tick_asks_for_the_calls_that_are_switched_on_and_gives_the_decision_the_skip_words_and_the_countdown_as_its_lead(world):
     settings = Settings(
         calls={"zoom": False, "teams": True, "meet": True},
         ignore_title_substrings=("lunch",),
         zoom_lookahead_minutes=4,
         fresh_zoom_seconds=33,
+        countdown_seconds=12,
     )
     run_loop(world, settings=settings)
     assert world.asked == [({"zoom": False, "teams": True, "meet": True}, {"zoom.exe": [300]})]
-    assert world.evaluated == [(timedelta(minutes=4), 33, ("lunch",))]
+    assert world.evaluated == [(timedelta(minutes=4), 33, ("lunch",), timedelta(seconds=12))]
 
 
 def test_switching_a_call_on_in_settings_takes_effect_from_the_next_tick(world):
@@ -852,9 +853,9 @@ def test_the_card_mutex_is_held_from_before_the_card_starts_to_after_it_closes_a
     control = watcher.Control()
     control.on_view = lambda view: seen.append(("menu", processes.card_showing()))
 
-    def ask(title, seconds, kind):
+    def ask(title, seconds, kind, choices):
         seen.append(("card", processes.card_showing()))
-        return False
+        return watcher.CardAnswer(False)
 
     monkeypatch.setattr(watcher, "ask_notice", ask)
     assert not processes.card_showing()
@@ -866,7 +867,7 @@ def test_the_card_mutex_is_held_from_before_the_card_starts_to_after_it_closes_a
 
 def test_a_card_that_cannot_run_or_breaks_still_lets_the_watcher_go_of_the_card_mutex(monkeypatch):
     control = watcher.Control()
-    monkeypatch.setattr(watcher, "ask_notice", lambda *_args: None)
+    monkeypatch.setattr(watcher, "ask_notice", lambda *_args: watcher.CardAnswer(None))
     monkeypatch.setattr(watcher, "still_present", lambda settings: False)
     watcher.handle_prompt(prompt(), Settings(), control, threading.Lock(), WatcherState())
     assert not processes.card_showing()
@@ -884,9 +885,9 @@ def test_a_card_that_is_up_keeps_the_card_mutex_after_the_watcher_lets_go_of_its
     seen = []
     card_lets_go = held_elsewhere(processes.CARD_MUTEX)  # the card's own process, which took it as it came up
 
-    def ask(title, seconds, kind):
+    def ask(title, seconds, kind, choices):
         seen.append(processes.card_showing())
-        return False
+        return watcher.CardAnswer(False)
 
     monkeypatch.setattr(watcher, "ask_notice", ask)
     watcher.handle_prompt(prompt(), Settings(), watcher.Control(), threading.Lock(), WatcherState())
@@ -1090,10 +1091,10 @@ def test_a_second_watcher_leaves_the_first_one_running(cli, monkeypatch, capsys)
     assert calls == [] and "another watcher is already running" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize(("started", "said"), [(True, "would start"), (False, "cancelled")])
-def test_preview_shows_the_card_once_and_says_what_it_would_do(started, said, cli, monkeypatch, capsys):
+@pytest.mark.parametrize(("picked", "said"), [(0, "would start"), (None, "cancelled")])
+def test_preview_shows_the_card_once_and_says_what_it_would_do(picked, said, cli, monkeypatch, capsys):
     _calls, run = cli
-    monkeypatch.setattr(notice, "show_notice", lambda title, seconds: started)
+    monkeypatch.setattr(notice, "show_notice", lambda title, seconds: picked)
     assert run("--preview-notice") == 0
     assert capsys.readouterr().out.strip() == said
 

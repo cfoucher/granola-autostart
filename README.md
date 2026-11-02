@@ -2,11 +2,17 @@
 
 > **Disclaimer:** this is a small personal project, to fix a frustration I have with missing meeting notes. It is 100% AI-built, on a best-effort basis, with no guarantee of success.
 
-Starts [Granola](https://granola.ai) when a meeting begins on this PC, or when you join a Zoom call. Microsoft Teams and Google Meet calls work too, once you switch them on: they're off by default. A small card appears first in the top-right corner of the screen under the pointer, with the meeting title and a 10-second ring.
+Starts [Granola](https://granola.ai) when a meeting begins on this PC, or when you join a Zoom call. Microsoft Teams and Google Meet calls work too, once you switch them on: they're off by default. A small card appears first in the top-right corner of your main display, with the meeting title and a 10-second ring. For a calendar meeting it appears that long before the start, so notes start as the meeting begins.
 
 **Cancel** leaves Granola alone. **Start now** or doing nothing opens that meeting's note and starts transcription. It does not join the call. The card never takes keyboard focus, so typing in another app is not interrupted (and Esc is not used). If the card itself can't open, notes for a meeting start anyway, as if nobody had answered it, and the tray says the card is broken. Notes aren't restarted after Granola closes without a card to cancel.
 
 It runs in the background, so this still works when Granola was quit or crashed. The same card is used for a calendar meeting (including one where you are in the room and not on a call), a call you join, and Granola closing mid-meeting (for notes started from a call, while that call is still going).
+
+When several meetings start together, the card lists them, up to four, and you tick the one to take notes for. One with guests is ticked first, then the one on the calendar higher in your list, then the later start. Its notes answer the others, and **Cancel** answers them all. A call you join while several meetings are under way lists them the same way.
+
+![The countdown card listing two meetings starting together: Design review ticked, with 5 guests, and Pay the invoices, with none, with Start now and Cancel buttons](assets/countdown-choose.png)
+
+A meeting that runs long keeps its notes: while you're still in its call, the next meeting's card waits until you leave that call. Joining the next meeting's call brings its card straight away. Back-to-back meetings on one Zoom link, such as a personal room, share the first one's notes.
 
 Notes start only when the Windows session is unlocked and you have used the mouse or keyboard in the last few minutes. A locked or idle laptop does not start a recording. If you sit down after the start time, the card appears then, until the meeting's scheduled end.
 
@@ -14,7 +20,7 @@ Granola Autostart is an independent tool and is not made by Granola.
 
 ![The countdown card: Starting notes, Weekly product sync, 7 seconds, with Start now and Cancel buttons](assets/countdown-card.png)
 
-![The Settings window on the Calendars page: three calendars, the last one switched off and the first open to show the addresses whose declined meetings it skips, with the Watching status and the Autostart notes switch](assets/settings-calendars.png)
+![The Settings window on the Calendars page: three calendars, each with up and down arrows to reorder it, the last one switched off and the first open to show the addresses whose declined meetings it skips, with the Watching status and the Autostart notes switch](assets/settings-calendars.png)
 
 ![The Settings window on the Calls page: Zoom switched on, Microsoft Teams and Google Meet switched off, and the note to join Meet with its tab in front](assets/settings-calls.png)
 
@@ -34,7 +40,7 @@ It starts again whenever you sign in to Windows, unless you turn that off in **G
 
 Left-click the tray icon, or right-click it and choose **Settings…**. The side panel has **Calendars**, **Calls**, **Starting notes**, and **General**.
 
-- **Calendars:** add, test, and remove calendars. **Add calendar** is at the top of the page, and a row's arrow opens its settings: **Skip meetings declined by**, **Test**, and **Remove calendar**. Each calendar shows how many meetings it has in the next day, or why its downloads are failing. Ones that need attention come first and ones that are off come last; with five or more, the list scrolls under a header that counts them. Secret addresses are encrypted for your Windows user (DPAPI) and never written to the log.
+- **Calendars:** add, test, and remove calendars. **Add calendar** is at the top of the page, and the arrow at the end of a row opens its settings: **Skip meetings declined by**, **Test**, and **Remove calendar**. Each calendar shows how many meetings it has in the next day, or why its downloads are failing. Calendars stay in your order: the up and down arrows on a row move it, and the order decides which meeting the card ticks first when several start together. With five or more, the list scrolls under a header that counts them. Secret addresses are encrypted for your Windows user (DPAPI) and never written to the log.
   - Each calendar has a switch. Off, it isn't downloaded, its meetings don't start notes, and it never raises "isn't updating". It still lends its address to the other calendars' declines, so switching off your main calendar doesn't change what the others skip.
   - **Skip meetings declined by** lists the addresses whose declined meetings are skipped, one list per calendar. Automatic reads the calendar's own address (a Google calendar is named after its account). A calendar that names no address, such as an Outlook one or a calendar you made yourself, uses your other calendars' addresses. To add an alias, put it in the list: the calendar then skips meetings declined by exactly the addresses listed. With every address removed, declines aren't checked on that calendar, so every meeting on it starts notes. **Reset addresses** goes back to automatic.
 - **Calls:** a switch for each of Zoom, Microsoft Teams, and Google Meet. Zoom is on. Teams and Meet are off until you switch them on, even when Teams is installed. Zoom and Teams say whether their app was found on this PC (Zoom under your user folder or in Program Files); that is only a hint, and doesn't decide whether a call is noticed. Only a call that has just begun gets a card, so one already under way when you switch its provider on isn't asked about. When no meeting on your calendars matches the call, the card shows the meeting's name from its window, or "Zoom meeting", "Teams call", or "Google Meet call".

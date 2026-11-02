@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from granola_autostart.calendar_feed import CalendarEvent, meetings_next_day, merge_events
@@ -47,6 +48,15 @@ def test_the_first_copy_of_a_meeting_is_kept_and_the_same_series_at_another_time
     assert merge_events([copy], [first], [copy]) == [copy]
     assert merge_events([later, first], [copy]) == [first, later]  # in the order they start
     assert merge_events() == [] and merge_events([], []) == []
+
+
+def test_the_copy_on_the_calendar_higher_in_the_list_is_the_one_kept_with_its_rank_and_name():
+    start = datetime(2026, 10, 29, 17, 0, tzinfo=timezone.utc)
+    top = CalendarEvent(id="abc", summary="Launcher", start=start, end=start + timedelta(minutes=30), guests=3, calendar_rank=0, calendar_name="you@shift.com")
+    lower = replace(top, calendar_rank=1, calendar_name="Personal")
+    assert merge_events([top], [lower]) == [top]  # the groups come in the order of the list
+    [kept] = merge_events([lower], [top])
+    assert (kept.calendar_rank, kept.calendar_name) == (1, "Personal")  # which is what the order is for
 
 
 def test_the_meetings_a_calendar_has_in_the_next_day_leave_out_skipped_ones():

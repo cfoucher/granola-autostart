@@ -35,6 +35,8 @@ def load_feeds(now: datetime, settings: Settings, owners: dict[str, str | None])
     Each calendar's declines are checked against its own addresses (see ``declined_addresses``), so every
     download comes first: a calendar that names no address borrows the others' owners. Each calendar leaves out
     what it declined, so a meeting on several calendars counts if any of them kept it (see ``merge_events``).
+    Each meeting also carries where it came from: its calendar's place in the list (0 is the top) and its name.
+    ``events`` is filled in the list's order, so merging its groups keeps the copy on the highest calendar.
 
     ``owners`` holds each calendar's own address, calendars that are off included, and is updated in place,
     so a feed that fails this time, or is off, still lends the address it had last time.
@@ -58,7 +60,7 @@ def load_feeds(now: datetime, settings: Settings, owners: dict[str, str | None])
         if url not in texts:
             continue
         try:
-            result.events[url] = events_between(
+            found = events_between(
                 texts[url],
                 now - timedelta(hours=12),
                 now + timedelta(hours=36),
@@ -66,6 +68,8 @@ def load_feeds(now: datetime, settings: Settings, owners: dict[str, str | None])
                 user_emails=declined_addresses(calendar.declined_by, owners.get(url), known, settings.user_email),
                 keep_skipped=True,
             )
+            name = result.names.get(url) or ""
+            result.events[url] = [dataclasses.replace(event, calendar_rank=index - 1, calendar_name=name) for event in found]
         except Exception as error:
             result.failures.append((index, url, error))
     return result

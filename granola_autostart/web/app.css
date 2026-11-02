@@ -151,7 +151,8 @@ main.general { gap: 12px; }
 .item.warn .lead { color: var(--warn); }
 .empty { padding: 18px 16px; color: var(--muted); font-size: 13px; }
 
-/* A calendar's row: icon, name with its provider, the status line, then the switch and the arrow. Its settings open below. */
+/* A calendar's row: icon, name with its provider, the status line, then the arrows that move it, the switch, and the arrow
+   that opens its settings below. */
 .cal { display: flex; flex-direction: column; }
 .cal + .cal::before { content: ""; height: 1px; margin: 0 16px; background: var(--border); }
 .cal-main { padding: 13px 12px 13px 16px; }
@@ -162,6 +163,11 @@ main.general { gap: 12px; }
 .cal .line { margin-top: 0; }
 .cal .actions { gap: 4px; }
 .cal .icon-btn { color: var(--ink); }
+/* The two move arrows are square and a little apart from the switch. The first row's up and the last row's down can't move
+   it, so they are muted and ignore the pointer. */
+.moves { display: flex; align-items: center; margin-right: 4px; }
+.moves .icon-btn { width: 28px; }
+.cal .icon-btn:disabled, .cal .icon-btn:disabled:hover { color: var(--muted); opacity: .55; cursor: default; background: transparent; }
 .icon-btn svg { transition: transform .12s; }
 @media (prefers-reduced-motion: reduce) { .icon-btn svg { transition: none; } }
 .icon-btn[aria-expanded="true"] svg { transform: rotate(180deg); }

@@ -1,6 +1,6 @@
-"""The watcher: each tick it checks presence, calls, and the calendars, then shows the countdown card when a
-meeting starts and opens Granola. While Autostart notes is off it checks none of that. It also runs the tray
-icon and the command line for the other modes."""
+"""The watcher: each tick it checks presence, calls, and the calendars, then shows the countdown card as a meeting
+is about to start, so that Granola opens about when it begins. While Autostart notes is off it checks none of that.
+It also runs the tray icon and the command line for the other modes."""
 
 from __future__ import annotations
 
@@ -11,9 +11,10 @@ import logging
 import subprocess
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 import pystray
 
@@ -153,20 +154,33 @@ class Control:
             callback(view)
 
 
-def ask_notice(title: str, seconds: int, kind: str) -> bool | None:
-    """True when the countdown ran out or Start now was clicked, False on Cancel, None when the card couldn't run."""
+class CardAnswer(NamedTuple):
+    """What the countdown card said. ``accepted`` is True when the countdown ran out or Start now was clicked, False on
+    Cancel, and None when the card couldn't run. ``picked`` is the meeting to start, as its place in the card's list: 0 is
+    the first, and the only one when the card listed none."""
+
+    accepted: bool | None
+    picked: int = 0
+
+
+def ask_notice(title: str, seconds: int, kind: str, choices: Sequence[tuple[str, str]] = ()) -> CardAnswer:
+    """Show the card, listing the meetings in ``choices`` (title and line each) when there are any."""
     try:
-        completed = subprocess.run(processes.notice_command(title, seconds, kind), timeout=max(1, seconds) + 60)
+        completed = subprocess.run(processes.notice_command(title, seconds, kind, choices), timeout=max(1, seconds) + 60)
     except subprocess.TimeoutExpired:
         log.error("countdown window did not close")
-        return None
+        return CardAnswer(None)
     except Exception:
         log.exception("countdown window failed to open")
-        return None
-    if completed.returncode in (0, 1):
-        return completed.returncode == 0
-    log.error("countdown window exited %s", completed.returncode)
-    return None
+        return CardAnswer(None)
+    code = completed.returncode
+    if code in (0, 1):
+        return CardAnswer(code == 0)
+    place = code - processes.CHOICE_EXIT_CODE
+    if 0 < place < len(choices):
+        return CardAnswer(True, place)
+    log.error("countdown window exited %s", code)
+    return CardAnswer(None)
 
 
 def config_stamp() -> tuple[int, int] | None:
@@ -295,6 +309,7 @@ def run_loop(settings: Settings, control: Control, state_lock: threading.Lock, s
                     lookahead=timedelta(minutes=settings.zoom_lookahead_minutes),
                     fresh_call_seconds=settings.fresh_zoom_seconds,
                     skip_words=settings.ignore_title_substrings,
+                    lead=timedelta(seconds=settings.countdown_seconds),
                 )
                 _warn_if_launch_missing(state, now)
                 launch_now = dataclasses.replace(state.active_launch) if state.active_launch else None
@@ -322,40 +337,49 @@ def still_present(settings: Settings) -> bool:
 
 
 def handle_prompt(prompt: Prompt, settings: Settings, control: Control, state_lock: threading.Lock, state) -> None:
-    log.info("countdown for %s (%s)", prompt.title, prompt.kind)
+    if prompt.choices:
+        log.info("countdown for %s (%s), %s meetings", prompt.title, prompt.kind, len(prompt.choices))
+    else:
+        log.info("countdown for %s (%s)", prompt.title, prompt.kind)
+    now = datetime.now().astimezone()
+    listed = [(choice.title, choice.line(now)) for choice in prompt.choices]
     # Held from before the card starts, which takes a moment, until it has closed: an update isn't installed
     # in between. The card holds it too while it is up (notice.main).
     processes.hold_mutex(processes.CARD_MUTEX, shared=True)
     control.set_card(True)
     try:
-        answer = ask_notice(prompt.title, settings.countdown_seconds, prompt.kind)
+        answer = ask_notice(prompt.title, settings.countdown_seconds, prompt.kind, listed)
     finally:
         processes.release_mutex(processes.CARD_MUTEX)  # first: the tray menu rebuilt next asks whether a card is up
         control.set_card(False)
-    control.card_failed = answer is None
+    control.card_failed = answer.accepted is None
     # A card that couldn't run counts as nobody answering, which starts notes, so a broken card never
     # quietly skips meetings. Not for restarting notes after Granola closed, though: the user may have
     # closed it on purpose, and without a card nothing would let them say no.
-    accepted = answer if answer is not None else prompt.kind != "crash"
-    if answer is None:
-        log.info("%s Granola for %s without the card", "starting" if accepted else "not restarting", prompt.title)
+    accepted = answer.accepted if answer.accepted is not None else prompt.kind != "crash"
+    # The meeting ticked on the card. A Cancel answers the prompt as it was, with every meeting it listed.
+    chosen = prompt.picked(answer.picked) if accepted else prompt
+    if answer.accepted is None:
+        log.info("%s Granola for %s without the card", "starting" if accepted else "not restarting", chosen.title)
+    if accepted and answer.picked:
+        log.info("picked %s on the card", chosen.title)
     if control.stop.is_set():
         return
     if accepted and control.paused(datetime.now().astimezone()):
-        log.info("paused during the countdown; not starting Granola for %s", prompt.title)
+        log.info("paused during the countdown; not starting Granola for %s", chosen.title)
         return
     if accepted and notes_off(control):
-        log.info("turned off during the countdown; not starting Granola for %s", prompt.title)
+        log.info("turned off during the countdown; not starting Granola for %s", chosen.title)
         return
     if accepted and not still_present(settings):
-        log.info("left the computer during the countdown; will ask again for %s", prompt.title)
+        log.info("left the computer during the countdown; will ask again for %s", chosen.title)
         return
-    if answer is False:
+    if answer.accepted is False:
         log.info("cancelled Granola for %s", prompt.title)
-    opened = accepted and open_granola(prompt.payload, prompt.title, dry_run=settings.dry_run)
+    opened = accepted and open_granola(chosen.payload, chosen.title, dry_run=settings.dry_run)
     at = datetime.now().astimezone()
     with state_lock:
-        apply_result(state, prompt, accepted, at)
+        apply_result(state, chosen, accepted, at)
         if accepted and settings.dry_run:
             # Answered like a real start, but nothing opened, so there is nothing to watch for.
             state.active_launch = None
@@ -364,7 +388,7 @@ def handle_prompt(prompt: Prompt, settings: Settings, control: Control, state_lo
             state.active_launch.failed = True
         _save_state(state, control)
     if accepted and not settings.dry_run:
-        control.record_start(prompt.title, at)
+        control.record_start(chosen.title, at)
 
 
 def _save_state(state, control: Control) -> None:
@@ -675,6 +699,7 @@ def print_check(settings: Settings, config_error: str | None) -> None:
     loaded = load_feeds(now, settings, owners)
     for index, _url, error in loaded.failures:
         print(f"calendar feed {index}: failed ({describe_error(error)})")
+    # loaded.events is in the order of the Calendars list, so a meeting on two calendars keeps the higher one's copy.
     events = merge_events(*loaded.events.values())
     upcoming = [event for event in events if event.end > now][:8]
     if not upcoming:
@@ -718,7 +743,7 @@ def main() -> int:
         from .notice import show_notice
 
         started = show_notice("Design review", settings.countdown_seconds)
-        print("would start" if started else "cancelled")
+        print("would start" if started is not None else "cancelled")
         return 0
     if args.mode == "check":
         print_check(settings, config_error)
