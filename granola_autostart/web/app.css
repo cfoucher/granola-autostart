@@ -215,7 +215,6 @@ main.general { gap: 12px; }
 .segmented button[aria-checked="true"], .segmented button[aria-selected="true"] { background: var(--btn); color: var(--on-accent); font-weight: 600; }
 .chips { display: flex; flex-wrap: wrap; gap: 8px; }
 .chip { display: inline-flex; align-items: center; gap: 2px; height: 28px; max-width: 100%; padding: 0 4px 0 12px; border-radius: 14px; background: var(--hover); border: 1px solid var(--border); font-size: 13px; }
-.chip.fixed { padding-right: 12px; }
 .chip .text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chip button { width: 22px; height: 22px; border: none; border-radius: 11px; background: transparent; color: var(--muted); display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
 .chip button:hover { color: var(--ink); background: var(--border); }

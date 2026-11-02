@@ -43,7 +43,7 @@ from .settings import (
     ConfigError,
     Settings,
     app_dir,
-    clean_addresses,
+    clean_declined_by,
     load_or_defaults,
     load_settings,
     saved_appearance,
@@ -170,9 +170,12 @@ def summarize_feed(
 
 
 def address_note(declined_by: tuple[str, ...] | None, owner: str | None, known_owners: Iterable[str | None], user_email: str) -> str:
-    """Where a calendar's declined addresses come from, as the page says it under them: "list" (typed in), "own"
-    (the calendar's name is an address), "copied" (it names none, so the other calendars' are used), "kept" (no
-    other calendar has one either: only the address an older version saved) or "none" (no address at all)."""
+    """Where a calendar's declined addresses come from, as the page says it under them: "unchecked" (an empty list:
+    no declines are checked), "list" (typed in), "own" (the calendar's name is an address), "copied" (it names none,
+    so the other calendars' are used), "kept" (no other calendar has one either: only the address an older version
+    saved) or "none" (no address at all)."""
+    if declined_by == ():
+        return "unchecked"
     if declined_by is not None:
         return "list"
     if owner:
@@ -417,12 +420,13 @@ class Api:
 
     def add_calendar(self, url: str, declined_by: list[str] | None = None) -> dict:
         """Add a calendar. ``declined_by`` is what the editor ended with after Test, stored as it is given: the
-        page sends None while the editor holds what Test suggested, which leaves the calendar automatic."""
+        page sends None while the editor holds what Test suggested, which leaves the calendar automatic, and an empty
+        list when it was emptied, which checks no declines."""
         cleaned = normalize_feed_url(url)
         settings = load_settings()
         if cleaned in settings.calendar_urls():
             return self.load()
-        chosen = clean_addresses(declined_by)
+        chosen = clean_declined_by(declined_by)
         if not _valid_addresses(chosen):
             return {**self.load(), "error": NOT_AN_ADDRESS}
         log.info("calendar added from Settings")
@@ -454,7 +458,8 @@ class Api:
         return self._save_calendar(settings, calendar, declined_by=(*current, address))
 
     def remove_declined(self, calendar_id: str, address: str) -> dict:
-        """Take an address away. With none left, the calendar goes back to automatic."""
+        """Take an address away. With none left, the calendar checks no declines: Reset addresses is how it goes back
+        to automatic."""
         settings = load_settings()
         calendar = _find(settings, calendar_id)
         if calendar is None:
@@ -463,7 +468,12 @@ class Api:
         remaining = [piece for piece in current if piece.casefold() != (address or "").strip().casefold()]
         if len(remaining) == len(current):
             return self.load()
-        return self._save_calendar(settings, calendar, declined_by=clean_addresses(remaining))
+        return self._save_calendar(settings, calendar, declined_by=tuple(remaining))
+
+    def reset_declined(self, calendar_id: str) -> dict:
+        """Put a calendar's addresses back to automatic."""
+        settings = load_settings()
+        return self._save_calendar(settings, _find(settings, calendar_id), declined_by=None)
 
     # Updates
 
@@ -556,7 +566,7 @@ class Api:
         settings = load_settings()
         calendars = settings.distinct_calendars()
         cleaned = normalize_feed_url(url) if url else None
-        chosen = clean_addresses(declined_by)
+        chosen = clean_declined_by(declined_by)
         if cleaned and not _valid_addresses(chosen):
             return {**self.load(), "error": NOT_AN_ADDRESS}
         if cleaned and cleaned not in settings.calendar_urls():

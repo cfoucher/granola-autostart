@@ -1006,7 +1006,7 @@ def test_check_downloads_the_calendars_that_are_on_each_with_its_own_declines(mo
 
     served = {
         HOME: feed("Home", ("Dentist", "DECLINED", "me@example.com"), ("Pottery", "ACCEPTED", "me@example.com"), ("Choir", "DECLINED", "alias@example.ca")),
-        WORK: feed("me@example.com", ("Planning", "ACCEPTED", "me@example.com")),
+        WORK: feed("me@example.com", ("Planning", "ACCEPTED", "me@example.com"), ("Dentist", "DECLINED", "me@example.com")),
     }
     fetched = []
     monkeypatch.setattr(calendar_cache, "fetch_ics", lambda url: fetched.append(url) or served[url])
@@ -1027,6 +1027,19 @@ def test_check_downloads_the_calendars_that_are_on_each_with_its_own_declines(mo
     watcher.print_check(Settings(calendars=(Calendar(WORK, enabled=False), Calendar(HOME, declined_by=("alias@example.ca",)))), None)
     out = capsys.readouterr().out
     assert "Pottery" in out and "Dentist" in out and "Choir" not in out  # exactly the listed address
+    # A meeting on two calendars is skipped only when it is declined on both. WORK declines the Dentist, which is also
+    # on HOME. With every address removed nothing is declined on HOME, so the Dentist counts there, and so does Choir.
+    watcher.print_check(Settings(calendars=(Calendar(WORK), Calendar(HOME, declined_by=()))), None)
+    out = capsys.readouterr().out
+    assert "Pottery" in out and "Dentist" in out and "Choir" in out and "Planning" in out
+    # With only the alias on HOME's list, its Dentist isn't declined there (me@example.com declined it), but Choir is.
+    watcher.print_check(Settings(calendars=(Calendar(WORK), Calendar(HOME, declined_by=("alias@example.ca",)))), None)
+    out = capsys.readouterr().out
+    assert "Pottery" in out and "Dentist" in out and "Planning" in out and "Choir" not in out
+    # Automatic, HOME borrows WORK's address, so the Dentist is declined on both calendars and skipped.
+    watcher.print_check(Settings(calendars=(Calendar(WORK), Calendar(HOME))), None)
+    out = capsys.readouterr().out
+    assert "Pottery" in out and "Planning" in out and "Dentist" not in out
 
 
 @pytest.fixture

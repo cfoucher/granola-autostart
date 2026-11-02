@@ -37,24 +37,23 @@ def test_the_same_meeting_on_two_feeds_is_one_prompt():
     assert [event.id for event in merged] == ["abc", "def"]
 
 
-def test_a_meeting_declined_on_either_calendar_is_skipped_whichever_copy_comes_first():
+def test_the_first_copy_of_a_meeting_is_kept_and_the_same_series_at_another_time_is_another_meeting():
     start = datetime(2026, 10, 29, 17, 0, tzinfo=timezone.utc)
-    kept = CalendarEvent(id="abc", summary="Launcher", start=start, end=start + timedelta(minutes=30))
-    declined = CalendarEvent(id="abc", summary="Launcher", start=start, end=start + timedelta(minutes=30), declined=True)
-    other = CalendarEvent(id="def", summary="Office hours", start=start, end=start + timedelta(minutes=30))
-    assert [event.id for event in merge_events([kept, other], [declined])] == ["def"]
-    assert [event.id for event in merge_events([declined], [kept, other])] == ["def"]
-    assert merge_events([declined]) == []
-    # The same series at another time is another meeting.
-    later = CalendarEvent(id="abc", summary="Launcher", start=start + timedelta(days=7), end=start + timedelta(days=7, minutes=30))
-    assert merge_events([declined, later]) == [later]
+    end = start + timedelta(minutes=30)
+    first = CalendarEvent(id="abc", summary="Launcher", start=start, end=end)
+    copy = CalendarEvent(id="abc", summary="Launcher (copy)", start=start, end=end)
+    later = CalendarEvent(id="abc", summary="Launcher", start=start + timedelta(days=7), end=end + timedelta(days=7))
+    assert merge_events([first], [copy]) == [first]
+    assert merge_events([copy], [first], [copy]) == [copy]
+    assert merge_events([later, first], [copy]) == [first, later]  # in the order they start
+    assert merge_events() == [] and merge_events([], []) == []
 
 
-def test_the_meetings_a_calendar_has_in_the_next_day_leave_out_skipped_and_declined_ones():
+def test_the_meetings_a_calendar_has_in_the_next_day_leave_out_skipped_ones():
     now = datetime(2026, 10, 29, 9, 0, tzinfo=timezone.utc)
     soon = now + timedelta(hours=1)
 
     def event(event_id, **marks):
         return CalendarEvent(id=event_id, summary=event_id, start=soon, end=soon + timedelta(minutes=30), **marks)
 
-    assert meetings_next_day([event("a"), event("b", skipped=True), event("c", declined=True)], now) == 1
+    assert meetings_next_day([event("a"), event("b", skipped=True)], now) == 1

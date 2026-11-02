@@ -33,8 +33,8 @@ def load_feeds(now: datetime, settings: Settings, owners: dict[str, str | None])
     """Download every calendar that is on, then keep each one's meetings, leaving out those it declined.
 
     Each calendar's declines are checked against its own addresses (see ``declined_addresses``), so every
-    download comes first: a calendar that names no address borrows the others' owners. Declined meetings are kept,
-    marked, for ``merge_events`` to drop, which is how the same meeting declined on another calendar is skipped too.
+    download comes first: a calendar that names no address borrows the others' owners. Each calendar leaves out
+    what it declined, so a meeting on several calendars counts if any of them kept it (see ``merge_events``).
 
     ``owners`` holds each calendar's own address, calendars that are off included, and is updated in place,
     so a feed that fails this time, or is off, still lends the address it had last time.
@@ -65,7 +65,6 @@ def load_feeds(now: datetime, settings: Settings, owners: dict[str, str | None])
                 ignore_title_substrings=settings.ignore_title_substrings,
                 user_emails=declined_addresses(calendar.declined_by, owners.get(url), known, settings.user_email),
                 keep_skipped=True,
-                keep_declined=True,
             )
         except Exception as error:
             result.failures.append((index, url, error))
