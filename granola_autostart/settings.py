@@ -131,12 +131,13 @@ class Calendar:
     url: str
     enabled: bool = True
     # None is automatic: the calendar's own address if its name is one, otherwise every address the app
-    # knows, plus Settings.user_email. A list is exactly those addresses, so aliases work.
+    # knows, plus Settings.user_email. A list is exactly those addresses, so aliases work, and an empty one
+    # checks no declines at all.
     declined_by: tuple[str, ...] | None = None
 
 
 def clean_addresses(values, *, lower: bool = False) -> tuple[str, ...] | None:
-    """Declined addresses without blanks or repeats (compared ignoring case), or None when none are left: automatic.
+    """Declined addresses without blanks or repeats (compared ignoring case), or None when none are left.
     ``lower`` writes each one in lower case, as declines are compared."""
     found: dict[str, str] = {}
     for value in values or ():
@@ -144,6 +145,12 @@ def clean_addresses(values, *, lower: bool = False) -> tuple[str, ...] | None:
         if address:
             found.setdefault(address.casefold(), address.casefold() if lower else address)
     return tuple(found.values()) or None
+
+
+def clean_declined_by(values) -> tuple[str, ...] | None:
+    """A calendar's ``declined_by`` from a list that was saved or sent: no list (None) is automatic, and a list is
+    exactly its addresses, an empty one included, which checks no declines."""
+    return None if values is None else clean_addresses(values) or ()
 
 
 @dataclass
@@ -339,7 +346,7 @@ def _calendar(entry, where: str) -> Calendar:
     return Calendar(
         _decrypt(token.strip(), "calendars"),
         enabled=_flag(entry, "enabled", default=True, label=f"{where}.enabled"),
-        declined_by=clean_addresses(declined),
+        declined_by=clean_declined_by(declined),
     )
 
 

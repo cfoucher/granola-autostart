@@ -46,8 +46,8 @@ const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 let data = null;
 // A row's address editor saves as you add or remove an address. Add calendar's (add*) and setup's (found*) editors keep
 // their list in the page and save it once, on Add calendar or Finish. Their *Suggested list is what Test suggested, so
-// an editor left as it is sends null and the calendar stays automatic. Setup's call switches (calls, by provider) are kept
-// the same way and saved with Finish or Calls only for now.
+// an editor left as it is sends null and the calendar stays automatic, and one emptied of it sends [], so no declines are
+// checked. Setup's call switches (calls, by provider) are kept the same way and saved with Finish or Calls only for now.
 const ui = {
   section: "calendars",
   adding: false, addUrl: "", addResult: null, addBusy: false, saving: false,
@@ -119,9 +119,9 @@ const EMAIL = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 const NOT_AN_ADDRESS = "That doesn't look like an email address.";
 const sameAddress = (a, b) => a.toLowerCase() === b.toLowerCase();
 const sameList = (a, b) => a.length === b.length && a.every((x) => b.some((y) => sameAddress(x, y)));
-// What add_calendar and finish_setup are sent: null while the editor holds what Test suggested (or nothing), so the
-// calendar stays automatic and nothing more is downloaded.
-const chosenList = (list, suggested) => (!list.length || sameList(list, suggested) ? null : list);
+// What add_calendar and finish_setup are sent: null while the editor holds what Test suggested (both empty included), so
+// the calendar stays automatic and nothing more is downloaded, and otherwise the list, which is [] when it was emptied.
+const chosenList = (list, suggested) => (sameList(list, suggested) ? null : list);
 
 function resetAdd() {
   ui.adding = false; ui.addUrl = ""; ui.addResult = null; ui.addList = []; ui.addSuggested = []; ui.addDraft = ""; ui.addError = null; ui.showHelp = false;
@@ -237,6 +237,7 @@ const MANY = 5;
 const NOTES = {
   own: "Read from this calendar{older}. Add any other addresses your invites go to, such as aliases.",
   list: "Add any other addresses your invites on this calendar go to, such as aliases.",
+  unchecked: "With no addresses, every meeting on this calendar starts notes, even ones you've declined.",
   copied: "Copied from your other {calendars}{older}, as this one doesn't name an address.",
   kept: "Saved by an older version of this app, as this calendar doesn't name an address. Add any others your invites go to.",
   none: "This calendar doesn't name an address. Add the ones your invites go to, so meetings you've declined are skipped.",
@@ -252,6 +253,10 @@ const calendarsLent = (r) => (r.lent > 1 ? "calendars" : "calendar");
 function noteText(r) {
   return NOTES[r.note].replace("{calendars}", calendarsLent(r)).replace("{older}", r.older ? `, plus ${OLDER_ADDRESS}` : "");
 }
+
+// The note under Add calendar's and setup's editors: Test's, or the "unchecked" one once the editor has been emptied of
+// the addresses Test suggested.
+const editorNote = (result, list, suggested) => noteText(!list.length && suggested.length ? { note: "unchecked" } : result);
 
 const manyCalendars = () => Boolean(data.settings) && data.settings.calendars.length >= MANY;
 
@@ -309,10 +314,8 @@ function rowDetail(c) {
     ? `<div class="stack"><div class="label sm">Skip meetings declined by</div><p class="small muted">${esc(noteText(c))}</p></div>`
     : addressEditor({
       key: c.id, chips: c.declined,
-      // An automatic calendar's only address would come straight back, so it can't be taken away.
-      removable: !(c.automatic && c.declined.length === 1),
       removeAction: "removeDeclined", addAction: "addDeclined", bind: "newAddress", draft: ui.newAddress, error: ui.addressError,
-      label: `Add an address for ${c.name}`, note: noteText(c),
+      label: `Add an address for ${c.name}`, note: noteText(c), resetAction: c.automatic ? null : "resetDeclined",
     });
   return `<div id="cal-detail-${c.id}" class="detail" role="group" aria-label="Settings for ${esc(c.name)}">
     ${addresses}
@@ -322,12 +325,10 @@ function rowDetail(c) {
 }
 
 // "Skip meetings declined by", the addresses as removable chips, and a field to add another. A calendar's row, Add
-// calendar, and setup each pass their own ids (key) and the actions that change the list they hold.
-function addressEditor({ key, chips, removable, removeAction, addAction, bind, draft, error, label, note }) {
-  const chip = (address, i) => `<span class="chip ${removable ? "" : "fixed"}" role="listitem"><span class="text" title="${esc(address)}">${esc(address)}</span>${
-    removable
-      ? `<button id="chip-${key}-${i}" data-action="${removeAction}" data-id="${key}" data-address="${esc(address)}" aria-label="Remove ${esc(address)}">${icon("x", "sm")}</button>`
-      : ""}</span>`;
+// calendar, and setup each pass their own ids (key) and the actions that change the list they hold. ``resetAction``
+// is the one that puts the list back to automatic, and is null while it is.
+function addressEditor({ key, chips, removeAction, addAction, bind, draft, error, label, note, resetAction }) {
+  const chip = (address, i) => `<span class="chip" role="listitem"><span class="text" title="${esc(address)}">${esc(address)}</span><button id="chip-${key}-${i}" data-action="${removeAction}" data-id="${key}" data-address="${esc(address)}" aria-label="Remove ${esc(address)}">${icon("x", "sm")}</button></span>`;
   return `<div class="stack">
     <div id="declined-${key}" class="label sm">Skip meetings declined by</div>
     <div class="editor">
@@ -340,7 +341,9 @@ function addressEditor({ key, chips, removable, removeAction, addAction, bind, d
       </span>
     </div>
     ${error ? `<p id="address-error-${key}" class="small warn-text" role="alert">${esc(error)}</p>` : ""}
-    <p class="small muted">${esc(note)}</p>
+    <p class="small muted">${esc(note)}${resetAction
+      ? ` <button id="reset-${key}" class="link small" data-action="${resetAction}" data-id="${key}">Reset addresses</button>`
+      : ""}</p>
   </div>`;
 }
 
@@ -366,8 +369,6 @@ function resultBlock(result) {
 function addPanel() {
   const result = ui.addResult;
   const ok = Boolean(result && result.ok);
-  // The suggestion's only address would come straight back, as it does for an automatic calendar.
-  const removable = !(ui.addSuggested.length === 1 && sameList(ui.addList, ui.addSuggested));
   return `<div class="panel">
     <div class="stack">
       <div class="row between"><label class="label" for="add-url">Secret address in iCal format</label>
@@ -381,8 +382,9 @@ function addPanel() {
     </div>
     ${result ? resultBlock(result) : ""}
     ${ok ? addressEditor({
-      key: "new", chips: ui.addList, removable, removeAction: "removeNewAddress", addAction: "addNewAddress", bind: "addDraft", draft: ui.addDraft,
-      error: ui.addError, label: "Add an address for this calendar", note: noteText(result),
+      key: "new", chips: ui.addList, removeAction: "removeNewAddress", addAction: "addNewAddress", bind: "addDraft", draft: ui.addDraft,
+      error: ui.addError, label: "Add an address for this calendar", note: editorNote(result, ui.addList, ui.addSuggested),
+      resetAction: sameList(ui.addList, ui.addSuggested) ? null : "resetNewAddresses",
     }) : ""}
     <div class="row" style="justify-content:flex-end">
       <button id="add-cancel" class="btn" data-action="cancelAdd">Cancel</button>
@@ -651,12 +653,13 @@ function foundStep() {
         ${m.skipped ? `<span class="small">${esc(m.skipped)}</span>` : ""}</div>`)
     .join("");
   const suggested = ui.foundSuggested;
-  // The editor opens at once when there is nothing to start from, and on "Add another address" otherwise.
+  // The editor opens at once when there is nothing to start from, and on "Add another address" otherwise, so the
+  // sentence only ever names what Test suggested, never an empty list.
   const declined = ui.foundEditing
     ? addressEditor({
-      key: "setup", chips: ui.foundList, removable: !(suggested.length === 1 && sameList(ui.foundList, suggested)),
-      removeAction: "removeFoundAddress", addAction: "addFoundAddress", bind: "foundDraft", draft: ui.foundDraft, error: ui.foundError,
-      label: "Add an address for this calendar", note: noteText(f),
+      key: "setup", chips: ui.foundList, removeAction: "removeFoundAddress", addAction: "addFoundAddress", bind: "foundDraft",
+      draft: ui.foundDraft, error: ui.foundError, label: "Add an address for this calendar", note: editorNote(f, ui.foundList, suggested),
+      resetAction: sameList(ui.foundList, suggested) ? null : "resetFoundAddresses",
     })
     : `<p class="row muted" style="flex-wrap:nowrap;align-items:flex-start"><span style="color:var(--accent-ink);display:flex;padding-top:2px">${icon("check", "sm")}</span>
         <span>Meetings declined by ${names(suggested)}${setupOrigin(f)} are skipped.
@@ -726,6 +729,7 @@ const actions = {
   },
   addNewAddress: () => addTyped("addList", "addDraft", "addError", "address-new"),
   removeNewAddress: (d) => removeTyped("addList", d.address, "chip-new-", "address-new"),
+  resetNewAddresses: () => { ui.addList = [...ui.addSuggested]; render(); focusSoon("address-new"); },
   confirmAdd: async () => {
     if (ui.saving || !ui.addResult || !ui.addResult.ok) return;
     const typed = withTyped(ui.addList, ui.addDraft);
@@ -782,6 +786,12 @@ const actions = {
     render();
     // Focus moves to the chip that took its place, or else to the field.
     (document.getElementById(`chip-${d.id}-${at}`) || document.getElementById(`address-${d.id}`))?.focus();
+  },
+  resetDeclined: async (d) => {
+    data = await api().reset_declined(d.id);
+    // The Test result shown was for the old list, so it goes.
+    delete ui.tests[d.id];
+    render(); focusSoon(`address-${d.id}`);
   },
   setCountdown: (d) => choose("countdown", Number(d.value), () => data.settings.countdown_seconds, (value) => api().set_countdown(value)),
   setIdle: async (_d, element) => { data = await api().set_idle(Number(element.value)); render(); },
@@ -857,6 +867,7 @@ const actions = {
   editFound: () => { ui.foundEditing = true; render(); focusSoon("address-setup"); },
   addFoundAddress: () => addTyped("foundList", "foundDraft", "foundError", "address-setup"),
   removeFoundAddress: (d) => removeTyped("foundList", d.address, "chip-setup-", "address-setup"),
+  resetFoundAddresses: () => { ui.foundList = [...ui.foundSuggested]; render(); focusSoon("address-setup"); },
   finish: async () => {
     if (ui.setupBusy) return;
     const typed = withTyped(ui.foundList, ui.foundDraft);

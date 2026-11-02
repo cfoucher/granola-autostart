@@ -115,20 +115,22 @@ def test_skipped_meetings_can_be_kept_and_marked_for_zoom_matching():
     assert "Focus time" not in [e.summary for e in dropped]
 
 
-def test_declined_meetings_can_be_kept_and_marked_for_merging_across_calendars():
+def test_a_meeting_is_left_out_when_one_of_the_addresses_declined_it_and_kept_for_any_other_address_or_none():
     start = datetime(2026, 10, 28, 16, 0, tzinfo=timezone.utc)
     end = start + timedelta(hours=8)
     me = frozenset({"conrad@example.com"})
-    dropped = events_between(ICS, start, end, user_emails=me)
-    assert "Skipped 1:1" not in [e.summary for e in dropped]
-    kept = events_between(ICS, start, end, user_emails=me, keep_declined=True)
-    assert [(e.summary, e.declined) for e in kept if e.summary == "Skipped 1:1"] == [("Skipped 1:1", True)]
-    assert all(not e.declined for e in kept if e.summary != "Skipped 1:1")
-    # A decline by an address that isn't one of the calendar's isn't a decline, and nothing is declined without addresses.
-    other = events_between(ICS, start, end, user_emails=frozenset({"someone@example.com"}), keep_declined=True)
-    assert not any(e.declined for e in other) and not any(e.declined for e in events_between(ICS, start, end, keep_declined=True))
-    in_a_tuple = events_between(ICS, start, end, user_emails=("conrad@example.com",), keep_declined=True)  # any collection will do
-    assert [e.summary for e in in_a_tuple if e.declined] == ["Skipped 1:1"]
+
+    def summaries(**options):
+        return [e.summary for e in events_between(ICS, start, end, **options)]
+
+    everything = summaries()  # nothing is declined without addresses
+    assert "Skipped 1:1" in everything
+    declined = summaries(user_emails=me)
+    assert "Skipped 1:1" not in declined
+    assert declined == [summary for summary in everything if summary != "Skipped 1:1"]  # and nothing else is left out
+    # A decline by an address that isn't one of the calendar's isn't a decline.
+    assert summaries(user_emails=frozenset({"someone@example.com"})) == everything
+    assert "Skipped 1:1" not in summaries(user_emails=("conrad@example.com",))  # any collection will do
 
 
 def test_a_lone_moved_instance_keeps_its_google_instance_id():

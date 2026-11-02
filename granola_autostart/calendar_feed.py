@@ -31,9 +31,6 @@ class CalendarEvent:
     end: datetime
     # Its title has a skip word. It never prompts, but a call joined during it is not asked about either.
     skipped: bool = False
-    # One of the calendar's declined addresses declined it. It is kept through the download only so that
-    # merge_events can leave out the same meeting on another calendar too.
-    declined: bool = False
 
     def key(self) -> str:
         return f"event:{self.id}:{self.start.isoformat()}"
@@ -48,15 +45,13 @@ class CalendarEvent:
 
 
 def merge_events(*groups: list[CalendarEvent]) -> list[CalendarEvent]:
-    """Keep one copy when the same meeting is on more than one calendar, and none when any copy is declined."""
+    """Keep one copy when the same meeting is on more than one calendar. Each calendar has already left out what it
+    declined, so a meeting starts notes when any calendar it is on kept it."""
     by_key: dict[str, CalendarEvent] = {}
-    declined: set[str] = set()
     for events in groups:
         for event in events:
             by_key.setdefault(event.key(), event)
-            if event.declined:
-                declined.add(event.key())
-    return sorted((event for key, event in by_key.items() if key not in declined), key=lambda event: event.start)
+    return sorted(by_key.values(), key=lambda event: event.start)
 
 
 def normalize_feed_url(url: str) -> str:
@@ -204,8 +199,8 @@ def feed_owner(ics_text: str) -> str | None:
 def declined_addresses(declined_by: tuple[str, ...] | None, owner: str | None, known_owners, user_email: str) -> tuple[str, ...]:
     """The addresses one calendar's declines are checked against, in lower case and once each.
 
-    A list (``declined_by``) is exactly those addresses. Automatic (None) is the calendar's own address
-    when it has one, otherwise every address the app knows, and in both cases the old ``user_email``.
+    A list (``declined_by``) is exactly those addresses, and an empty one is none. Automatic (None) is the
+    calendar's own address when it has one, otherwise every address the app knows, and in both cases the old ``user_email``.
     """
     if declined_by is not None:
         return clean_addresses(declined_by, lower=True) or ()
@@ -220,12 +215,10 @@ def events_between(
     ignore_title_substrings: tuple[str, ...] = (),
     user_emails: Collection[str] = frozenset(),
     keep_skipped: bool = False,
-    keep_declined: bool = False,
 ) -> list[CalendarEvent]:
     """Meetings in the window. With ``keep_skipped``, ones with a skip word stay in, marked ``skipped``.
 
-    ``user_emails`` are the addresses a decline is looked for in, in lower case. With ``keep_declined``,
-    meetings declined by one of them stay in, marked ``declined``.
+    ``user_emails`` are the addresses a decline is looked for in, in lower case: meetings declined by one of them are left out.
     """
     user_emails = frozenset(user_emails)
     calendar = Calendar.from_ical(prefilter_ics(ics_text, window_start, window_end))
@@ -249,7 +242,7 @@ def events_between(
         )
         if event is None or event.end <= event.start:
             continue
-        if (keep_skipped or not event.skipped) and (keep_declined or not event.declined):
+        if keep_skipped or not event.skipped:
             found.append(event)
     found.sort(key=lambda item: item.start)
     return found
@@ -261,8 +254,8 @@ def skip_word(summary: str, words: Iterable[str]) -> str | None:
 
 
 def meetings_next_day(events: list[CalendarEvent], now: datetime) -> int:
-    """How many meetings start in the next day, leaving out skipped and declined ones: a calendar's health at a glance."""
-    return sum(1 for event in events if not event.skipped and not event.declined and now <= event.start < now + timedelta(days=1))
+    """How many meetings start in the next day, leaving out skipped ones: a calendar's health at a glance."""
+    return sum(1 for event in events if not event.skipped and now <= event.start < now + timedelta(days=1))
 
 
 def _give_missing_ends_an_hour(calendar) -> None:
@@ -287,7 +280,7 @@ def _component_to_event(
     series_uids: set[str],
 ) -> CalendarEvent | None:
     status = str(component.get("status") or "").strip().upper()
-    if status in {"CANCELLED", "CANCELED"}:
+    if status in {"CANCELLED", "CANCELED"} or _declined(component, user_emails):
         return None
     start_value = _raw_dt(component.get("dtstart"))
     # recurring_ical_events always sets DTEND on an occurrence, working it out from DURATION if need be.
@@ -309,7 +302,6 @@ def _component_to_event(
         start=start,
         end=end,
         skipped=skipped,
-        declined=_declined(component, user_emails),
     )
 
 

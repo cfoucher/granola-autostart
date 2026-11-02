@@ -600,6 +600,17 @@ def test_a_calendar_that_names_no_address_and_has_no_others_keeps_the_address_an
     assert (watch["declined"], watch["automatic"], watch["note"]) == (["old@example.com"], True, "kept")
 
 
+def test_a_calendar_with_no_addresses_shows_none_and_says_no_declines_are_checked_even_before_it_downloads(api):
+    api.add_calendar(WATCH, [])
+    [watch] = api.load()["settings"]["calendars"]  # the watcher has not written a status for it
+    assert (watch["declined"], watch["automatic"], watch["note"], watch["older"], watch["lent"]) == ([], False, "unchecked", False, 0)
+    api.add_calendar(GOOD)
+    watcher_saw((WATCH, "Granola watch", None), (GOOD, "Work", "me@example.com"))
+    save_settings(dataclasses.replace(load_settings(), user_email="old@example.com"))
+    watch, _work = api.load()["settings"]["calendars"]  # whatever the other calendar lends, it is not borrowed
+    assert (watch["declined"], watch["automatic"], watch["note"], watch["older"], watch["lent"]) == ([], False, "unchecked", False, 0)
+
+
 def test_a_calendar_that_has_not_downloaded_yet_has_no_address_to_show_so_it_is_pending(api):
     api.add_calendar(WATCH)
     save_settings(dataclasses.replace(load_settings(), user_email="old@example.com"))
@@ -661,6 +672,8 @@ def test_the_old_address_is_said_to_add_a_chip_only_when_it_adds_one_to_the_cale
 def test_the_note_says_where_a_calendar_s_addresses_come_from():
     note = settings_app.address_note
     assert note(("a@example.com",), "me@example.com", [None], "old@example.com") == "list"  # typed in, whatever else is known
+    assert note((), "me@example.com", ["me@example.com"], "old@example.com") == "unchecked"  # an empty list, whatever else is known
+    assert note((), None, [], "") == "unchecked"
     assert note(None, "me@example.com", ["me@example.com"], "") == "own"
     assert note(None, "me@example.com", [None], "old@example.com") == "own"  # the old address is added to its own
     assert note(None, None, ["me@example.com", None], "") == "copied"
@@ -694,7 +707,7 @@ def test_a_calendar_row_says_how_many_calendars_lent_it_an_address(api):
 def test_the_page_has_words_for_every_note_python_can_send():
     page = (settings_app.WEB / "app.js").read_text(encoding="utf-8")
     block = re.search(r"const NOTES = \{(.*?)\n\};", page, re.S)[1]
-    assert set(re.findall(r"^  (\w+):", block, re.M)) == {"own", "list", "copied", "kept", "none", "pending", "off"}
+    assert set(re.findall(r"^  (\w+):", block, re.M)) == {"own", "list", "unchecked", "copied", "kept", "none", "pending", "off"}
 
 
 def test_switching_a_calendar_off_keeps_its_name_and_says_its_meetings_wont_start_notes(api):
@@ -784,7 +797,7 @@ def test_adding_or_removing_an_address_for_a_calendar_that_has_gone_changes_noth
     assert api.remove_declined("not-a-calendar", "me@example.com")["settings"] == before
 
 
-def test_removing_an_address_leaves_the_others_and_the_last_one_goes_back_to_automatic(api):
+def test_removing_an_address_leaves_the_others_and_the_last_one_leaves_a_calendar_that_checks_no_declines(api):
     api.add_calendar(GOOD, ["me@example.com", "alias@example.ca"])
     assert declined_by(GOOD) == ("me@example.com", "alias@example.ca")
     view = api.remove_declined(feed_id(GOOD), " ALIAS@example.ca ")
@@ -792,7 +805,48 @@ def test_removing_an_address_leaves_the_others_and_the_last_one_goes_back_to_aut
     assert api.remove_declined(feed_id(GOOD), "nobody@example.com")["settings"] == view["settings"]
     watcher_saw((GOOD, "Work", "me@example.com"))
     [calendar] = api.remove_declined(feed_id(GOOD), "me@example.com")["settings"]["calendars"]
+    assert declined_by(GOOD) == () and not calendar["automatic"] and calendar["note"] == "unchecked" and calendar["declined"] == []
+    # Nothing is left to remove, and it stays as it is rather than going back to automatic.
+    assert api.remove_declined(feed_id(GOOD), "me@example.com")["settings"]["calendars"] == [calendar]
+    assert declined_by(GOOD) == ()
+
+
+def test_an_automatic_calendars_only_address_can_be_removed_and_leaves_no_declines_checked(api):
+    api.add_calendar(GOOD)
+    watcher_saw((GOOD, "Work", "me@example.com"))
+    assert api.load()["settings"]["calendars"][0]["declined"] == ["me@example.com"]
+    [calendar] = api.remove_declined(feed_id(GOOD), "me@example.com")["settings"]["calendars"]
+    assert (calendar["declined"], calendar["automatic"], calendar["note"]) == ([], False, "unchecked")
+    assert declined_by(GOOD) == ()
+    # An address added to it after that is the only one, not the automatic ones again.
+    [calendar] = api.add_declined(feed_id(GOOD), "alias@example.ca")["settings"]["calendars"]
+    assert (calendar["declined"], calendar["note"]) == (["alias@example.ca"], "list")
+    assert declined_by(GOOD) == ("alias@example.ca",)
+
+
+def test_resetting_a_calendars_addresses_puts_it_back_to_automatic(api):
+    api.add_calendar(GOOD, ["alias@example.ca"])
+    watcher_saw((GOOD, "Work", "me@example.com"))
+    [calendar] = api.reset_declined(feed_id(GOOD))["settings"]["calendars"]
+    assert declined_by(GOOD) is None
+    assert (calendar["declined"], calendar["automatic"], calendar["note"]) == (["me@example.com"], True, "own")
+    # From no addresses too, and a calendar that is already automatic stays so.
+    api.remove_declined(feed_id(GOOD), "me@example.com")
+    assert declined_by(GOOD) == ()
+    [calendar] = api.reset_declined(feed_id(GOOD))["settings"]["calendars"]
     assert declined_by(GOOD) is None and calendar["automatic"] and calendar["note"] == "own"
+    assert api.reset_declined(feed_id(GOOD))["settings"]["calendars"] == [calendar]
+    assert load_settings().calendars == (Calendar(GOOD),)
+
+
+def test_resetting_a_calendar_that_has_gone_changes_nothing_and_keeps_its_switch(api):
+    api.add_calendar(GOOD, [])
+    api.add_calendar(WATCH, ["alias@example.ca"])
+    api.set_calendar_enabled(feed_id(WATCH), False)
+    before = api.load()["settings"]
+    assert api.reset_declined("not-a-calendar")["settings"] == before
+    api.reset_declined(feed_id(WATCH))
+    assert load_settings().calendars == (Calendar(GOOD, True, ()), Calendar(WATCH, False, None))
 
 
 def test_removing_an_address_from_an_automatic_calendar_starts_from_its_automatic_addresses(api):
@@ -844,22 +898,44 @@ def test_testing_a_calendar_that_is_added_filters_with_its_own_declined_addresse
     assert (listed["count"], listed["declined"], listed["older"], listed["note"]) == (0, ["me@example.com", "alias@example.ca"], False, "list")
 
 
+def test_a_test_of_a_calendar_with_no_addresses_counts_the_meetings_it_declined(api, monkeypatch):
+    declined = ics("me@example.com", ("Pottery", now() + timedelta(hours=1))).replace(
+        "END:VEVENT", "ATTENDEE;PARTSTAT=DECLINED:mailto:me@example.com\nEND:VEVENT"
+    )
+    serving(monkeypatch, {GOOD: declined})
+    api.add_calendar(GOOD)
+    watcher_saw((GOOD, "Work", "me@example.com"))
+    assert api.test_calendar(feed_id(GOOD))["count"] == 0  # automatic: declined by its own address
+    api.remove_declined(feed_id(GOOD), "me@example.com")
+    unchecked = api.test_calendar(feed_id(GOOD))
+    assert (unchecked["count"], unchecked["declined"], unchecked["older"], unchecked["note"], unchecked["lent"]) == (1, [], False, "unchecked", 0)
+    assert [(meeting["title"], meeting["skipped"]) for meeting in unchecked["meetings"]] == [("Pottery", None)]
+
+
 def no_more_downloads(monkeypatch) -> None:
     """Adding a calendar saves what the page sent: it never downloads the calendar again to second-guess it."""
     monkeypatch.setattr(settings_app, "fetch_ics", lambda url, timeout=30: pytest.fail("the calendar was downloaded again"))
 
 
 def test_a_calendar_the_page_sends_no_list_for_is_added_automatic(api, monkeypatch):
-    # The page sends None while the editor holds what Test suggested, or nothing at all.
+    # The page sends None while the editor holds what Test suggested, or both are empty.
     no_more_downloads(monkeypatch)
     api.add_calendar(GOOD, None)
     assert load_settings().calendars == (Calendar(GOOD),)
     api.remove_calendar(feed_id(GOOD))
-    api.add_calendar(GOOD, [])  # every address removed in the editor
-    assert declined_by(GOOD) is None
-    api.remove_calendar(feed_id(GOOD))
     api.add_calendar(GOOD)
     assert declined_by(GOOD) is None
+
+
+def test_a_calendar_the_page_sends_an_empty_list_for_is_added_with_no_addresses_not_automatic(api, monkeypatch):
+    # Every address Test suggested was removed in the editor, so no declines are checked.
+    no_more_downloads(monkeypatch)
+    view = api.add_calendar(GOOD, [])
+    assert declined_by(GOOD) == () and "error" not in view
+    assert load_settings().calendars == (Calendar(GOOD, True, ()),)
+    api.remove_calendar(feed_id(GOOD))
+    api.add_calendar(GOOD, ["", "  "])  # nothing in it either
+    assert declined_by(GOOD) == ()
 
 
 def test_a_calendar_added_with_a_list_keeps_it_as_the_page_sent_it_whatever_automatic_would_use(api, monkeypatch):
@@ -906,6 +982,19 @@ def test_setup_keeps_the_addresses_chosen_and_leaves_a_calendar_automatic_when_n
     api.remove_calendar(feed_id(GOOD))
     api.finish_setup(GOOD, ["me@example.com"])  # the page sends None for what Test suggested, so this is a choice
     assert declined_by(GOOD) == ("me@example.com",)
+
+
+def test_setup_with_an_empty_list_checks_no_declines_and_with_none_leaves_the_calendar_automatic(api, monkeypatch):
+    no_more_downloads(monkeypatch)
+    view = api.finish_setup(GOOD, [])  # every address Test suggested was removed in the editor
+    assert load_settings().calendars == (Calendar(GOOD, True, ()),) and "error" not in view
+    assert load_settings().setup_complete
+    api.remove_calendar(feed_id(GOOD))
+    api.finish_setup(GOOD, None)  # what Test suggested, or both empty, was left as it is
+    assert load_settings().calendars == (Calendar(GOOD),)
+    api.remove_calendar(feed_id(GOOD))
+    api.finish_setup(None, [])  # Calls only for now sends no calendar, so there is no list to keep
+    assert load_settings().calendars == ()
 
 
 def test_setup_turns_a_bad_address_back_before_it_finishes(api):
@@ -1101,6 +1190,17 @@ def test_test_skips_a_meeting_declined_by_another_calendars_owner():
     )
     assert settings_app.summarize_feed(declined, Settings(), [], now())["count"] == 1
     assert settings_app.summarize_feed(declined, Settings(), ["me@example.com"], now())["count"] == 0
+
+
+def test_test_counts_a_declined_meeting_on_a_calendar_with_no_addresses():
+    declined = ics("Granola watch", ("Design crit", now() + timedelta(hours=1))).replace(
+        "END:VEVENT", "ATTENDEE;PARTSTAT=DECLINED:mailto:me@example.com\nEND:VEVENT"
+    )
+    result = settings_app.summarize_feed(declined, Settings(user_email="me@example.com"), ["me@example.com"], now(), ())
+    assert (result["count"], result["declined"], result["note"], result["older"], result["lent"]) == (1, [], "unchecked", False, 0)
+    assert [(meeting["title"], meeting["skipped"]) for meeting in result["meetings"]] == [("Design crit", None)]
+    # Automatic, the same calendar borrows an address, which declined it.
+    assert settings_app.summarize_feed(declined, Settings(), ["me@example.com"], now(), None)["count"] == 0
 
 
 def test_a_supervisor_left_waiting_reads_as_restarting_after_a_problem(api, monkeypatch):
