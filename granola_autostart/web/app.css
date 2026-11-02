@@ -31,6 +31,8 @@ p { margin: 0; }
 svg.icon { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
 svg.icon.sm { width: 14px; height: 14px; stroke-width: 2; }
 svg.icon.xs { width: 12px; height: 12px; stroke-width: 2.25; }
+svg.icon.md { width: 16px; height: 16px; stroke-width: 2; }
+svg.icon.lg { width: 20px; height: 20px; }
 
 /* Buttons */
 .btn {
@@ -55,6 +57,13 @@ svg.icon.xs { width: 12px; height: 12px; stroke-width: 2.25; }
 .icon-btn:hover { background: var(--hover); color: var(--ink); }
 .link { border: none; background: none; padding: 0; color: var(--accent-ink); text-decoration: underline; cursor: pointer; font-size: 13px; }
 .link:hover { color: var(--ink); }
+.link.small { font-size: 12px; }
+/* A quiet button: no outline until it is pointed at, like Remove calendar. */
+.quiet {
+  display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border: none; border-radius: 6px;
+  background: transparent; color: var(--muted); font-size: 12px; cursor: pointer;
+}
+.quiet:hover { background: var(--hover); color: var(--ink); }
 
 /* Fields */
 .field {
@@ -62,10 +71,14 @@ svg.icon.xs { width: 12px; height: 12px; stroke-width: 2.25; }
   background: var(--field); color: var(--ink); min-width: 0;
 }
 .field::placeholder { color: var(--muted); }
+.field[aria-invalid="true"] { border-color: var(--warn); }
 select.field { padding-right: 8px; }
 .label { font-weight: 600; }
+.label.sm { font-size: 13px; }
+.warn-text { color: var(--warn); }
 .stack { display: flex; flex-direction: column; gap: 6px; }
 .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.row.between { flex-wrap: nowrap; align-items: baseline; justify-content: space-between; gap: 12px; }
 .divider { border: none; border-top: 1px dashed var(--border); margin: 0; }
 
 /* Settings window */
@@ -83,7 +96,9 @@ select.field { padding-right: 8px; }
 .nav[aria-current="page"]::before {
   content: ""; position: absolute; left: 0; top: 10px; width: 3px; height: 16px; border-radius: 2px; background: var(--accent);
 }
-.rail-status { margin-top: auto; padding: 14px 12px; display: flex; flex-direction: column; gap: 10px; border-top: 1px solid var(--border); }
+.rail-status { margin-top: auto; padding: 12px 12px 14px; display: flex; flex-direction: column; gap: 10px; border-top: 1px solid var(--border); }
+.rail-status .power { display: flex; align-items: center; gap: 8px; }
+.rail-status .power > span { flex-grow: 1; font-size: 13px; }
 .rail-status .state { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; }
 .rail-status .warn { color: var(--warn); }
 .rail-status .controls { gap: 8px; }
@@ -91,7 +106,7 @@ select.field { padding-right: 8px; }
 .dot.notes { box-shadow: 0 0 0 3px var(--accent-soft); }
 .dot.paused { background: var(--paused); }
 .dot.starting { background: var(--paused); opacity: .6; }
-.dot.stopped { background: transparent; border: 1.5px solid var(--paused); }
+.dot.stopped, .dot.off { background: transparent; border: 1.5px solid var(--paused); }
 .dot.attention { background: var(--warn); }
 .menu-anchor { position: relative; }
 .menu {
@@ -104,8 +119,26 @@ main { flex: 1; min-width: 0; padding: 26px 32px 22px; display: flex; flex-direc
 .intro { display: flex; flex-direction: column; gap: 6px; }
 .intro p { font-size: 13px; color: var(--muted); }
 
+/* Calendars: Add calendar sits in the header beside the title. From 5 calendars the header holds still and the list
+   scrolls under it, with a thin scrollbar. */
+.page-head { display: flex; align-items: flex-start; gap: 16px; }
+.page-head .intro { flex: 1; min-width: 0; }
+.page-head .btn { flex-shrink: 0; margin-top: 2px; padding: 0 16px 0 12px; }
+/* Four calendars with one open have to fit the window without scrolling, even when one needs attention. */
+main.calendars { gap: 16px; }
+main.many { padding: 0; gap: 0; overflow: hidden; }
+main.many .page-head { flex-shrink: 0; padding: 26px 32px 16px; border-bottom: 1px solid var(--border); }
+main.many .scroll > * { flex-shrink: 0; }
+main.many .scroll {
+  flex: 1; min-height: 0; padding: 16px 32px 22px; display: flex; flex-direction: column; gap: 18px; overflow-y: auto;
+  scrollbar-width: thin; scrollbar-color: var(--field-line) transparent;
+}
+
 .list { display: flex; flex-direction: column; background: var(--field); border: 1px solid var(--border); border-radius: 8px; }
 .list > .item + .item { border-top: 1px solid var(--border); }
+/* General has more rows than the window has height for, so its cards are a little closer set. */
+main.general { gap: 12px; }
+.list.tight > .item { padding-top: 9px; padding-bottom: 9px; }
 .item { display: flex; align-items: flex-start; gap: 14px; padding: 14px 16px; }
 .item .body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .item .name { font-weight: 600; overflow-wrap: anywhere; }
@@ -118,6 +151,29 @@ main { flex: 1; min-width: 0; padding: 26px 32px 22px; display: flex; flex-direc
 .item.warn .lead { color: var(--warn); }
 .empty { padding: 18px 16px; color: var(--muted); font-size: 13px; }
 
+/* A calendar's row: icon, name with its provider, the status line, then the switch and the arrow. Its settings open below. */
+.cal { display: flex; flex-direction: column; }
+.cal + .cal::before { content: ""; height: 1px; margin: 0 16px; background: var(--border); }
+.cal-main { padding: 13px 12px 13px 16px; }
+.cal .body { gap: 2px; }
+.cal .title { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.cal .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; overflow-wrap: normal; }
+.cal .provider { flex-shrink: 0; font-size: 12px; color: var(--muted); }
+.cal .line { margin-top: 0; }
+.cal .actions { gap: 4px; }
+.cal .icon-btn { color: var(--ink); }
+.icon-btn svg { transition: transform .12s; }
+@media (prefers-reduced-motion: reduce) { .icon-btn svg { transition: none; } }
+.icon-btn[aria-expanded="true"] svg { transform: rotate(180deg); }
+.cal.off .lead, .cal.off .name { color: var(--muted); }
+.cal.warn .lead { color: var(--warn); }
+.detail { margin: 0 16px; padding: 10px 0 12px 34px; display: flex; flex-direction: column; gap: 10px; border-top: 1px dashed var(--border); }
+.detail > .stack { gap: 5px; }
+.editor { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.editor .chips { display: inline-flex; max-width: 100%; }
+.adder { display: inline-flex; gap: 8px; }
+.field.address { width: 200px; height: 32px; font-size: 13px; }
+
 .panel { display: flex; flex-direction: column; gap: 12px; padding: 16px; background: var(--field); border: 1.5px solid var(--accent); border-radius: 8px; }
 .result { display: flex; flex-direction: column; gap: 6px; padding: 12px 14px; border-radius: 6px; background: var(--accent-soft); }
 .result.error { background: var(--warn-soft); color: var(--warn); }
@@ -129,18 +185,40 @@ main { flex: 1; min-width: 0; padding: 26px 32px 22px; display: flex; flex-direc
 .help { font-size: 12px; color: var(--muted); }
 .banner { display: flex; gap: 10px; align-items: flex-start; padding: 12px 14px; border-radius: 8px; background: var(--warn-soft); color: var(--warn); font-size: 13px; }
 .footnote { margin-top: auto; display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+/* A note that runs to more than a line keeps its icon beside the first. */
+.footnote.top { align-items: flex-start; }
+.footnote.top svg { margin-top: 1px; }
+.caution { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; color: var(--warn); }
+.caution svg { margin-top: 2px; }
+
+/* Calls, in Settings and in setup: a switch for each, its icon grey while it is off. The rows are divided by a rule that
+   stops short of the edges, as a calendar's rows are. */
+.item.call.off .lead { color: var(--muted); }
+.list > .item.call + .item.call { border-top: none; background: linear-gradient(var(--border), var(--border)) 16px 0 / calc(100% - 32px) 1px no-repeat; }
+
+/* A switch: the button is the track, and the knob inside it sits at the end when it is on. */
+.switch {
+  width: 40px; height: 20px; flex-shrink: 0; padding: 0 3px; border: 1px solid var(--muted); border-radius: 10px;
+  background: transparent; display: flex; align-items: center; justify-content: flex-start; cursor: pointer;
+}
+.switch .knob { width: 12px; height: 12px; border-radius: 50%; background: var(--muted); }
+.switch[aria-checked="true"] { border-color: var(--btn); background: var(--btn); justify-content: flex-end; }
+.switch[aria-checked="true"] .knob { background: var(--on-accent); }
+.switch:disabled { opacity: .5; cursor: default; }
+.item > .switch { margin-top: 1px; }
 
 .segmented { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--field-line); border-radius: 18px; background: var(--field); }
 .segmented button { height: 28px; min-width: 52px; padding: 0 12px; border: none; border-radius: 14px; background: transparent; cursor: pointer; font-size: 13px; }
 .segmented button:hover { background: var(--hover); }
+.segmented button:disabled { opacity: .5; cursor: default; }
+.segmented button:disabled:hover:not([aria-checked="true"]) { background: transparent; }
 .segmented button[aria-checked="true"], .segmented button[aria-selected="true"] { background: var(--btn); color: var(--on-accent); font-weight: 600; }
 .chips { display: flex; flex-wrap: wrap; gap: 8px; }
-.chip { display: inline-flex; align-items: center; gap: 2px; height: 28px; padding: 0 4px 0 12px; border-radius: 14px; background: var(--hover); border: 1px solid var(--border); font-size: 13px; }
+.chip { display: inline-flex; align-items: center; gap: 2px; height: 28px; max-width: 100%; padding: 0 4px 0 12px; border-radius: 14px; background: var(--hover); border: 1px solid var(--border); font-size: 13px; }
+.chip.fixed { padding-right: 12px; }
+.chip .text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chip button { width: 22px; height: 22px; border: none; border-radius: 11px; background: transparent; color: var(--muted); display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
 .chip button:hover { color: var(--ink); background: var(--border); }
-
-.identity { display: flex; align-items: center; gap: 16px; }
-.identity .title { font: 20px Georgia, Cambria, serif; }
 
 /* Setup window */
 .setup { display: flex; flex-direction: column; height: 100vh; }
@@ -149,6 +227,7 @@ main { flex: 1; min-width: 0; padding: 26px 32px 22px; display: flex; flex-direc
 .setup h1 { font-size: 28px; }
 .setup .footer { flex-shrink: 0; margin: 0 40px; padding: 16px 0 22px; display: flex; align-items: center; justify-content: flex-end; gap: 10px; border-top: 1px dashed var(--border); }
 .setup .footer .note { flex: 1; font-size: 12px; color: var(--muted); }
+.setup .footnote.top { margin-bottom: 18px; }
 .steps { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 12px; }
 .steps li { display: flex; gap: 12px; align-items: flex-start; }
 .steps .num { width: 24px; height: 24px; flex-shrink: 0; border-radius: 50%; background: var(--accent-soft); color: var(--accent-ink); display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600; }

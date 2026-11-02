@@ -6,6 +6,7 @@ named by a hash of the address, which Settings recomputes from the addresses it 
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import socket
@@ -17,8 +18,13 @@ from pathlib import Path
 from .settings import write_json
 
 FAILURES_BEFORE_ALERT = 3
-# Reasons that come from calendar_feed itself and are safe to show.
-_KNOWN_REASONS = {"calendar feeds must use https", "calendar feed is too large", "calendar download was cut short"}
+# Reasons that come from calendar_feed and updates themselves and are safe to show.
+_KNOWN_REASONS = {
+    "calendar feeds must use https",
+    "calendar feed is too large",
+    "calendar download was cut short",
+    "download was cut short",  # updates.CUT_SHORT
+}
 
 
 def feed_id(url: str) -> str:
@@ -47,6 +53,8 @@ class FeedStatus:
     last_ok: datetime | None = None
     failures: int = 0
     last_error: str | None = None
+    # Off: not downloaded, so it never alerts. Its name and owner stay, for Settings and for other calendars' declines.
+    enabled: bool = True
 
     def succeeded(self, now: datetime, *, name: str | None, owner: str | None, meetings_next_day: int) -> None:
         self.name, self.owner, self.meetings_next_day = name, owner, meetings_next_day
@@ -78,6 +86,7 @@ class FeedStatus:
             "last_ok": self.last_ok.isoformat() if self.last_ok else None,
             "failures": self.failures,
             "last_error": self.last_error,
+            "enabled": self.enabled,
         }
 
     @classmethod
@@ -85,12 +94,13 @@ class FeedStatus:
         try:
             return cls(
                 id=str(raw["id"]),
-                name=raw.get("name"),
-                owner=raw.get("owner"),
+                name=_str_or_none(raw.get("name")),
+                owner=_str_or_none(raw.get("owner")),
                 meetings_next_day=None if raw.get("meetings_next_day") is None else int(raw["meetings_next_day"]),
-                last_ok=_moment(raw.get("last_ok")),
+                last_ok=saved_moment(raw.get("last_ok")),
                 failures=int(raw.get("failures") or 0),
-                last_error=raw.get("last_error"),
+                last_error=_str_or_none(raw.get("last_error")),
+                enabled=raw.get("enabled") is not False,
             )
         except (AttributeError, KeyError, OverflowError, TypeError, ValueError):  # OverflowError: Infinity
             return None
@@ -122,7 +132,7 @@ def launch_problem_key(launch) -> str:
 
 def find_problems(config_error: str | None, feeds: list[FeedStatus], launch, *, card_failed: bool = False) -> list[Problem]:
     """Most urgent first: a launch that failed, a countdown card that can't open, a broken config, then
-    calendars that stopped updating."""
+    calendars that stopped updating. A calendar that is off isn't being updated, and isn't expected to be."""
     problems: list[Problem] = []
     if launch is not None and launch.did_not_open:
         problems.append(
@@ -130,7 +140,7 @@ def find_problems(config_error: str | None, feeds: list[FeedStatus], launch, *, 
                 key=launch_problem_key(launch),
                 title=f"Granola didn't open for {launch.title}"[:120],
                 detail="A Granola update may have changed how notes open. Open Granola yourself to take notes in this meeting.",
-                section="about",
+                section="general",
                 actions=(("Try again", "retry"), ("Open log folder", "logs")),
             )
         )
@@ -140,7 +150,7 @@ def find_problems(config_error: str | None, feeds: list[FeedStatus], launch, *, 
                 key="card",
                 title="The countdown card couldn't open",
                 detail="Meetings start notes without it, and you can't cancel them. The log folder says what went wrong.",
-                section="about",
+                section="general",
                 actions=(("Open log folder", "logs"),),
             )
         )
@@ -149,13 +159,16 @@ def find_problems(config_error: str | None, feeds: list[FeedStatus], launch, *, 
             Problem(
                 key="config",
                 title="Settings couldn't be read",
-                detail=f"{config_error}. Zoom joins still start notes. Calendar meetings won't until it's fixed.",
+                detail=(
+                    f"{config_error}. Until it's fixed, the app keeps the last settings it could read, "
+                    "or the defaults if it started with this file."
+                ),
                 section="calendars",
                 actions=(("Open file", "config"), ("Dismiss", "dismiss")),
             )
         )
     for feed in feeds:
-        if feed.alerting:
+        if feed.enabled and feed.alerting:
             problems.append(
                 Problem(
                     key=f"feed:{feed.id}",
@@ -183,10 +196,11 @@ class AlertBook:
 
 @dataclass(frozen=True)
 class TrayView:
-    kind: str  # "watching" | "paused" | "attention"
+    kind: str  # "watching" | "paused" | "attention" | "off"
     header: str
     paused: bool
     problem_section: str | None = None
+    update: str | None = None  # the version available to install
 
     @property
     def tooltip(self) -> str:
@@ -229,7 +243,32 @@ def until_tomorrow(paused_until: datetime, now: datetime) -> bool:
     return (local.hour, local.minute) == (0, 0) and local.date() == now.date() + timedelta(days=1)
 
 
-def tray_view(now: datetime, paused_until: datetime | None, problems: list[Problem], upcoming) -> TrayView:
+def tray_view(
+    now: datetime,
+    paused_until: datetime | None,
+    problems: list[Problem],
+    upcoming,
+    *,
+    update: str | None = None,
+    installing: str | None = None,
+    off: bool = False,
+) -> TrayView:
+    """What the tray shows. Off wins over everything else, and the update still shows in the badge and the menu.
+    An update available takes the first line when nothing needs attention and nothing is paused; one being
+    installed (its version is ``installing``) takes it always, as the app is about to restart."""
+    view = _tray_view(now, paused_until, problems, upcoming, off)
+    if installing:
+        header = f"Installing version {installing}…"
+    elif update and view.kind == "watching":
+        header = f"Version {update} is available"
+    else:
+        header = view.header
+    return dataclasses.replace(view, header=header, update=update)
+
+
+def _tray_view(now: datetime, paused_until: datetime | None, problems: list[Problem], upcoming, off: bool) -> TrayView:
+    if off:
+        return TrayView("off", "Off. Meetings and calls won't start notes", False)
     paused = paused_until is not None and now < paused_until
     if problems:
         return TrayView("attention", _shorten(problems[0].title), paused, problems[0].section)
@@ -257,7 +296,7 @@ class LastStart:
     @classmethod
     def from_json(cls, raw) -> LastStart | None:
         try:
-            at = _moment(raw["at"])
+            at = saved_moment(raw["at"])
             return cls(str(raw["title"]), at, raw.get("granola_opened")) if at else None
         except (AttributeError, KeyError, TypeError):
             return None
@@ -274,10 +313,12 @@ class Status:
     feeds: list[FeedStatus] = field(default_factory=list)
     last_start: LastStart | None = None
     problems: list[Problem] = field(default_factory=list)
+    off: bool = False  # Autostart notes is switched off
 
     def to_json(self) -> dict:
         return {
             "version": self.version,
+            "off": self.off,
             "paused_until": self.paused_until.isoformat() if self.paused_until else None,
             "next_meeting": _titled_json(self.next_meeting, "start"),
             "taking_notes": _titled_json(self.taking_notes, "since"),
@@ -292,7 +333,8 @@ class Status:
         raw = raw if isinstance(raw, dict) else {}
         return cls(
             version=str(raw.get("version") or ""),
-            paused_until=_moment(raw.get("paused_until")),
+            off=raw.get("off") is True,
+            paused_until=saved_moment(raw.get("paused_until")),
             next_meeting=_titled(raw.get("next_meeting"), "start"),
             taking_notes=_titled(raw.get("taking_notes"), "since"),
             feeds=[feed for feed in map(FeedStatus.from_json, _list(raw.get("feeds"))) if feed is not None],
@@ -308,17 +350,23 @@ def _titled_json(value: tuple[str, datetime] | None, moment_key: str) -> dict | 
 def _titled(raw, moment_key: str) -> tuple[str, datetime] | None:
     if not isinstance(raw, dict) or not raw.get("title"):
         return None
-    moment = _moment(raw.get(moment_key))
+    moment = saved_moment(raw.get(moment_key))
     return (str(raw["title"]), moment) if moment else None
 
 
-def _moment(raw) -> datetime | None:
-    """A saved time. One without a UTC offset (a hand edit) is read as this PC's local time."""
+def saved_moment(raw) -> datetime | None:
+    """A saved time. One without a UTC offset (a hand edit) is read as this PC's local time. One this PC's clock
+    can't show, such as the year 1 or 9999, is no time at all: left in, it would fail where it is next shown."""
     try:
         moment = datetime.fromisoformat(raw) if raw else None
-    except (TypeError, ValueError):
+        local = moment.astimezone() if moment is not None else None
+    except (TypeError, ValueError, OverflowError, OSError):  # OSError: Windows' own refusal of a date out of range
         return None
-    return moment.astimezone() if moment is not None and moment.tzinfo is None else moment
+    return local if moment is not None and moment.tzinfo is None else moment
+
+
+def _str_or_none(raw) -> str | None:
+    return raw if isinstance(raw, str) else None
 
 
 def _list(raw) -> list:

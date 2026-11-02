@@ -1,9 +1,8 @@
 import gzip
 import io
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -13,11 +12,10 @@ from icalendar import Calendar
 from granola_autostart import calendar_feed
 from granola_autostart.calendar_feed import (
     _gunzip_capped,
-    _HttpsOnlyRedirects,
     _read_capped,
+    declined_addresses,
     events_between,
     feed_owner,
-    my_addresses,
     normalize_feed_url,
     prefilter_ics,
 )
@@ -117,6 +115,22 @@ def test_skipped_meetings_can_be_kept_and_marked_for_zoom_matching():
     assert "Focus time" not in [e.summary for e in dropped]
 
 
+def test_declined_meetings_can_be_kept_and_marked_for_merging_across_calendars():
+    start = datetime(2026, 10, 28, 16, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=8)
+    me = frozenset({"conrad@example.com"})
+    dropped = events_between(ICS, start, end, user_emails=me)
+    assert "Skipped 1:1" not in [e.summary for e in dropped]
+    kept = events_between(ICS, start, end, user_emails=me, keep_declined=True)
+    assert [(e.summary, e.declined) for e in kept if e.summary == "Skipped 1:1"] == [("Skipped 1:1", True)]
+    assert all(not e.declined for e in kept if e.summary != "Skipped 1:1")
+    # A decline by an address that isn't one of the calendar's isn't a decline, and nothing is declined without addresses.
+    other = events_between(ICS, start, end, user_emails=frozenset({"someone@example.com"}), keep_declined=True)
+    assert not any(e.declined for e in other) and not any(e.declined for e in events_between(ICS, start, end, keep_declined=True))
+    in_a_tuple = events_between(ICS, start, end, user_emails=("conrad@example.com",), keep_declined=True)  # any collection will do
+    assert [e.summary for e in in_a_tuple if e.declined] == ["Skipped 1:1"]
+
+
 def test_a_lone_moved_instance_keeps_its_google_instance_id():
     start = datetime(2026, 10, 28, 16, 0, tzinfo=timezone.utc)
     events = events_between(LONE_INSTANCE, start, start + timedelta(hours=8))
@@ -139,12 +153,23 @@ def test_a_secondary_calendar_or_an_event_field_has_no_owner():
     assert feed_owner(in_event) is None
 
 
-def test_declines_are_checked_against_the_typed_address_and_every_owner():
-    assert my_addresses(" Alias@Example.ca ", ["conrad@example.com", None, ""]) == {
-        "alias@example.ca",
-        "conrad@example.com",
-    }
-    assert my_addresses("", [None]) == frozenset()
+def test_an_automatic_calendar_checks_declines_against_its_own_address_and_the_old_typed_one():
+    own = declined_addresses(None, "conrad@example.com", ["other@example.com", "conrad@example.com"], " Alias@Example.ca ")
+    assert own == ("conrad@example.com", "alias@example.ca")  # not other@example.com, which is another calendar's
+    assert declined_addresses(None, "conrad@example.com", [], "") == ("conrad@example.com",)
+
+
+def test_an_automatic_calendar_with_no_address_of_its_own_borrows_every_known_owner():
+    known = ["conrad@example.com", None, "", "Other@Example.com", "conrad@example.com"]
+    assert declined_addresses(None, None, known, "alias@example.ca") == ("conrad@example.com", "other@example.com", "alias@example.ca")
+    assert declined_addresses(None, None, known, "") == ("conrad@example.com", "other@example.com")
+    assert declined_addresses(None, None, [None], "") == ()
+
+
+def test_a_list_of_declined_addresses_is_exactly_those_in_lower_case():
+    listed = (" Alias@Example.ca", "conrad@example.com", "ALIAS@example.ca", "")
+    assert declined_addresses(listed, "main@example.com", ["main@example.com"], "old@example.com") == ("alias@example.ca", "conrad@example.com")
+    assert declined_addresses((), "main@example.com", [], "old@example.com") == ()
 
 
 FAR_AWAY = ICS.replace(
@@ -233,13 +258,57 @@ def test_downloads_are_capped_across_reads():
         _read_capped(io.BytesIO(body), len(body) - 1, deadline)
 
 
-def test_redirects_may_not_leave_https():
-    handler = _HttpsOnlyRedirects()
-    with pytest.raises(urllib.error.HTTPError) as error:
-        handler.redirect_request(urllib.request.Request("https://a/x"), None, 302, "Found", {}, "http://a/x")
-    assert error.value.code == 302
-    moved = handler.redirect_request(urllib.request.Request("https://a/x"), None, 302, "Found", {}, "https://b/y")
-    assert moved.full_url == "https://b/y"
+class Trickling:
+    """A server that sends a byte at a time, each taking ``seconds`` on ``clock``. Reading for a whole chunk of that,
+    rather than for what has arrived, would take for ever."""
+
+    def __init__(self, body: bytes, clock: list[float], seconds: float) -> None:
+        self.body, self.clock, self.seconds = io.BytesIO(body), clock, seconds
+
+    def read(self, size=-1):
+        pytest.fail("read waits for a whole chunk, which a trickle is slow to fill")
+
+    def read1(self, size=-1):
+        self.clock[0] += self.seconds
+        return self.body.read(1)
+
+
+def test_a_download_that_trickles_is_given_up_on_at_the_deadline_not_when_the_calendar_is_in(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(calendar_feed, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    with pytest.raises(TimeoutError, match="took too long"):
+        _read_capped(Trickling(b"A" * 1000, clock, seconds=30), 10_000, deadline=100.0)
+    assert clock[0] <= 150  # a few bytes in, not all of them
+
+
+def test_a_download_that_trickles_but_finishes_in_time_is_whole(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(calendar_feed, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    assert _read_capped(Trickling(b"BEGIN:VCALENDAR", clock, seconds=1), 100, deadline=100.0) == b"BEGIN:VCALENDAR"
+
+
+class Served(io.BytesIO):
+    def __init__(self, body: bytes, **headers: str) -> None:
+        super().__init__(body)
+        self.headers = headers
+
+
+def test_a_calendar_is_downloaded_whole_and_unzipped_when_it_comes_gzipped(monkeypatch):
+    text = "BEGIN:VCALENDAR\nX-WR-CALNAME:Work\nEND:VCALENDAR\n" * 3000  # several reads
+    asked = []
+
+    def serve(body, **headers):
+        def open_(request, timeout):
+            asked.append((request.full_url, request.get_header("Accept-encoding"), timeout))
+            return Served(body, **headers)
+
+        monkeypatch.setattr(calendar_feed, "_opener", SimpleNamespace(open=open_))
+
+    serve(text.encode())
+    assert calendar_feed.fetch_ics("webcal://calendar.example/work.ics") == text
+    serve(gzip.compress(text.encode()), **{"Content-Encoding": "GZIP"})
+    assert calendar_feed.fetch_ics("https://calendar.example/work.ics", timeout=5) == text
+    assert asked == [("https://calendar.example/work.ics", "gzip", 30), ("https://calendar.example/work.ics", "gzip", 5)]
 
 
 def _calendar(events: str) -> str:

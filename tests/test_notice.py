@@ -9,7 +9,7 @@ import pytest
 
 import granola_autostart
 import granola_autostart.__main__ as entry
-from granola_autostart import notice, settings, watcher
+from granola_autostart import notice, processes, settings, watcher
 from granola_autostart.notice import keep_display_on as real_keep_display_on
 from granola_autostart.notice import show_notice as real_show_notice
 
@@ -68,6 +68,40 @@ def test_the_exit_code_tells_the_watcher_whether_to_start_granola(started, exit_
     monkeypatch.setattr(notice, "show_notice", lambda title, seconds, *, kind: shown.append((title, seconds, kind)) or started)
     assert run(monkeypatch, "--notice", "--title=-- standup", "--seconds=7", "--kind=crash") == exit_code
     assert shown == [("-- standup", 7, "crash")]
+
+
+def test_a_card_holds_the_card_mutex_while_it_is_up_so_an_update_waits_for_it(monkeypatch):
+    seen = []
+
+    def card(title, seconds, *, kind):
+        seen.append(processes.card_showing())
+        return True
+
+    monkeypatch.setattr(notice, "show_notice", card)
+    assert not processes.card_showing()
+    assert notice.main(["--title=Standup"]) == 0
+    assert seen == [True] and not processes.card_showing()
+
+
+def test_a_card_keeps_the_card_mutex_up_when_the_watcher_or_another_card_that_held_it_lets_go_first(monkeypatch, held_elsewhere):
+    seen = []
+    watcher_lets_go = held_elsewhere(processes.CARD_MUTEX)  # the watcher holds it while the card starts
+
+    def card(title, seconds, *, kind):
+        watcher_lets_go()  # a card that overlapped this one closed, or the watcher's hold ended
+        seen.append(processes.card_showing())
+        return True
+
+    monkeypatch.setattr(notice, "show_notice", card)
+    assert notice.main(["--title=Standup"]) == 0
+    assert seen == [True] and not processes.card_showing()
+
+
+def test_a_card_that_fails_lets_go_of_the_card_mutex(monkeypatch):
+    monkeypatch.setattr(notice, "show_notice", broken_card)
+    with pytest.raises(RuntimeError):
+        notice.main(["--title=Standup"])
+    assert not processes.card_showing()
 
 
 def test_a_watcher_that_crashes_says_why_in_its_log_and_exits_for_the_supervisor(monkeypatch, tmp_path, app_log):
