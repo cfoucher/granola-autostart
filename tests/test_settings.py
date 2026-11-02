@@ -16,6 +16,7 @@ from granola_autostart.settings import (
     ConfigError,
     Settings,
     clean_addresses,
+    clean_declined_by,
     config_path,
     load_settings,
     saved_appearance,
@@ -207,6 +208,15 @@ def test_calendars_keep_their_switch_and_declined_addresses(tmp_path):
     assert settings.calendar_urls() == [WORK, WATCH] and settings.enabled_urls() == [WORK]
 
 
+def test_a_calendar_with_no_addresses_is_saved_as_an_empty_list_and_comes_back_as_one_not_as_automatic(tmp_path):
+    settings = Settings(calendars=(Calendar(WORK, True, ()), Calendar(WATCH, True, None)))
+    save_settings(settings)
+    saved = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert [entry["declined_by"] for entry in saved["calendars"]] == [[], None]
+    assert [calendar.declined_by for calendar in load_settings().calendars] == [(), None]
+    assert load_settings() == settings
+
+
 def test_the_same_address_listed_more_than_once_is_one_calendar_and_the_first_entry_wins(tmp_path):
     config = {
         "calendars": [
@@ -222,14 +232,20 @@ def test_the_same_address_listed_more_than_once_is_one_calendar_and_the_first_en
     assert len(json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))["calendars"]) == 2
 
 
-def test_missing_switches_and_lists_mean_on_and_automatic_and_an_empty_list_is_automatic(tmp_path):
+def test_missing_switches_mean_on_and_a_missing_or_null_list_means_automatic_but_an_empty_one_means_no_declines_are_checked(tmp_path):
     entries = [
         {"address_protected": protect(WORK)},
-        {"address_protected": protect(WATCH), "enabled": None, "declined_by": []},
-        {"address_protected": protect("https://calendar.example/home.ics"), "enabled": " False ", "declined_by": ["", "  "]},
+        {"address_protected": protect(WATCH), "enabled": None, "declined_by": None},
+        {"address_protected": protect("https://calendar.example/home.ics"), "enabled": " False ", "declined_by": []},
+        {"address_protected": protect("https://calendar.example/other.ics"), "declined_by": ["", "  "]},  # nothing in it, as typed by hand
     ]
     write_config(tmp_path, json.dumps({"calendars": entries}))
-    assert [(calendar.enabled, calendar.declined_by) for calendar in load_settings().calendars] == [(True, None), (True, None), (False, None)]
+    assert [(calendar.enabled, calendar.declined_by) for calendar in load_settings().calendars] == [
+        (True, None),
+        (True, None),
+        (False, ()),
+        (True, ()),
+    ]
 
 
 def test_declined_addresses_are_trimmed_and_a_repeat_ignoring_case_is_dropped(tmp_path):
@@ -237,6 +253,12 @@ def test_declined_addresses_are_trimmed_and_a_repeat_ignoring_case_is_dropped(tm
     write_config(tmp_path, json.dumps({"calendars": [entry]}))
     assert load_settings().calendars[0].declined_by == ("Me@Example.com", "alias@example.ca")
     assert clean_addresses(None) is None and clean_addresses([" "]) is None
+
+
+def test_a_saved_or_sent_list_is_automatic_only_when_there_is_none_and_an_empty_one_checks_no_declines():
+    assert clean_declined_by(None) is None
+    assert clean_declined_by([]) == () and clean_declined_by([" ", None, ""]) == ()
+    assert clean_declined_by([" Me@Example.com ", "me@EXAMPLE.com", "Alias@Example.ca"]) == ("Me@Example.com", "Alias@Example.ca")
 
 
 def test_addresses_can_also_come_out_in_lower_case_without_blanks_or_repeats():

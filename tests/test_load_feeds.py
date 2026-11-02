@@ -80,7 +80,7 @@ def feeds(monkeypatch):
 
 
 def titles(loaded):
-    """What the watcher would keep: the calendars' meetings merged, with any declined one gone."""
+    """What the watcher would keep: the calendars' meetings merged, each calendar having left out what it declined."""
     return sorted(event.summary for event in merge_events(*loaded.events.values()))
 
 
@@ -91,7 +91,8 @@ def test_a_secondary_calendar_skips_declines_by_the_main_calendars_address(feeds
     assert titles(loaded) == ["Weekly sync"]
     assert owners == {MAIN: "conrad@example.com", WATCH: None}
     assert loaded.names == {MAIN: "conrad@example.com", WATCH: "Granola watch"}
-    assert [(event.summary, event.declined) for event in loaded.events[WATCH]] == [("Design crit", True)]  # kept, marked
+    assert loaded.events[WATCH] == []  # its one meeting was declined, so it is left out
+    assert [event.summary for event in loaded.events[MAIN]] == ["Weekly sync"]
 
 
 def test_a_failed_main_calendar_still_lends_its_last_known_address(feeds):
@@ -152,8 +153,9 @@ def test_a_failure_is_numbered_by_its_place_in_the_config_even_when_a_calendar_b
     assert [(index, url) for index, url, _error in calendar_cache.load_feeds(NOW, settings, {}).failures] == [(2, WATCH)]
 
 
-def test_a_meeting_on_two_calendars_is_skipped_when_either_copy_is_declined(feeds):
+def test_a_meeting_on_two_calendars_starts_notes_unless_every_copy_is_declined_on_its_own_calendar(feeds):
     accepted_on_watch = SHARED_ON_WATCH.replace("PARTSTAT=DECLINED", "PARTSTAT=ACCEPTED")
+    declined_on_main = SHARED_ON_MAIN.replace("PARTSTAT=ACCEPTED", "PARTSTAT=DECLINED")
     both = Settings(calendars=(Calendar(MAIN), Calendar(WATCH)))
 
     def merged(main, watch, settings=both):
@@ -161,14 +163,45 @@ def test_a_meeting_on_two_calendars_is_skipped_when_either_copy_is_declined(feed
         return [event.summary for event in merge_events(*calendar_cache.load_feeds(NOW, settings, {}).events.values())]
 
     assert merged(SHARED_ON_MAIN, accepted_on_watch) == ["Weekly sync"]  # one copy, not two
-    assert merged(SHARED_ON_MAIN, SHARED_ON_WATCH) == []  # declined on the secondary calendar only
-    declined_on_main = SHARED_ON_MAIN.replace("PARTSTAT=ACCEPTED", "PARTSTAT=DECLINED")
-    assert merged(declined_on_main, accepted_on_watch) == []  # declined on the main one only
+    assert merged(declined_on_main, SHARED_ON_WATCH) == []  # declined on both: the watch calendar copies the main address
+    # Declined on one calendar only, the other would start notes, and its copy is the one kept.
+    assert merged(SHARED_ON_MAIN, SHARED_ON_WATCH) == ["Weekly sync"]
+    assert merged(declined_on_main, accepted_on_watch) == ["Design crit"]
     # Each calendar checks its own addresses: the copy on WATCH isn't a decline when WATCH's list leaves conrad out,
-    # but the other copy still is.
+    # so the meeting declined on the main calendar still starts notes. With both copies declined it doesn't.
     elsewhere = Settings(calendars=(Calendar(MAIN), Calendar(WATCH, declined_by=("other@example.com",))))
     assert merged(SHARED_ON_MAIN, SHARED_ON_WATCH, elsewhere) == ["Weekly sync"]
-    assert merged(declined_on_main, SHARED_ON_WATCH, elsewhere) == []
+    assert merged(declined_on_main, SHARED_ON_WATCH, elsewhere) == ["Design crit"]
+    declined_on_both = Settings(calendars=(Calendar(MAIN), Calendar(WATCH, declined_by=("conrad@example.com", "other@example.com"))))
+    assert merged(declined_on_main, SHARED_ON_WATCH, declined_on_both) == []
+
+
+def test_a_meeting_declined_on_the_main_calendar_starts_notes_when_the_watch_calendar_would_start_it(feeds):
+    feeds[MAIN] = SHARED_ON_MAIN.replace("PARTSTAT=ACCEPTED", "PARTSTAT=DECLINED")
+    feeds[WATCH] = SHARED_ON_WATCH  # its invite names conrad@example.com, who declined it
+
+    def merged(watch_list):
+        settings = Settings(calendars=(Calendar(MAIN), Calendar(WATCH, declined_by=watch_list)))
+        return [event.summary for event in merge_events(*calendar_cache.load_feeds(NOW, settings, {}).events.values())]
+
+    assert merged(None) == []  # the watch calendar names no address, so it copies the main one: declined on both
+    assert merged(("conrad@example.com",)) == []
+    assert merged(("alias@example.ca",)) == ["Design crit"]  # an alias that isn't on the invite: not declined on this calendar
+    assert merged(()) == ["Design crit"]  # no addresses: nothing is declined on this calendar
+
+
+def test_a_calendar_with_no_addresses_checks_no_declines(feeds):
+    none_checked = Settings(calendars=(Calendar(MAIN), Calendar(WATCH, declined_by=())))
+    loaded = calendar_cache.load_feeds(NOW, none_checked, {})
+    assert loaded.failures == []
+    # Design crit was declined by the main calendar's address, which this calendar doesn't look for.
+    assert [event.summary for event in loaded.events[WATCH]] == ["Design crit"]
+    assert titles(loaded) == ["Design crit", "Weekly sync"]
+    # Automatic, or with a list that has the address, the decline stands.
+    for settings in (watching(MAIN, WATCH), Settings(calendars=(Calendar(MAIN), Calendar(WATCH, declined_by=("conrad@example.com",))))):
+        loaded = calendar_cache.load_feeds(NOW, settings, {})
+        assert loaded.events[WATCH] == []
+        assert titles(loaded) == ["Weekly sync"]
 
 
 @pytest.fixture
@@ -231,6 +264,23 @@ def test_a_failed_download_never_puts_the_address_in_the_log_or_status(error, ca
         assert SECRET not in text
         assert "private-0123456789abcdef" not in text
         assert "example.com" not in text
+
+
+def test_the_cache_keeps_a_meeting_declined_on_the_main_calendar_when_the_watch_calendar_would_start_it(feeds, cache):
+    feeds[MAIN] = SHARED_ON_MAIN.replace("PARTSTAT=ACCEPTED", "PARTSTAT=DECLINED")
+    feeds[WATCH] = SHARED_ON_WATCH
+    automatic = watching(MAIN, WATCH)
+    cache._refresh(automatic, cache._generation, NOW)
+    assert cache.current(NOW, automatic, refresh=False) == []  # declined on both
+    for watch_list in (("alias@example.ca",), ()):
+        settings = Settings(calendars=(Calendar(MAIN), Calendar(WATCH, declined_by=watch_list)))
+        cache.invalidate(settings.enabled_urls())
+        cache._refresh(settings, cache._generation, NOW)
+        assert [event.summary for event in cache.current(NOW, settings, refresh=False)] == ["Design crit"]
+    # Switching the watch calendar off takes its copy away at once, so the one declined on the main calendar is all there is.
+    watch_off = Settings(calendars=(Calendar(MAIN), Calendar(WATCH, enabled=False, declined_by=())))
+    cache.invalidate(watch_off.enabled_urls())
+    assert cache.current(NOW, watch_off, refresh=False) == []
 
 
 def test_a_calendar_that_fails_keeps_its_last_meetings(feeds, cache):
