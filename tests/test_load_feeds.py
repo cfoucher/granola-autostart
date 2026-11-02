@@ -204,6 +204,47 @@ def test_a_calendar_with_no_addresses_checks_no_declines(feeds):
         assert titles(loaded) == ["Weekly sync"]
 
 
+def test_each_meeting_knows_its_calendar_s_place_in_the_list_its_name_and_its_guests(feeds):
+    feeds[WATCH] = WATCH_ICS.replace("PARTSTAT=DECLINED", "PARTSTAT=ACCEPTED")
+    loaded = calendar_cache.load_feeds(NOW, watching(MAIN, WATCH), {})
+    [main], [watch] = loaded.events[MAIN], loaded.events[WATCH]
+    assert (main.calendar_rank, main.calendar_name, main.guests) == (0, "conrad@example.com", 1)
+    assert (watch.calendar_rank, watch.calendar_name, watch.guests) == (1, "Granola watch", 1)
+    # A calendar that is off still has its place, and a feed that names no calendar leaves the name blank.
+    feeds[WATCH] = WATCH_ICS.replace("PARTSTAT=DECLINED", "PARTSTAT=ACCEPTED").replace("X-WR-CALNAME:Granola watch\n", "")
+    settings = Settings(calendars=(Calendar(MAIN, enabled=False), Calendar(WATCH)))
+    [watch] = calendar_cache.load_feeds(NOW, settings, {}).events[WATCH]
+    assert (watch.calendar_rank, watch.calendar_name) == (1, "")
+
+
+def test_the_feeds_are_loaded_in_the_order_of_the_list_so_the_highest_calendar_keeps_a_shared_meeting(feeds):
+    # Both calendars list the meeting, neither declined it. merge_events keeps the first copy, which is also what --check merges.
+    feeds[MAIN] = SHARED_ON_MAIN
+    feeds[WATCH] = SHARED_ON_WATCH
+    for order, kept in (((MAIN, WATCH), "conrad@example.com"), ((WATCH, MAIN), "Granola watch")):
+        settings = Settings(calendars=tuple(Calendar(url, declined_by=()) for url in order))
+        loaded = calendar_cache.load_feeds(NOW, settings, {})
+        assert list(loaded.events) == list(order)
+        [shared] = merge_events(*loaded.events.values())
+        assert (shared.calendar_rank, shared.calendar_name) == (0, kept)
+
+
+def test_the_cache_keeps_the_shared_meeting_s_copy_from_the_calendar_highest_in_the_list_even_after_a_reorder(feeds, cache):
+    feeds[MAIN] = SHARED_ON_MAIN
+    feeds[WATCH] = SHARED_ON_WATCH
+    main_first = Settings(calendars=(Calendar(MAIN, declined_by=()), Calendar(WATCH, declined_by=())))
+    cache._refresh(main_first, cache._generation, NOW)
+    [shared] = cache.current(NOW, main_first, refresh=False)
+    assert (shared.calendar_rank, shared.calendar_name) == (0, "conrad@example.com")
+    watch_first = Settings(calendars=(Calendar(WATCH, declined_by=()), Calendar(MAIN, declined_by=())))
+    cache.invalidate(watch_first.enabled_urls())
+    [shared] = cache.current(NOW, watch_first, refresh=False)
+    assert shared.calendar_name == "Granola watch"  # at once, with the rank it had until the next download
+    cache._refresh(watch_first, cache._generation, NOW)
+    [shared] = cache.current(NOW, watch_first, refresh=False)
+    assert (shared.calendar_rank, shared.calendar_name) == (0, "Granola watch")
+
+
 @pytest.fixture
 def cache(monkeypatch):
     monkeypatch.setattr(calendar_cache, "lower_thread_priority", lambda: None)

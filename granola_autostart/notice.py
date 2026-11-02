@@ -2,6 +2,10 @@
 starts Granola; Cancel exits 1. A card that fails exits 2 after logging to notice-log.txt, and the
 watcher starts notes anyway, except when it was asking to restart them after Granola closed.
 
+When meetings start together the card lists them (--choices, a JSON list of {"title", "line"}), the first one
+ticked, and a click on another ticks it. Starting then means the ticked meeting: the exit code is 0 for the first
+and 10 + i for the one at place i (processes.CHOICE_EXIT_CODE). Cancel is still 1, whichever is ticked.
+
 The card never takes keyboard focus, so typing in the current app is not interrupted.
 """
 
@@ -9,10 +13,12 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
 import math
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from collections.abc import Sequence
 from ctypes import wintypes
 
 from PIL import Image, ImageDraw, ImageTk
@@ -23,6 +29,7 @@ from .winui import app_theme, per_monitor_dpi, set_window_attribute
 ES_CONTINUOUS = 0x80000000
 ES_DISPLAY_REQUIRED = 0x00000002
 MAX_TITLE = 200
+MAX_CHOICES = 4  # the most meetings the card lists (the same number as decide.MAX_CHOICES, which can't be imported here)
 RING_STEPS = 120
 # A click already on its way to that corner when the card appears must not skip the countdown.
 START_NOW_DELAY_SECONDS = 0.75
@@ -42,6 +49,7 @@ PALETTES = {
         "track": "#e9e2d2",
         "button_line": "#2b2924",
         "button_hover": "#f1eadb",
+        "accent_soft": "#e8efdf",
         "warn": "#94501a",
     },
     "dark": {
@@ -57,6 +65,7 @@ PALETTES = {
         "track": "#3a3731",
         "button_line": "#f1ece1",
         "button_hover": "#33302a",
+        "accent_soft": "#2c3627",
         "warn": "#e9a15c",
     },
 }
@@ -75,18 +84,15 @@ class _MONITORINFO(ctypes.Structure):
     ]
 
 
-def _monitor_at_cursor() -> tuple[int, int, int, int, int]:
-    """Work area of the monitor under the pointer, plus that monitor's DPI."""
+def _primary_monitor() -> tuple[int, int, int, int, int]:
+    """Work area of the primary monitor, which Windows calls the main display, plus that monitor's DPI."""
     user32 = ctypes.windll.user32
-    user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
-    user32.GetCursorPos.restype = wintypes.BOOL
     user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
     user32.MonitorFromPoint.restype = wintypes.HANDLE
     user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_MONITORINFO)]
     user32.GetMonitorInfoW.restype = wintypes.BOOL
-    point = wintypes.POINT()
-    user32.GetCursorPos(ctypes.byref(point))
-    monitor = user32.MonitorFromPoint(point, 2)
+    # The primary monitor always contains (0, 0).
+    monitor = user32.MonitorFromPoint(wintypes.POINT(0, 0), 1)  # MONITOR_DEFAULTTOPRIMARY
     info = _MONITORINFO()
     info.cbSize = ctypes.sizeof(_MONITORINFO)
     if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
@@ -167,19 +173,34 @@ def _fit_lines(font: tkfont.Font, text: str, width: int, max_lines: int) -> list
     return lines[: max_lines - 1] + [last.rstrip(" ,.;:-") + "\u2026"]
 
 
-def _pill_image(width: int, height: int, fill: str | None, outline: str | None = None, line: float = 0) -> ImageTk.PhotoImage:
+def _pill_image(
+    width: int, height: int, fill: str | None, outline: str | None = None, line: float = 0, radius: float | None = None
+) -> ImageTk.PhotoImage:
+    """A rounded rectangle, a pill unless ``radius`` says how round its corners are."""
     ss = 4
     img = Image.new("RGBA", (width * ss, height * ss), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     inset = line * ss / 2
     draw.rounded_rectangle(
         (inset, inset, width * ss - 1 - inset, height * ss - 1 - inset),
-        radius=height * ss / 2,
+        radius=(height / 2 if radius is None else radius) * ss,
         fill=fill,
         outline=outline,
         width=round(line * ss) if outline else 0,
     )
     return ImageTk.PhotoImage(img.resize((width, height), Image.LANCZOS))
+
+
+def _radio_image(size: int, stroke: float, ring: str, dot: str | None) -> ImageTk.PhotoImage:
+    """A radio button: a ring, with a dot in the middle when it is ticked."""
+    ss = 4
+    s = size * ss
+    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse((0, 0, s - 1, s - 1), outline=ring, width=round(stroke * ss))
+    if dot:
+        draw.ellipse((s / 4, s / 4, s - 1 - s / 4, s - 1 - s / 4), fill=dot)
+    return ImageTk.PhotoImage(img.resize((size, size), Image.LANCZOS))
 
 
 def _ring_image(size: int, stroke: float, fraction: float, track: str, accent: str) -> ImageTk.PhotoImage:
@@ -203,12 +224,39 @@ def _ring_image(size: int, stroke: float, fraction: float, track: str, accent: s
     return ImageTk.PhotoImage(img.resize((size, size), Image.LANCZOS))
 
 
-def show_notice(title: str, seconds: int, *, kind: str = "calendar") -> bool:
-    """Return True when the countdown finishes or Start now is clicked, False when the user cancels."""
-    title = " ".join(title.split())[:MAX_TITLE] or "Meeting"
+def _one_line(text: str) -> str:
+    return " ".join(text.split())[:MAX_TITLE]
+
+
+def parse_choices(text: str) -> list[tuple[str, str]]:
+    """The (title, line) pairs of --choices, a JSON list of {"title", "line"} objects (the line may be left out). A value
+    that is missing, isn't JSON, or isn't that shape is no choices at all, so the card shows its own title as before."""
+    try:
+        listed = json.loads(text)
+    except ValueError:
+        return []
+    if not isinstance(listed, list):
+        return []
+    pairs = []
+    for item in listed:
+        if not isinstance(item, dict) or not isinstance(item.get("title"), str) or not isinstance(item.get("line", ""), str):
+            return []
+        pairs.append((item["title"], item.get("line", "")))
+    return pairs
+
+
+def show_notice(title: str, seconds: int, *, kind: str = "calendar", choices: Sequence[tuple[str, str]] = ()) -> int | None:
+    """Return which meeting to start notes for when the countdown finishes or Start now is clicked, None when the user cancels.
+
+    That is 0 for the meeting in ``title``, or the first of ``choices`` when there are two or more: (title, line) pairs
+    the card lists, up to MAX_CHOICES, with the first ticked. A click ticks another, and then its place is returned.
+    A card for Granola closing never lists choices.
+    """
+    title = _one_line(title) or "Meeting"
+    listed = [] if kind == "crash" or len(choices) < 2 else [(_one_line(name) or "Meeting", _one_line(line)) for name, line in choices[:MAX_CHOICES]]
     # Per-monitor so a 150% laptop and a 100% external display each size the card correctly.
     per_monitor_dpi()
-    left, top, right, bottom, dpi = _monitor_at_cursor()
+    left, top, right, bottom, dpi = _primary_monitor()
     scale = max(1.0, dpi / 96)
 
     def px(value: float) -> int:
@@ -221,7 +269,7 @@ def show_notice(title: str, seconds: int, *, kind: str = "calendar") -> bool:
     root.overrideredirect(True)
     root.attributes("-topmost", True)
     root.configure(bg=colors["bg"])
-    state = {"value": False, "done": False}
+    state = {"value": None, "done": False}
 
     sans = _family(root, "Segoe UI Variable Text", "Segoe UI")
     sans_strong = _family(root, "Segoe UI Variable Text Semibold", "Segoe UI Semibold")
@@ -229,6 +277,7 @@ def show_notice(title: str, seconds: int, *, kind: str = "calendar") -> bool:
     serif = _family(root, "Georgia", "Cambria", "Times New Roman")
     eyebrow_font = tkfont.Font(root=root, family=sans_strong, size=8)
     title_font = tkfont.Font(root=root, family=serif, size=13)
+    row_font = tkfont.Font(root=root, family=serif, size=12)  # 16 px
     body_font = tkfont.Font(root=root, family=sans, size=9)
     button_font = tkfont.Font(root=root, family=sans_strong, size=10)
     count_font = tkfont.Font(root=root, family=display, size=17)
@@ -248,14 +297,53 @@ def show_notice(title: str, seconds: int, *, kind: str = "calendar") -> bool:
     eyebrow = "GRANOLA  \u00b7  " + ("RESTARTING NOTES" if kind == "crash" else "STARTING NOTES")
     canvas.create_text(text_x, y, text=eyebrow, anchor="nw", font=eyebrow_font, fill=colors["accent_text"])
     y += eyebrow_font.metrics("linespace") + px(4)
-    for line in _fit_lines(title_font, title, text_w, 2):
-        canvas.create_text(text_x, y, text=line, anchor="nw", font=title_font, fill=colors["ink"])
-        y += title_font.metrics("linespace")
+    row_tags = [f"row{index}" for index in range(len(listed))]
+    row_faces: list[int] = []
+    row_radios: list[int] = []
+    face_images: dict[str, ImageTk.PhotoImage] = {}
+    radio_images: dict[str, ImageTk.PhotoImage] = {}
+    if listed:
+        # Each row reaches past the text on both sides, so its tick lines up with the eyebrow above it.
+        row_x = text_x - px(8)
+        row_w = text_w + px(16)
+        row_pad = px(8)
+        radio = px(16)
+        row_text_x = text_x + radio + px(10)
+        row_text_w = text_x + text_w - row_text_x
+        title_h = row_font.metrics("linespace")
+        row_h = max(px(40), row_pad * 2 + title_h + px(2) + body_font.metrics("linespace"))
+        face_images = {
+            "idle": _pill_image(row_w, row_h, None, radius=px(6)),
+            "hover": _pill_image(row_w, row_h, colors["button_hover"], radius=px(6)),
+            "ticked": _pill_image(row_w, row_h, colors["accent_soft"], radius=px(6)),
+        }
+        radio_images = {
+            "off": _radio_image(radio, max(1.0, 1.5 * scale), colors["muted"], None),
+            "on": _radio_image(radio, max(1.0, 1.5 * scale), colors["accent"], colors["accent"]),
+        }
+        images.extend((*face_images.values(), *radio_images.values()))
+        for tag, (name, line) in zip(row_tags, listed):
+            row_faces.append(canvas.create_image(row_x, y, image=face_images["idle"], anchor="nw", tags=tag))
+            radio_y = y + row_pad + (title_h - radio) // 2
+            row_radios.append(canvas.create_image(row_x + row_pad, radio_y, image=radio_images["off"], anchor="nw", tags=tag))
+            text_y = y + row_pad
+            canvas.create_text(row_text_x, text_y, text=_fit_lines(row_font, name, row_text_w, 1)[0], anchor="nw", font=row_font, fill=colors["ink"], tags=tag)
+            text_y += title_h + px(2)
+            canvas.create_text(row_text_x, text_y, text=_fit_lines(body_font, line, row_text_w, 1)[0], anchor="nw", font=body_font, fill=colors["muted"], tags=tag)
+            y += row_h + px(2)
+        y -= px(2)
+    else:
+        for line in _fit_lines(title_font, title, text_w, 2):
+            canvas.create_text(text_x, y, text=line, anchor="nw", font=title_font, fill=colors["ink"])
+            y += title_font.metrics("linespace")
     y += px(4)
     status = None
+    calm = ["Granola opens when the timer runs out."]
+    if listed:
+        calm = _fit_lines(body_font, "Granola opens the ticked meeting when the timer runs out.", text_w, 2)
     if kind != "crash":
         status = canvas.create_text(text_x, y, text="", anchor="nw", font=body_font, fill=colors["muted"])
-        y += body_font.metrics("linespace")
+        y += body_font.metrics("linespace") * len(calm)
     else:
         dot = px(6)
         line_h = body_font.metrics("linespace")
@@ -312,18 +400,32 @@ def show_notice(title: str, seconds: int, *, kind: str = "calendar") -> bool:
 
     timer = {"job": None}
 
-    def finish(start: bool) -> None:
+    def finish(answer: int | None) -> None:
         # quit() rather than destroy(): destroying inside a canvas click handler crashes Tk.
         if state["done"]:
             return
         state["done"] = True
-        state["value"] = start
+        state["value"] = answer
         if timer["job"] is not None:
             root.after_cancel(timer["job"])
         root.quit()
 
     pressed = {"tag": None, "at": 0.0}
     shown_at = {"at": float("inf")}
+    ticked = {"row": 0}  # the meeting that starts, as its place in the list
+    hovered = {"row": None}
+
+    def paint_rows() -> None:
+        for index, (face, radio_item) in enumerate(zip(row_faces, row_radios)):
+            on = index == ticked["row"]
+            shade = "ticked" if on else "hover" if hovered["row"] == index else "idle"
+            canvas.itemconfigure(face, image=face_images[shade])
+            canvas.itemconfigure(radio_item, image=radio_images["on" if on else "off"])
+
+    def hover_row(index: int | None) -> None:
+        hovered["row"] = index
+        paint_rows()
+        canvas.configure(cursor="" if index is None else "hand2")
 
     def on_press(tag: str) -> None:
         pressed["tag"] = tag
@@ -334,16 +436,25 @@ def show_notice(title: str, seconds: int, *, kind: str = "calendar") -> bool:
         if was != tag:
             return
         if tag == "cancel":
-            finish(False)
+            finish(None)
             return
         x1, y1, x2, y2 = canvas.bbox(tag)
         over = x1 <= event.x <= x2 and y1 <= event.y <= y2
-        if over and pressed["at"] >= shown_at["at"] + START_NOW_DELAY_SECONDS:
-            finish(True)
+        if not over or pressed["at"] < shown_at["at"] + START_NOW_DELAY_SECONDS:
+            return
+        if tag == "start":
+            finish(ticked["row"])
+        else:
+            ticked["row"] = row_tags.index(tag)
+            paint_rows()
 
-    for tag in ("start", "cancel"):
+    for tag in ("start", "cancel", *row_tags):
         canvas.tag_bind(tag, "<ButtonPress-1>", lambda _e, t=tag: on_press(t))
         canvas.tag_bind(tag, "<ButtonRelease-1>", lambda e, t=tag: on_release(t, e))
+    for index, tag in enumerate(row_tags):
+        canvas.tag_bind(tag, "<Enter>", lambda _e, i=index: hover_row(i))
+        canvas.tag_bind(tag, "<Leave>", lambda _e: hover_row(None))
+    paint_rows()
 
     total = max(1, seconds)
     deadline = time.monotonic() + total
@@ -355,7 +466,7 @@ def show_notice(title: str, seconds: int, *, kind: str = "calendar") -> bool:
             return
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            finish(True)
+            finish(ticked["row"])
             return
         shown = math.ceil(remaining)
         step = round(RING_STEPS * remaining / total)
@@ -365,10 +476,10 @@ def show_notice(title: str, seconds: int, *, kind: str = "calendar") -> bool:
             canvas.itemconfigure(ring_item, image=ring_frame["image"])
         canvas.itemconfigure(count, text=str(shown))
         if status is not None:
-            canvas.itemconfigure(status, text="Granola opens when the timer runs out." if shown > 1 else "Opening Granola\u2026")
+            canvas.itemconfigure(status, text="\n".join(calm) if shown > 1 else "Opening Granola\u2026")
         timer["job"] = root.after(33, tick)
 
-    root.protocol("WM_DELETE_WINDOW", lambda: finish(False))
+    root.protocol("WM_DELETE_WINDOW", lambda: finish(None))
     root.update_idletasks()
     height = y
     margin = max(16, px(24))
@@ -384,7 +495,7 @@ def show_notice(title: str, seconds: int, *, kind: str = "calendar") -> bool:
     tick()
     root.mainloop()
     root.destroy()
-    return bool(state["value"])
+    return state["value"]
 
 
 def keep_display_on() -> None:
@@ -400,17 +511,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--title", required=True)
     parser.add_argument("--seconds", type=int, default=10)
     parser.add_argument("--kind", default="calendar")
+    parser.add_argument("--choices", default="", help='the meetings starting together, as JSON: [{"title": ..., "line": ...}, ...]')
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    """0 to start Granola, 1 for Cancel. __main__ turns a failure into exit code 2, with the reason logged."""
+    """0 to start Granola, 1 for Cancel, and 10 + i to start the meeting at place i of --choices. __main__ turns a failure
+    into exit code 2, with the reason logged."""
     args = build_parser().parse_args(argv)
     keep_display_on()
     # An update isn't installed while the card is up, because the installer stops every process of the app. Shared:
     # the watcher already holds it while this card starts, and a card that overlaps another keeps it up as well.
     processes.hold_mutex(processes.CARD_MUTEX, shared=True)
     try:
-        return 0 if show_notice(args.title, args.seconds, kind=args.kind) else 1
+        picked = show_notice(args.title, args.seconds, kind=args.kind, choices=parse_choices(args.choices))
+        if picked is None:
+            return 1
+        return 0 if picked == 0 else processes.CHOICE_EXIT_CODE + picked
     finally:
         processes.release_mutex(processes.CARD_MUTEX)

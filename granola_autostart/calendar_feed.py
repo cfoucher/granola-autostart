@@ -31,6 +31,11 @@ class CalendarEvent:
     end: datetime
     # Its title has a skip word. It never prompts, but a call joined during it is not asked about either.
     skipped: bool = False
+    guests: int = 0  # how many ATTENDEE entries it has: a meeting with none is likelier a reminder than a meeting
+    # Where it came from, set once the calendar is known (calendar_cache.load_feeds): its place in the Calendars list, 0
+    # for the top, and the calendar's own name.
+    calendar_rank: int = 0
+    calendar_name: str = ""
 
     def key(self) -> str:
         return f"event:{self.id}:{self.start.isoformat()}"
@@ -46,7 +51,10 @@ class CalendarEvent:
 
 def merge_events(*groups: list[CalendarEvent]) -> list[CalendarEvent]:
     """Keep one copy when the same meeting is on more than one calendar. Each calendar has already left out what it
-    declined, so a meeting starts notes when any calendar it is on kept it."""
+    declined, so a meeting starts notes when any calendar it is on kept it.
+
+    The first copy stays, so the groups must come in the order of the Calendars list: the copy kept is the one on the
+    calendar highest in it, and that is the calendar the meeting is ranked by."""
     by_key: dict[str, CalendarEvent] = {}
     for events in groups:
         for event in events:
@@ -302,6 +310,7 @@ def _component_to_event(
         start=start,
         end=end,
         skipped=skipped,
+        guests=len(_attendees(component)),
     )
 
 
@@ -320,15 +329,18 @@ def _granola_event_id(uid: str, recurrence_start: datetime | None) -> str:
     return uid
 
 
+def _attendees(component) -> list:
+    """The event's ATTENDEE entries: none, one, or several, which icalendar gives as nothing, one value, or a list."""
+    attendees = component.get("attendee")
+    if attendees is None:
+        return []
+    return attendees if isinstance(attendees, list) else [attendees]
+
+
 def _declined(component, user_emails: frozenset[str]) -> bool:
     if not user_emails:
         return False
-    attendees = component.get("attendee")
-    if attendees is None:
-        return False
-    if not isinstance(attendees, list):
-        attendees = [attendees]
-    for attendee in attendees:
+    for attendee in _attendees(component):
         email = str(attendee).split(":", 1)[-1].strip().casefold()
         partstat = str(attendee.params.get("PARTSTAT", "")).upper()
         if email in user_emails and partstat == "DECLINED":

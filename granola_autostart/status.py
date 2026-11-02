@@ -214,10 +214,11 @@ def next_meeting(events, now: datetime):
 
 
 def taking_notes(launch, now: datetime) -> tuple[str, datetime] | None:
-    """(title, since) while Granola is open for the meeting the watcher started it for."""
+    """(title, since) while Granola is open for the meeting the watcher started it for, which includes the time after
+    the meeting's end while the user is still in its call (``overrunning``)."""
     if launch is None or not launch.opened or launch.missing_since is not None:
         return None
-    if now >= launch.expires_at:
+    if now >= launch.expires_at and not launch.overrunning:
         return None
     return launch.title, launch.launched_at
 

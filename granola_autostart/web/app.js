@@ -23,6 +23,7 @@ const ICONS = {
   up: '<path d="M6 15l6-6 6 6"/>',
   down: '<path d="M6 9l6 6 6-6"/>',
   arrowUp: '<path d="M12 19V5M6 11l6-6 6 6"/>',
+  arrowDown: '<path d="M12 5v14M6 13l6 6 6-6"/>',
   wifi: '<path d="M2 9a15 15 0 0 1 20 0M5.5 12.5a10 10 0 0 1 13 0M9 16a5 5 0 0 1 6 0M12 19.5h.01"/>',
   speaker: '<path d="M4 9.5h4L13 5v14l-5-4.5H4zM16.5 9a4 4 0 0 1 0 6M19 6.5a8 8 0 0 1 0 11"/>',
   people: '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0M16 4.6a3.5 3.5 0 0 1 0 6.8M18 14.3a6.5 6.5 0 0 1 3.5 5.7"/>',
@@ -227,8 +228,9 @@ function configBanner(effect = "nothing here can change") {
     <div class="row"><button class="btn small" data-action="openConfig">Open config.json</button></div></div></div>`;
 }
 
-const INTRO = "Meetings on these calendars start notes when they begin.";
-const ORDER_NOTE = "Ones that need attention come first, and ones that are off come last.";
+// What happens when several meetings start together: the intro says it, and with many calendars so does the summary.
+const TOGETHER = "If several start together, you choose on the card. It picks one with guests first, then the higher calendar.";
+const INTRO = `Meetings on these calendars start notes when they begin. ${TOGETHER}`;
 // From this many calendars the header holds still and the list scrolls under it.
 const MANY = 5;
 // Where a calendar's addresses come from, as the page says it, for the editors in a row, Add calendar, and setup.
@@ -264,7 +266,7 @@ function calendarsSection(err) {
   if (!data.settings) return `${err}<div class="intro"><h1>Calendars</h1><p>${INTRO}</p></div>${configBanner()}`;
   const calendars = data.settings.calendars;
   const many = manyCalendars();
-  const summary = many ? `${calendars.length} calendars, ${calendars.filter((c) => c.enabled).length} on. ${ORDER_NOTE}` : INTRO;
+  const summary = many ? `${calendars.length} calendars, ${calendars.filter((c) => c.enabled).length} on. ${TOGETHER}` : INTRO;
   const head = `<div class="page-head"><div class="intro"><h1>Calendars</h1><p>${esc(summary)}</p></div>
     <button id="add-calendar" class="btn" data-action="startAdd" ${ui.adding ? "disabled" : ""}>${icon("plus", "md")}Add calendar</button></div>`;
   const list = calendars.length
@@ -280,7 +282,16 @@ function helpText() {
     “Secret address in iCal format”. Outlook: Settings, Shared calendars, Publish a calendar, then copy the ICS link.`;
 }
 
-function calendarRow(c) {
+// A row's arrows move it up or down the list, which is the order a countdown card breaks a tie by. They are always
+// there, open row or closed, and the first row's up and the last row's down are disabled.
+const moveButton = (c, step, disabled) => {
+  const way = step < 0 ? "up" : "down";
+  return `<button id="cal-${way}-${c.id}" class="icon-btn" data-action="moveCalendar" data-id="${c.id}" data-step="${step}"
+    aria-label="Move ${esc(c.name)} ${way}" ${disabled ? "disabled" : ""}>${icon(step < 0 ? "arrowUp" : "arrowDown", "md")}</button>`;
+};
+
+// Called by map, so ``at`` and ``all`` are its index and the list.
+function calendarRow(c, at, all) {
   const open = ui.open === c.id;
   const lineIcon = { ok: icon("check", "sm"), warn: icon("warn", "sm"), pending: icon("clock", "sm"), off: icon("minus", "sm") }[c.state];
   return `<div class="cal ${c.state}" role="listitem">
@@ -291,6 +302,7 @@ function calendarRow(c) {
         <div class="line ${c.state}">${lineIcon}<span>${esc(c.line)}</span></div>
       </div>
       <div class="actions">
+        <span class="moves">${moveButton(c, -1, at === 0)}${moveButton(c, 1, at === all.length - 1)}</span>
         ${toggle(`cal-switch-${c.id}`, `aria-label="Start notes for ${esc(c.name)}"`, c.enabled, "toggleCalendar", `data-id="${c.id}"`)}
         <button id="cal-open-${c.id}" class="icon-btn" data-action="toggleRow" data-id="${c.id}" aria-expanded="${open}"
           ${open ? `aria-controls="cal-detail-${c.id}"` : ""} aria-label="Settings for ${esc(c.name)}">${icon("down", "md")}</button>
@@ -423,7 +435,7 @@ function callsSection() {
 
 function notesSection() {
   const intro = `<div class="intro"><h1>Starting notes</h1>
-    <p>When a meeting begins or you join a call, a card counts down in the top-right corner. Granola opens that meeting's note when it reaches zero, unless you cancel.</p></div>`;
+    <p>Just before a meeting begins, or when you join a call, a card counts down in the top-right corner of your main display. Granola opens that meeting's note when it reaches zero, unless you cancel.</p></div>`;
   if (!data.settings) return intro + configBanner();
   const st = data.settings;
   const length = "countdown" in ui.chosen ? ui.chosen.countdown : st.countdown_seconds;
@@ -439,7 +451,7 @@ function notesSection() {
       <div id="len-label" class="label">Countdown length</div>
       <div class="row" style="gap:14px"><div class="segmented" role="radiogroup" aria-labelledby="len-label">${lengths}</div>
         <button class="btn" data-action="preview">${icon("play", "sm")}Preview</button></div>
-      <p class="small muted">Granola opens ${length} seconds after the card appears. Preview shows the card without opening Granola.</p>
+      <p class="small muted">The card appears ${length} seconds before a meeting starts, so Granola opens as it begins. Preview shows the card without opening Granola.</p>
     </section>
     <hr class="divider">
     <section class="stack" style="gap:8px" aria-labelledby="idle-label">
@@ -577,7 +589,7 @@ function welcomeStep() {
   return {
     body: `<div class="stack" style="gap:8px"><div class="eyebrow">Welcome</div>
         <h1>Start Granola notes when meetings begin</h1>
-        <p class="muted">When a meeting starts, this card appears in the corner of your screen. When the ring runs out, Granola opens that meeting's note and starts transcribing. Cancel if you don't want notes.</p></div>
+        <p class="muted">Just before a meeting starts, this card appears in the top-right corner of your main display. When the ring runs out, as the meeting begins, Granola opens its note and starts transcribing. Cancel if you don't want notes.</p></div>
       ${card()}
       <ul class="points">
         <li>${icon("video")}Calls on Zoom, Teams or Google Meet can start notes when you join.</li>
@@ -758,8 +770,16 @@ const actions = {
     if (!calendar) return;
     data = await api().set_calendar_enabled(d.id, !calendar.enabled);
     render();
-    // An off calendar sorts to the end (and an on one back up), so the page follows its switch, which keeps the focus.
-    document.getElementById(`cal-switch-${d.id}`)?.scrollIntoView({ block: "nearest" });
+  },
+  // The row stays open or closed as it was, with its Test result, which the page keeps by its id. The focus stays on the
+  // arrow that was used, or goes to the row's other one when this one can't move it any further, and the list follows the row.
+  moveCalendar: async (d) => {
+    data = await api().move_calendar(d.id, Number(d.step));
+    render();
+    const way = Number(d.step) < 0 ? ["up", "down"] : ["down", "up"];
+    const arrow = way.map((name) => document.getElementById(`cal-${name}-${d.id}`)).find((button) => button && !button.disabled);
+    arrow?.focus({ preventScroll: true });
+    arrow?.closest(".cal-main").scrollIntoView({ block: "nearest" });
   },
   askRemove: (d) => { ui.confirmRemove = d.id; render(); focusSoon(`keep-${d.id}`); },
   keepCalendar: (d) => { ui.confirmRemove = null; render(); focusSoon(`askremove-${d.id}`); },

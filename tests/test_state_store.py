@@ -29,6 +29,7 @@ def test_every_field_survives_a_restart():
             missing_since=now + timedelta(seconds=20),
             failed=True,
             call_session="teams:77",
+            overrunning=True,
         ),
         call_decided_session="teams:77",
         call_decided_at=now - timedelta(minutes=1),

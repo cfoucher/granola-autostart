@@ -1,4 +1,5 @@
 import json
+import logging
 import subprocess
 import threading
 import time
@@ -9,7 +10,7 @@ import pytest
 
 from granola_autostart import commands, processes, watcher
 from granola_autostart.calendar_feed import CalendarEvent
-from granola_autostart.decide import ActiveLaunch, Prompt, WatcherState
+from granola_autostart.decide import ActiveLaunch, Choice, Prompt, WatcherState
 from granola_autostart.settings import Calendar, Settings, config_path, save_settings
 from granola_autostart.status import find_problems, launch_problem_key, taking_notes
 
@@ -29,17 +30,23 @@ def prompt(kind: str = "calendar") -> Prompt:
 
 @pytest.fixture
 def gate(monkeypatch):
-    """The card's answer is world["accepted"]: True, False (Cancel), or None (the card couldn't run)."""
+    """The card's answer is world["accepted"]: True, False (Cancel), or None (the card couldn't run), with the
+    meeting it ticked, world["picked"], and the card is asked what it is shown in world["asked"]."""
     launches: list[tuple[str, bool]] = []
-    world = {"accepted": True, "unlocked": True, "idle": 1.0}
-    monkeypatch.setattr(watcher, "ask_notice", lambda *_args: world["accepted"])
+    world = {"accepted": True, "picked": 0, "unlocked": True, "idle": 1.0, "asked": []}
+
+    def ask(*args):
+        world["asked"].append(args)
+        return watcher.CardAnswer(world["accepted"], world["picked"])
+
+    monkeypatch.setattr(watcher, "ask_notice", ask)
     monkeypatch.setattr(watcher, "is_unlocked", lambda: world["unlocked"])
     monkeypatch.setattr(watcher, "idle_seconds", lambda: world["idle"])
     monkeypatch.setattr(watcher, "launch", lambda url, dry_run: launches.append((url, dry_run)))
 
-    def run(control=None, settings=None, kind="calendar", state=None):
+    def run(control=None, settings=None, kind="calendar", state=None, shown=None):
         state = state or WatcherState()
-        watcher.handle_prompt(prompt(kind), settings or Settings(), control or watcher.Control(), threading.Lock(), state)
+        watcher.handle_prompt(shown or prompt(kind), settings or Settings(), control or watcher.Control(), threading.Lock(), state)
         return state
 
     return world, launches, run
@@ -167,6 +174,109 @@ def test_without_a_working_card_notes_are_not_restarted_after_granola_closes(gat
     assert launches == [] and state.active_launch is None
 
 
+def meeting(title, key, guests, calendar, *call):
+    """A meeting the card lists, as decide offers it: its own key, after the call's when it is for a call."""
+    end = NOW + timedelta(minutes=15)
+    return Choice(title, {"id": key, "summary": title}, (*call, f"event:{key}"), end, NOW, end, guests, calendar)
+
+
+def together(call=(), cancel_keys=None) -> Prompt:
+    """Two meetings starting together, the stand-up first, as the watcher is handed them."""
+    standup = meeting("Chromium Team: Stand-Up", "standup", 7, "you@shift.com", *call)
+    reminder = meeting("Reload 2Captcha Credits", "reminder", 0, "Personal", *call)
+    return Prompt(
+        kind="call" if call else "calendar",
+        title=standup.title,
+        payload=standup.payload,
+        keys=standup.keys,
+        expires_at=standup.expires_at,
+        cancel_keys=cancel_keys,
+        covers=("event:reminder",),
+        call_session=call[0] if call else None,
+        choices=(standup, reminder),
+    )
+
+
+def test_the_card_is_asked_to_list_the_meetings_each_with_its_line_and_a_single_meeting_lists_none(gate):
+    world, _launches, run = gate
+    run(shown=together())
+    title, seconds, kind, listed = world["asked"][0]
+    assert (title, seconds, kind) == ("Chromium Team: Stand-Up", Settings().countdown_seconds, "calendar")
+    assert [name for name, _line in listed] == ["Chromium Team: Stand-Up", "Reload 2Captcha Credits"]
+    assert listed[0][1].endswith(" · 7 guests · you@shift.com") and listed[1][1].endswith(" · No guests · Personal")
+    run()
+    assert world["asked"][1][3] == []
+
+
+def test_the_meeting_ticked_on_the_card_is_the_one_opened_and_the_other_is_answered(gate):
+    world, launches, run = gate
+    world["picked"] = 1
+    control = watcher.Control()
+    state = run(control, shown=together())
+    [(url, _dry_run)] = launches
+    assert "reminder" in url and "standup" not in url
+    assert state.active_launch.title == "Reload 2Captcha Credits" and state.active_launch.keys == ("event:reminder",)
+    assert set(state.handled) == {"event:reminder", "event:standup"}
+    assert control.last_start.title == "Reload 2Captcha Credits"
+
+
+def test_the_first_meeting_is_opened_when_nothing_else_is_ticked_and_the_other_is_answered_too(gate):
+    _world, launches, run = gate
+    state = run(shown=together())
+    [(url, _dry_run)] = launches
+    assert "standup" in url and "reminder" not in url
+    assert set(state.handled) == {"event:standup", "event:reminder"}
+
+
+def test_a_card_that_cannot_run_starts_the_first_meeting_and_answers_both(gate):
+    world, launches, run = gate
+    world["accepted"] = None
+    state = run(shown=together())
+    assert len(launches) == 1 and "standup" in launches[0][0]
+    assert set(state.handled) == {"event:standup", "event:reminder"}
+
+
+def test_cancel_answers_every_meeting_the_card_listed_whichever_was_ticked(gate):
+    world, launches, run = gate
+    world["accepted"], world["picked"] = False, 1
+    state = run(shown=together())
+    assert launches == [] and state.active_launch is None
+    assert set(state.handled) == {"event:standup", "event:reminder"}
+
+
+def test_cancel_on_an_early_join_answers_only_the_call(gate):
+    world, launches, run = gate
+    world["accepted"] = False
+    state = run(shown=together(call=("zoom:9:100",), cancel_keys=("zoom:9:100",)))
+    assert launches == [] and set(state.handled) == {"zoom:9:100"}
+
+
+def test_a_meeting_picked_for_a_call_keeps_the_call_and_answers_the_others(gate):
+    world, launches, run = gate
+    world["picked"] = 1
+    state = run(shown=together(call=("zoom:9:100",)))
+    assert "reminder" in launches[0][0]
+    assert state.active_launch.keys == ("zoom:9:100", "event:reminder") and state.active_launch.call_session == "zoom:9:100"
+    assert set(state.handled) == {"zoom:9:100", "event:reminder", "event:standup"}
+
+
+def test_the_log_says_how_many_meetings_the_countdown_was_for_and_which_was_picked_without_the_calendars(gate, caplog):
+    world, _launches, run = gate
+    world["picked"] = 1
+    with caplog.at_level(logging.INFO, logger="granola_autostart"):
+        run(shown=together())
+    assert "countdown for Chromium Team: Stand-Up (calendar), 2 meetings" in caplog.text
+    assert "picked Reload 2Captcha Credits on the card" in caplog.text
+    assert "Personal" not in caplog.text and "you@shift.com" not in caplog.text
+    caplog.clear()
+    world["picked"] = 0
+    with caplog.at_level(logging.INFO, logger="granola_autostart"):
+        run(shown=together())
+        run()
+    assert "picked" not in caplog.text and "2 meetings" in caplog.text
+    assert "countdown for Design review (calendar)" in caplog.text and "Design review (calendar)," not in caplog.text
+
+
 def failed_launch(gate, monkeypatch, control):
     def refuse(url, dry_run):
         raise OSError("Could not open Granola (ShellExecute error 31)")
@@ -249,7 +359,31 @@ def card_process(run):
 @pytest.mark.parametrize(("exit_code", "answer"), [(0, True), (1, False), (2, None)])
 def test_the_card_says_start_cancel_or_that_it_could_not_run(exit_code, answer, monkeypatch):
     monkeypatch.setattr(watcher, "subprocess", card_process(lambda command, timeout: subprocess.CompletedProcess(command, exit_code)))
-    assert watcher.ask_notice("Design review", 10, "calendar") is answer
+    assert watcher.ask_notice("Design review", 10, "calendar") == watcher.CardAnswer(answer)
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "answer"),
+    [
+        (11, watcher.CardAnswer(True, 1)),
+        (12, watcher.CardAnswer(True, 2)),
+        (13, watcher.CardAnswer(None)),  # a third place the card never listed
+        (10, watcher.CardAnswer(None)),  # the first meeting is the plain 0
+        (0, watcher.CardAnswer(True, 0)),
+    ],
+)
+def test_the_card_names_the_meeting_it_started_in_its_exit_code(exit_code, answer, monkeypatch):
+    commands = []
+
+    def run(command, timeout):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, exit_code)
+
+    monkeypatch.setattr(watcher, "subprocess", card_process(run))
+    listed = [("Stand-up", "09:00"), ("Reminder", "09:00"), ("Review", "09:00")]
+    assert watcher.ask_notice("Stand-up", 10, "calendar", listed) == answer
+    [argument] = [part for part in commands[0] if part.startswith("--choices=")]
+    assert json.loads(argument.removeprefix("--choices=")) == [{"title": name, "line": line} for name, line in listed]
 
 
 def test_a_card_that_never_closes_or_never_starts_could_not_run(monkeypatch):
@@ -264,7 +398,7 @@ def test_a_card_that_never_closes_or_never_starts_could_not_run(monkeypatch):
 
     for run in (hang, missing):
         monkeypatch.setattr(watcher, "subprocess", card_process(run))
-        assert watcher.ask_notice("Design review", 10, "calendar") is None
+        assert watcher.ask_notice("Design review", 10, "calendar") == watcher.CardAnswer(None)
     assert timeouts[0] > 10  # the card gets its whole countdown and then some
 
 

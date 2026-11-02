@@ -64,7 +64,6 @@ COUNTDOWN_CHOICES = (5, 10, 15, 20, 30)
 IDLE_CHOICES = (1, 2, 5, 10, 15)  # minutes
 SECTIONS = ("calendars", "calls", "notes", "general")
 CALL_NAMES = {"zoom": "Zoom", "teams": "Microsoft Teams", "meet": "Google Meet"}  # as the Calls page and setup list them
-LIST_ORDER = {"warn": 0, "off": 2}  # where a calendar row sorts by its state; any other state sorts between
 # General was About before: an old shortcut or command line with --section=about, and a problem an older
 # version saved in status.json, still say so.
 SECTION_ALIASES = {"about": "general"}
@@ -273,6 +272,7 @@ class Api:
         by_id = {feed.id: feed for feed in feeds}
         owners = _owners(settings, feeds)
         calendars = []
+        # In the saved order, which is the one the page's arrows change and the one a countdown card breaks a tie by.
         for calendar in settings.distinct_calendars():
             feed = by_id.get(feed_id(calendar.url))
             state, line = calendar_line(feed, now, calendar.enabled)
@@ -304,9 +304,6 @@ class Api:
                     "lent": calendars_lent(note, owners),  # see calendars_lent
                 }
             )
-        # The page lists them as given: ones that need attention first, ones that are off last, and the rest in the
-        # order they were added (the sort is stable).
-        calendars.sort(key=lambda calendar: LIST_ORDER.get(calendar["state"], 1))
         idle_minutes = min(IDLE_CHOICES, key=lambda choice: abs(choice * 60 - settings.idle_seconds))
         return {
             "calendars": calendars,
@@ -441,6 +438,20 @@ class Api:
     def set_calendar_enabled(self, calendar_id: str, on: bool) -> dict:
         settings = load_settings()
         return self._save_calendar(settings, _find(settings, calendar_id), enabled=bool(on))
+
+    def move_calendar(self, calendar_id: str, step: int) -> dict:
+        """Move a calendar one place up (``step`` -1) or down (1) in the saved order, which is the order the page lists
+        them in. A calendar that has gone, one already at that end, and any other step are left alone. Places are
+        counted among the calendars as listed, so an address saved twice, which is one calendar, doesn't take one."""
+        step = int(step)
+        settings = load_settings()
+        calendars = settings.distinct_calendars()
+        at = next((index for index, calendar in enumerate(calendars) if feed_id(calendar.url) == calendar_id), None)
+        if step not in (-1, 1) or at is None or not 0 <= at + step < len(calendars):
+            return self.load()
+        calendars[at], calendars[at + step] = calendars[at + step], calendars[at]
+        log.info("calendar moved from Settings")
+        return self._save(settings, calendars=tuple(calendars))
 
     def add_declined(self, calendar_id: str, address: str) -> dict:
         """Add an address a calendar's declines count for. The first one added to an automatic calendar

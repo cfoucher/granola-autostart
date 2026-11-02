@@ -1,4 +1,5 @@
 import ctypes
+import json
 import logging
 import math
 import re
@@ -9,7 +10,7 @@ import pytest
 
 import granola_autostart
 import granola_autostart.__main__ as entry
-from granola_autostart import notice, processes, settings, watcher
+from granola_autostart import decide, notice, processes, settings, watcher
 from granola_autostart.notice import keep_display_on as real_keep_display_on
 from granola_autostart.notice import show_notice as real_show_notice
 
@@ -62,20 +63,34 @@ def test_a_card_that_cannot_even_load_is_not_a_cancel_and_says_why(monkeypatch, 
     assert "the countdown card failed" in (tmp_path / "notice-log.txt").read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize(("started", "exit_code"), [(True, 0), (False, 1)])
-def test_the_exit_code_tells_the_watcher_whether_to_start_granola(started, exit_code, monkeypatch):
+@pytest.mark.parametrize(("picked", "exit_code"), [(0, 0), (None, 1), (1, 11), (3, 13)])
+def test_the_exit_code_tells_the_watcher_whether_to_start_granola_and_which_meeting(picked, exit_code, monkeypatch):
     shown = []
-    monkeypatch.setattr(notice, "show_notice", lambda title, seconds, *, kind: shown.append((title, seconds, kind)) or started)
+    monkeypatch.setattr(notice, "show_notice", lambda title, seconds, *, kind, choices: shown.append((title, seconds, kind, choices)) or picked)
     assert run(monkeypatch, "--notice", "--title=-- standup", "--seconds=7", "--kind=crash") == exit_code
-    assert shown == [("-- standup", 7, "crash")]
+    assert shown == [("-- standup", 7, "crash", [])]
+
+
+def test_the_card_is_given_the_meetings_it_lists_and_a_malformed_list_is_none(monkeypatch):
+    shown = []
+    monkeypatch.setattr(notice, "show_notice", lambda title, seconds, *, kind, choices: shown.append(choices) or 0)
+    listed = json.dumps([{"title": "Stand-up", "line": "09:00"}, {"title": "Reminder"}])
+    assert run(monkeypatch, "--notice", "--title=Stand-up", f"--choices={listed}") == 0
+    assert run(monkeypatch, "--notice", "--title=Stand-up", "--choices={not json") == 0
+    assert shown == [[("Stand-up", "09:00"), ("Reminder", "")], []]
+
+
+def test_the_exit_codes_are_the_ones_the_module_documents():
+    assert processes.CHOICE_EXIT_CODE == 10 and "10 + i" in notice.__doc__
+    assert notice.MAX_CHOICES == decide.MAX_CHOICES
 
 
 def test_a_card_holds_the_card_mutex_while_it_is_up_so_an_update_waits_for_it(monkeypatch):
     seen = []
 
-    def card(title, seconds, *, kind):
+    def card(title, seconds, *, kind, choices):
         seen.append(processes.card_showing())
-        return True
+        return 0
 
     monkeypatch.setattr(notice, "show_notice", card)
     assert not processes.card_showing()
@@ -87,10 +102,10 @@ def test_a_card_keeps_the_card_mutex_up_when_the_watcher_or_another_card_that_he
     seen = []
     watcher_lets_go = held_elsewhere(processes.CARD_MUTEX)  # the watcher holds it while the card starts
 
-    def card(title, seconds, *, kind):
+    def card(title, seconds, *, kind, choices):
         watcher_lets_go()  # a card that overlapped this one closed, or the watcher's hold ended
         seen.append(processes.card_showing())
-        return True
+        return 0
 
     monkeypatch.setattr(notice, "show_notice", card)
     assert notice.main(["--title=Standup"]) == 0
@@ -165,7 +180,7 @@ class Canvas:
         self.bindings.setdefault(tag, {})[sequence] = handler
 
     def bbox(self, tag):
-        [face] = [item for item in self.items.values() if item["kind"] == "image" and item.get("tags") == tag]
+        face = next(item for item in self.items.values() if item["kind"] == "image" and item.get("tags") == tag)  # a row's first
         x, y = face["coords"]
         return x, y, x + face["image"].width, y + face["image"].height
 
@@ -216,7 +231,7 @@ class Card:
 
     def __init__(self):
         self.now = 1000.0
-        self.monitor = (0, 0, 1920, 1040, 96)  # the work area and DPI of the monitor under the pointer
+        self.monitor = (0, 0, 1920, 1040, 96)  # the work area and DPI of the primary monitor
         self.theme = "light"
         self.user = lambda card: None
         self.styled = []
@@ -251,10 +266,10 @@ class Card:
     def close(self) -> None:
         self.root.protocols["WM_DELETE_WINDOW"]()
 
-    def show(self, title: str = "Design review", seconds: int = 10, kind: str = "calendar") -> tuple[bool, float]:
-        """The card's answer, and how long after it appeared it closed."""
+    def show(self, title: str = "Design review", seconds: int = 10, kind: str = "calendar", choices=()) -> tuple[int | None, float]:
+        """The card's answer (the meeting to start, or None for Cancel), and how long after it appeared it closed."""
         shown = self.now
-        answer = real_show_notice(title, seconds, kind=kind)
+        answer = real_show_notice(title, seconds, kind=kind, choices=choices)
         assert self.root.destroyed
         return answer, self.root.ended_at - shown
 
@@ -268,7 +283,7 @@ def card(monkeypatch) -> Card:
     monkeypatch.setattr(notice, "time", SimpleNamespace(monotonic=lambda: harness.now))
     monkeypatch.setattr(notice, "per_monitor_dpi", lambda: None)
     monkeypatch.setattr(notice, "app_theme", lambda: harness.theme)
-    monkeypatch.setattr(notice, "_monitor_at_cursor", lambda: harness.monitor)
+    monkeypatch.setattr(notice, "_primary_monitor", lambda: harness.monitor)
     monkeypatch.setattr(notice, "_wrapper_hwnd", lambda root: 0x10)
     monkeypatch.setattr(notice, "_style_card", lambda hwnd, *, border: harness.styled.append((hwnd, border)))
     return harness
@@ -283,16 +298,16 @@ def test_the_countdown_running_out_starts_granola(card):
         statuses.append([text for text in card.texts() if "Granola" in text][-1])
 
     card.user = user
-    assert card.show(seconds=10) == (True, 10)
+    assert card.show(seconds=10) == (0, 10)
     assert statuses == ["Granola opens when the timer runs out.", "Opening Granola…"]
     assert "GRANOLA  ·  STARTING NOTES" in card.texts()
 
 
 def test_cancel_and_the_close_button_both_say_no_at_once(card):
     card.user = lambda card: card.click("cancel")
-    assert card.show() == (False, 0)
+    assert card.show() == (None, 0)
     card.user = lambda card: (card.close(), card.close())
-    assert card.show() == (False, 0)
+    assert card.show() == (None, 0)
 
 
 def test_start_now_starts_granola_but_not_a_click_already_on_its_way(card):
@@ -306,7 +321,7 @@ def test_start_now_starts_granola_but_not_a_click_already_on_its_way(card):
         card.click("start")
 
     card.user = user
-    assert card.show() == (True, 1)
+    assert card.show() == (0, 1)
 
 
 def test_letting_go_outside_start_now_starts_nothing(card):
@@ -317,7 +332,7 @@ def test_letting_go_outside_start_now_starts_nothing(card):
         card.click("cancel")
 
     card.user = user
-    assert card.show() == (False, 1)
+    assert card.show() == (None, 1)
 
 
 def test_the_buttons_light_up_under_the_pointer(card):
@@ -350,11 +365,11 @@ def test_a_long_title_takes_two_lines_and_an_ellipsis(card):
     assert "Meeting" in card.texts()
 
 
-def test_the_card_sits_in_the_top_right_corner_of_the_pointer_s_screen(card):
-    card.monitor = (1920, 0, 3840, 1040, 144)  # a second display, at 150%
+def test_the_card_sits_in_the_top_right_corner_of_the_primary_monitor(card):
+    card.monitor = (0, 0, 2560, 1400, 144)  # the primary monitor, at 150%
     card.show()
     width, x, y = (int(part) for part in re.fullmatch(r"(\d+)x\d+\+(\d+)\+(\d+)", card.root.size).groups())
-    assert (width, x, y) == (606, 3840 - 606 - 36, 36)
+    assert (width, x, y) == (606, 2560 - 606 - 36, 36)
     assert card.styled == [(0x10, notice.PALETTES["light"]["border"])]
 
 
@@ -365,6 +380,177 @@ def test_a_card_too_tall_for_the_screen_keeps_its_top_on_screen(card):
     height, y = (int(part) for part in re.fullmatch(r"\d+x(\d+)\+\d+\+(\d+)", card.root.size).groups())
     assert height > 150 and y == 100
     assert card.canvas.options["bg"] == notice.PALETTES["dark"]["bg"]
+
+
+STANDUP = ("Chromium Team: Stand-Up", "09:00\u201309:15 \u00b7 7 guests")
+REMINDER = ("Reload 2Captcha Credits", "09:00\u201309:15 \u00b7 No guests")
+ACCENT_SOFT = (0xE8, 0xEF, 0xDF, 255)
+BUTTON_HOVER = (0xF1, 0xEA, 0xDB, 255)
+
+
+def row_images(card, index):
+    """A row's background and its radio button."""
+    return [item for item in card.canvas.items.values() if item["kind"] == "image" and item.get("tags") == f"row{index}"]
+
+
+def middle(item):
+    image = item["image"]
+    return image.getpixel((image.width // 2, image.height // 2))
+
+
+def ticked_rows(card):
+    rows = sorted(tag for tag in card.canvas.bindings if tag.startswith("row"))
+    return [middle(row_images(card, index)[0]) == ACCENT_SOFT for index in range(len(rows))]
+
+
+def row_press(card, index, *, wait=0):
+    card.wait(wait)
+    card.click(f"row{index}")
+
+
+def test_a_card_for_meetings_starting_together_lists_them_with_the_first_ticked(card):
+    calm = []
+    card.user = lambda card: calm.append(" ".join(" ".join(text.split()) for text in card.texts()))
+    card.show(choices=[STANDUP, REMINDER])
+    texts = card.texts()
+    assert "GRANOLA  \u00b7  STARTING NOTES" in texts
+    assert [text for text in texts if text in STANDUP + REMINDER] == [*STANDUP, *REMINDER]
+    assert "Design review" not in texts  # the rows take the title's place
+    assert "Granola opens the ticked meeting when the timer runs out." in calm[0]
+    assert ticked_rows(card) == [True, False]
+    on, off = (row_images(card, index)[1] for index in (0, 1))
+    assert middle(on) == (0x5A, 0x8A, 0x47, 255)  # a ring in the accent colour with a dot in it
+    assert middle(off)[3] == 0 and off["image"].getpixel((0, off["image"].height // 2))[3] > 100  # a ring and nothing in it
+    assert middle(row_images(card, 1)[0])[3] == 0  # no background until it is ticked or pointed at
+
+
+def test_the_card_lists_at_most_four_meetings_and_a_single_one_or_a_crash_card_none(card):
+    card.show(choices=[(f"Meeting {number}", "") for number in range(6)])
+    assert [tag for tag in card.canvas.bindings if tag.startswith("row")] == ["row0", "row1", "row2", "row3"]
+    for choices, kind in (([STANDUP], "calendar"), ([STANDUP, REMINDER], "crash"), ([], "calendar")):
+        card.show(title="Design review", kind=kind, choices=choices)
+        assert not any(tag.startswith("row") for tag in card.canvas.bindings)
+        assert [item["font"].family for item in card.canvas.items.values() if item.get("text") == "Design review"] == ["Georgia"]
+        if kind == "crash":
+            assert "Granola closed. Starting again unless you cancel." in " ".join(card.texts())
+
+
+def test_clicking_a_meeting_ticks_it_and_the_countdown_carries_on_to_start_it(card):
+    def user(card):
+        row_press(card, 1, wait=1)
+        assert ticked_rows(card) == [False, True] and card.root.ended_at is None
+        assert middle(row_images(card, 1)[1]) == (0x5A, 0x8A, 0x47, 255) and middle(row_images(card, 0)[1])[3] == 0
+        row_press(card, 0, wait=1)  # and back
+        assert ticked_rows(card) == [True, False]
+        row_press(card, 1, wait=1)
+
+    card.user = user
+    assert card.show(choices=[STANDUP, REMINDER]) == (1, 10)  # the timer was never restarted
+
+
+def test_start_now_starts_the_ticked_meeting_and_cancel_starts_none(card):
+    card.user = lambda card: (row_press(card, 1, wait=1), card.click("start"))
+    assert card.show(choices=[STANDUP, REMINDER]) == (1, 1)
+    card.user = lambda card: (row_press(card, 1, wait=1), card.click("cancel"))
+    assert card.show(choices=[STANDUP, REMINDER]) == (None, 1)
+
+
+def test_a_click_already_on_its_way_does_not_change_the_pick(card):
+    def user(card):
+        card.click("row1")  # the moment the card appeared
+        assert ticked_rows(card) == [True, False]
+        card.wait(1)
+        x1, y1, _x2, _y2 = card.canvas.bbox("row1")
+        card.canvas.bindings["row1"]["<ButtonRelease-1>"](SimpleNamespace(x=x1 + 2, y=y1 + 2))  # pressed elsewhere
+        assert ticked_rows(card) == [True, False]
+        card.click("row1", let_go_outside=True)
+        assert ticked_rows(card) == [True, False]
+        card.click("row1")
+        assert ticked_rows(card) == [False, True]
+
+    card.user = user
+    assert card.show(choices=[STANDUP, REMINDER])[0] == 1
+
+
+def test_the_rows_light_up_under_the_pointer_unless_they_are_ticked(card):
+    def user(card):
+        second = card.canvas.bindings["row1"]
+        second["<Enter>"](None)
+        assert middle(row_images(card, 1)[0]) == BUTTON_HOVER and card.canvas.options["cursor"] == "hand2"
+        second["<Leave>"](None)
+        assert middle(row_images(card, 1)[0])[3] == 0 and card.canvas.options["cursor"] == ""
+        card.canvas.bindings["row0"]["<Enter>"](None)
+        assert ticked_rows(card) == [True, False]  # the ticked one keeps its own colour
+
+    card.user = user
+    card.show(choices=[STANDUP, REMINDER])
+
+
+@pytest.mark.parametrize(("dpi", "height"), [(96, 40), (144, 60)])
+def test_a_row_is_at_least_40_pixels_tall_scaled_for_the_screen(dpi, height, card, monkeypatch):
+    class Small(Font):
+        def metrics(self, name):
+            return 4
+
+    monkeypatch.setattr(notice, "tkfont", SimpleNamespace(Font=Small, families=lambda root: ("Segoe UI", "Georgia")))
+    card.monitor = (0, 0, 1920, 1040, dpi)
+    card.show(choices=[STANDUP, REMINDER])
+    assert [row_images(card, index)[0]["image"].height for index in (0, 1)] == [height, height]
+
+
+def test_the_card_grows_with_its_rows_and_stays_in_the_work_area(card):
+    def size():
+        return [int(part) for part in re.fullmatch(r"(\d+)x(\d+)\+(\d+)\+(\d+)", card.root.size).groups()]
+
+    card.show(choices=[STANDUP, REMINDER])
+    two = size()
+    card.show(choices=[STANDUP, REMINDER, STANDUP, REMINDER])
+    four = size()
+    assert four[1] - two[1] == 2 * 52  # two more rows of 50 pixels, and the gap between rows
+    card.monitor = (0, 0, 1920, 380, 96)  # too short for it at the usual place, but tall enough for all of it
+    card.show(choices=[STANDUP, REMINDER, STANDUP, REMINDER])
+    _width, height, _x, y = size()
+    assert y < 24 and y + height <= 380
+
+
+def test_a_long_title_or_line_stays_on_one_row_line_and_ends_in_an_ellipsis(card):
+    card.show(choices=[("Quarterly planning review " * 5, "09:00\u201309:15 \u00b7 " + "a long calendar name " * 6), ("Standup\n\t ", " ")])
+    rows = [item for item in card.canvas.items.values() if item["kind"] == "text" and item.get("tags") in ("row0", "row1")]
+    first_title, first_line, second_title, second_line = (item["text"] for item in rows)
+    assert first_title.endswith("\u2026") and first_line.endswith("\u2026") and "\n" not in first_title + first_line
+    assert (second_title, second_line) == ("Standup", "")
+    card.show(choices=[(" \n ", "x"), ("b", "y")])
+    assert "Meeting" in card.texts()
+
+
+def test_the_card_for_meetings_says_opening_granola_for_the_last_second(card):
+    statuses = []
+
+    def user(card):
+        statuses.append([text for text in card.texts() if "Granola" in text and "GRANOLA" not in text][-1])
+        card.wait(9.25)
+        statuses.append([text for text in card.texts() if "Granola" in text and "GRANOLA" not in text][-1])
+
+    card.user = user
+    card.show(choices=[STANDUP, REMINDER])
+    assert [" ".join(text.split()) for text in statuses] == ["Granola opens the ticked meeting when the timer runs out.", "Opening Granola\u2026"]
+
+
+def test_the_palettes_have_the_ticked_row_s_colour():
+    assert (notice.PALETTES["light"]["accent_soft"], notice.PALETTES["dark"]["accent_soft"]) == ("#e8efdf", "#2c3627")
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["", "{not json", '{"title": "Stand-up"}', '"Stand-up"', "[1]", '[{"line": "09:00"}]', '[{"title": 1}]', '[{"title": "a", "line": 2}]', '[{"title": "a"}, null]'],
+)
+def test_choices_that_are_missing_or_malformed_are_none_at_all(text):
+    assert notice.parse_choices(text) == []
+
+
+def test_choices_are_titles_and_lines_and_a_line_may_be_left_out():
+    assert notice.parse_choices('[{"title": "Stand-up", "line": "09:00"}, {"title": "Reminder"}]') == [("Stand-up", "09:00"), ("Reminder", "")]
+    assert notice.parse_choices("[]") == []
 
 
 def test_words_wrap_and_a_word_wider_than_the_line_is_broken():
@@ -407,7 +593,12 @@ def fake_ctypes(monkeypatch, **dlls) -> None:
 
 
 def monitor_user32(work: tuple[int, int, int, int] | None) -> SimpleNamespace:
-    """The pointer's monitor has ``work`` as its work area; None when Windows won't say."""
+    """The primary monitor has ``work`` as its work area; None when Windows won't say. ``lookups`` has each
+    monitor asked for, as ((x, y), flags)."""
+
+    def monitor_from_point(point, flags):
+        user32.lookups.append(((point.x, point.y), flags))
+        return 0x99
 
     def monitor_info(monitor, info):
         if work is None:
@@ -416,27 +607,30 @@ def monitor_user32(work: tuple[int, int, int, int] | None) -> SimpleNamespace:
         area.left, area.top, area.right, area.bottom = work
         return True
 
-    return SimpleNamespace(
-        GetCursorPos=lambda point: True,
-        MonitorFromPoint=lambda point, flags: 0x99,
+    user32 = SimpleNamespace(
+        lookups=[],
+        MonitorFromPoint=monitor_from_point,
         GetMonitorInfoW=monitor_info,
         GetSystemMetrics=lambda index: (2560, 1440)[index],
     )
+    return user32
 
 
-def test_the_card_measures_the_monitor_under_the_pointer(monkeypatch):
+def test_the_card_measures_the_primary_monitor(monkeypatch):
     def dpi(monitor, kind, dpi_x, dpi_y):
         dpi_y._obj.value = 144
 
-    fake_ctypes(monkeypatch, user32=monitor_user32((1920, 0, 3840, 1040)), shcore=SimpleNamespace(GetDpiForMonitor=dpi))
-    assert notice._monitor_at_cursor() == (1920, 0, 3840, 1040, 144)
+    user32 = monitor_user32((0, 0, 2560, 1400))
+    fake_ctypes(monkeypatch, user32=user32, shcore=SimpleNamespace(GetDpiForMonitor=dpi))
+    assert notice._primary_monitor() == (0, 0, 2560, 1400, 144)
+    assert user32.lookups == [((0, 0), 1)]  # (0, 0), with MONITOR_DEFAULTTOPRIMARY
 
 
 def test_without_per_monitor_dpi_or_monitor_details_the_card_still_finds_a_place(monkeypatch):
     fake_ctypes(monkeypatch, user32=monitor_user32((0, 0, 1920, 1040)))  # Windows 8.0 has no shcore
-    assert notice._monitor_at_cursor() == (0, 0, 1920, 1040, 96)
+    assert notice._primary_monitor() == (0, 0, 1920, 1040, 96)
     fake_ctypes(monkeypatch, user32=monitor_user32(None))
-    assert notice._monitor_at_cursor() == (0, 0, 2560, 1440, 96)
+    assert notice._primary_monitor() == (0, 0, 2560, 1440, 96)
 
 
 def test_the_card_is_styled_through_tk_s_wrapper_window(monkeypatch):

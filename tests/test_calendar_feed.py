@@ -91,6 +91,44 @@ def test_feed_keeps_timed_meetings_and_google_instance_ids():
     assert weekly[0].start == datetime(2026, 10, 28, 17, 0, tzinfo=timezone.utc)
 
 
+GUESTS = """BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:reminder@google.com
+SUMMARY:Reload credits
+DTSTART:20261028T170000Z
+DTEND:20261028T171500Z
+END:VEVENT
+BEGIN:VEVENT
+UID:one@google.com
+SUMMARY:One on one
+DTSTART:20261028T170000Z
+DTEND:20261028T173000Z
+ATTENDEE;PARTSTAT=ACCEPTED:mailto:conrad@example.com
+END:VEVENT
+BEGIN:VEVENT
+UID:standup@google.com
+SUMMARY:Stand-up
+DTSTART:20261028T170000Z
+DTEND:20261028T171500Z
+ATTENDEE;PARTSTAT=ACCEPTED:mailto:conrad@example.com
+ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:ana@example.com
+ATTENDEE;PARTSTAT=DECLINED:mailto:ben@example.com
+END:VEVENT
+END:VCALENDAR
+"""
+
+
+def test_a_meeting_s_guests_are_the_attendees_it_lists_declined_ones_included():
+    start = datetime(2026, 10, 28, 16, 0, tzinfo=timezone.utc)
+    events = events_between(GUESTS, start, start + timedelta(hours=4))
+    assert {event.summary: event.guests for event in events} == {"Reload credits": 0, "One on one": 1, "Stand-up": 3}
+    # Which calendar a meeting is on isn't known here, and Granola is told nothing of guests or calendars.
+    standup = next(event for event in events if event.summary == "Stand-up")
+    assert (standup.calendar_rank, standup.calendar_name) == (0, "")
+    assert set(standup.payload()) == {"id", "summary", "start", "end"}
+
+
 LONE_INSTANCE = """BEGIN:VCALENDAR
 VERSION:2.0
 PRODID:-//granola-autostart//test//EN

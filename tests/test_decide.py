@@ -4,14 +4,26 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from granola_autostart.calendar_feed import CalendarEvent
-from granola_autostart.decide import CALL_HOLD, HANDLED_GRACE, ActiveLaunch, Prompt, Snapshot, WatcherState, apply_result, evaluate
+from granola_autostart.decide import (
+    CALL_HOLD,
+    HANDLED_GRACE,
+    MAX_CHOICES,
+    ActiveLaunch,
+    Choice,
+    Prompt,
+    Snapshot,
+    WatcherState,
+    apply_result,
+    evaluate,
+)
+from granola_autostart.status import taking_notes
 
 NOW = datetime(2026, 10, 28, 17, 0, tzinfo=timezone.utc)
 LOOKAHEAD = timedelta(minutes=10)
 
 
-def event(summary="Design review", start=NOW, minutes=30, event_id="abc123", skipped=False):
-    return CalendarEvent(id=event_id, summary=summary, start=start, end=start + timedelta(minutes=minutes), skipped=skipped)
+def event(summary="Design review", start=NOW, minutes=30, event_id="abc123", skipped=False, **marks):
+    return CalendarEvent(id=event_id, summary=summary, start=start, end=start + timedelta(minutes=minutes), skipped=skipped, **marks)
 
 
 def snap(**overrides) -> Snapshot:
@@ -37,9 +49,9 @@ def zoom_join(session="9:100", age=1, title=None, **overrides) -> Snapshot:
     return call_join("zoom", session, age, title, **overrides)
 
 
-def decide(snapshot, state=None, now=NOW, skip_words=()):
+def decide(snapshot, state=None, now=NOW, skip_words=(), lead=timedelta(0)):
     state = state or WatcherState()
-    prompt = evaluate(now, snapshot, state, lookahead=LOOKAHEAD, fresh_call_seconds=120, skip_words=skip_words)
+    prompt = evaluate(now, snapshot, state, lookahead=LOOKAHEAD, fresh_call_seconds=120, skip_words=skip_words, lead=lead)
     return prompt, state
 
 
@@ -496,12 +508,12 @@ def test_a_double_booking_asks_once():
     assert prompt is None
 
 
-def test_cancelling_one_of_two_overlapping_meetings_asks_about_the_other():
+def test_cancelling_two_overlapping_meetings_answers_both_because_the_card_listed_both():
     standup = event(summary="Standup", start=NOW - timedelta(minutes=20), event_id="early")
     review = event(summary="Design review", start=NOW - timedelta(minutes=1), event_id="later")
     state = answered(snap(events=(standup, review)), accepted=False)
     prompt, _state = decide(snap(events=(standup, review)), state, now=NOW + timedelta(seconds=5))
-    assert prompt is not None and prompt.title == "Standup"
+    assert prompt is None
 
 
 def test_starting_notes_from_a_zoom_join_answers_the_other_meeting_under_way():
@@ -739,3 +751,412 @@ def test_an_adhoc_answer_does_not_answer_the_meeting_of_the_next_call():
     state = answered(next_call, accepted=False, state=state, now=NOW + timedelta(minutes=1))  # "still in the last one"
     prompt, _state = decide(next_call, state, now=review.start + timedelta(seconds=5))
     assert prompt is not None and prompt.title == "Design review"
+
+
+def reminder_and_standup():
+    """Two meetings that start together: a reminder with no guests, which the feed lists first, and a stand-up with 7."""
+    reminder = event("Reload 2Captcha Credits", event_id="reminder", minutes=15, calendar_name="Personal")
+    standup = event("Chromium Team: Stand-Up", event_id="standup", minutes=15, guests=7, calendar_name="you@shift.com")
+    return reminder, standup
+
+
+def test_a_meeting_with_guests_is_the_default_over_a_reminder_the_feed_lists_first():
+    reminder, standup = reminder_and_standup()
+    prompt, _state = decide(snap(events=(reminder, standup)))
+    assert (prompt.title, prompt.keys) == ("Chromium Team: Stand-Up", (standup.key(),))
+    assert [choice.title for choice in prompt.choices] == ["Chromium Team: Stand-Up", "Reload 2Captcha Credits"]
+
+
+EARLIER = NOW - timedelta(minutes=20)
+
+
+@pytest.mark.parametrize(
+    ("winner_marks", "loser_marks"),
+    [
+        (dict(guests=1, start=EARLIER), dict(guests=0)),  # guests beat a later start
+        (dict(guests=1, calendar_rank=3), dict(guests=0, calendar_rank=0)),  # and a calendar higher in the list
+        (dict(guests=2), dict(guests=9, calendar_rank=1)),  # how many guests doesn't matter: the calendar decides
+        (dict(start=EARLIER, calendar_rank=0), dict(calendar_rank=1)),  # the higher calendar beats a later start
+        (dict(), dict(start=EARLIER)),  # the later start decides when nothing else does
+    ],
+)
+def test_the_default_among_meetings_under_way_goes_by_guests_then_calendar_then_the_later_start(winner_marks, loser_marks):
+    winner = event("Winner", event_id="winner", **winner_marks)
+    loser = event("Loser", event_id="loser", **loser_marks)
+    for events in ((winner, loser), (loser, winner)):
+        prompt, _state = decide(snap(events=events))
+        assert prompt.title == "Winner" and [choice.title for choice in prompt.choices] == ["Winner", "Loser"]
+
+
+def test_meetings_that_tie_on_everything_keep_the_order_of_the_feed():
+    first = event("First", event_id="first", guests=2)
+    second = event("Second", event_id="second", guests=5)
+    for events in ((first, second), (second, first)):
+        prompt, _state = decide(snap(events=events))
+        assert prompt.title == events[0].summary
+
+
+def test_joining_early_prefers_guests_then_the_calendar_and_then_the_earlier_start():
+    soon = event("Soon", start=NOW + timedelta(minutes=5), event_id="soon")
+    sooner = event("Sooner", start=NOW + timedelta(minutes=3), event_id="sooner")
+
+    def chosen(*events):
+        prompt, _state = decide(zoom_join(events=events))
+        return prompt.title
+
+    assert chosen(soon, sooner) == "Sooner"
+    assert chosen(replace(soon, guests=1), sooner) == "Soon"
+    assert chosen(replace(soon, guests=1, calendar_rank=1), replace(sooner, guests=1)) == "Sooner"
+    assert chosen(replace(soon, calendar_rank=1), sooner) == "Sooner"
+
+
+def test_meetings_starting_together_are_listed_with_the_default_first_and_matching_the_prompt():
+    reminder, standup = reminder_and_standup()
+    prompt, _state = decide(snap(events=(reminder, standup)))
+    first, second = prompt.choices
+    assert (first.title, first.payload, first.keys, first.expires_at) == (prompt.title, prompt.payload, prompt.keys, prompt.expires_at)
+    assert (first.start, first.end, first.guests, first.calendar_name) == (NOW, NOW + timedelta(minutes=15), 7, "you@shift.com")
+    assert (second.title, second.payload, second.keys, second.guests, second.calendar_name) == (
+        "Reload 2Captcha Credits",
+        reminder.payload(),
+        (reminder.key(),),
+        0,
+        "Personal",
+    )
+    assert prompt.covers == (reminder.key(),)
+
+
+def test_there_is_nothing_to_choose_with_one_meeting_a_skipped_one_or_an_answered_one():
+    standup = event("Stand-up", guests=7, event_id="standup")
+    lunch = event("Lunch", skipped=True, event_id="lunch")
+    answered_one = event("Other", event_id="other")
+    prompt, _state = decide(snap(events=(standup, lunch)))
+    assert prompt.title == "Stand-up" and prompt.choices == ()
+    prompt, _state = decide(snap(events=(standup, answered_one)), WatcherState(handled={answered_one.key(): answered_one.end}))
+    assert prompt.title == "Stand-up" and prompt.choices == ()
+
+
+def test_the_card_lists_at_most_four_meetings_and_cancel_leaves_the_fifth_to_ask():
+    five = tuple(event(f"Meeting {number}", event_id=f"m{number}", start=NOW - timedelta(minutes=number)) for number in range(5))
+    prompt, state = decide(snap(events=five))
+    assert MAX_CHOICES == 4 and [choice.title for choice in prompt.choices] == [f"Meeting {number}" for number in range(4)]
+    assert prompt.covers == tuple(meeting.key() for meeting in five[1:])  # starting notes answers the fifth too
+    apply_result(state, prompt, accepted=False, now=NOW)
+    assert set(state.handled) == {meeting.key() for meeting in five[:4]}
+    prompt, _state = decide(snap(events=five), state, now=NOW + timedelta(seconds=5))
+    assert prompt.title == "Meeting 4" and prompt.choices == ()
+
+
+def test_a_call_joined_while_meetings_are_under_way_lists_them_with_the_call_in_each_one_s_keys():
+    reminder, standup = reminder_and_standup()
+    prompt, _state = decide(zoom_join(events=(reminder, standup)))
+    assert prompt.kind == "call" and prompt.title == "Chromium Team: Stand-Up"
+    assert [choice.keys for choice in prompt.choices] == [("zoom:9:100", standup.key()), ("zoom:9:100", reminder.key())]
+    assert prompt.choices[0].keys == prompt.keys and prompt.cancel_keys is None
+
+
+def joined_early_for_two_meetings():
+    ending = event("Standup", start=NOW - timedelta(minutes=25), minutes=30, event_id="ending")
+    review = event("Design review", start=NOW + timedelta(minutes=5), event_id="review", guests=4)
+    vendor = event("Vendor call", start=NOW + timedelta(minutes=5), event_id="vendor")
+    prompt, state = decide(zoom_join("4:10", age=3, events=(ending, vendor, review)))
+    return (ending, review, vendor), prompt, state
+
+
+def test_joining_early_lists_the_meetings_about_to_start_and_not_the_one_ending():
+    (ending, review, vendor), prompt, _state = joined_early_for_two_meetings()
+    assert prompt.title == "Design review" and [choice.title for choice in prompt.choices] == ["Design review", "Vendor call"]
+    assert prompt.choices[0].keys == prompt.keys == ("zoom:4:10", review.key())
+    assert prompt.covers == (ending.key(), vendor.key())
+
+
+def test_cancelling_an_early_join_answers_only_the_call_so_the_meetings_keep_their_own_cards():
+    (_ending, review, vendor), prompt, state = joined_early_for_two_meetings()
+    assert prompt.cancel_keys == ("zoom:4:10",)
+    apply_result(state, prompt, accepted=False, now=NOW)
+    assert set(state.handled) == {"zoom:4:10"}
+    at_start = review.start + timedelta(seconds=5)
+    prompt, _state = decide(snap(events=(review, vendor)), state, now=at_start)
+    assert prompt.kind == "calendar" and [choice.title for choice in prompt.choices] == ["Design review", "Vendor call"]
+
+
+def test_an_ad_hoc_call_a_skipped_meeting_and_a_crash_card_list_no_choices():
+    prompt, _state = decide(zoom_join(title="Hallway chat"))
+    assert prompt.kind == "call" and prompt.choices == ()
+    reminder, standup = reminder_and_standup()
+    state = answered(snap(events=(reminder, standup)), accepted=True)
+    decide(snap(events=(reminder, standup), granola_running=True), state, now=NOW + timedelta(seconds=5))
+    gone = NOW + timedelta(seconds=30)
+    decide(snap(events=(reminder, standup)), state, now=gone)
+    crash, _state = decide(snap(events=(reminder, standup)), state, now=gone + timedelta(seconds=10))
+    assert crash.kind == "crash" and crash.choices == ()
+
+
+def test_picking_another_meeting_gives_its_notes_and_answers_the_others():
+    reminder, standup = reminder_and_standup()
+    prompt, state = decide(snap(events=(reminder, standup)))
+    picked = prompt.picked(1)
+    assert (picked.kind, picked.title, picked.payload, picked.keys, picked.expires_at) == (
+        "calendar",
+        "Reload 2Captcha Credits",
+        reminder.payload(),
+        (reminder.key(),),
+        reminder.end,
+    )
+    assert picked.covers == (standup.key(),) and picked.choices == ()
+    apply_result(state, picked, accepted=True, now=NOW)
+    launch = state.active_launch
+    assert (launch.title, launch.payload, launch.keys, launch.expires_at) == (picked.title, reminder.payload(), picked.keys, reminder.end)
+    assert set(state.handled) == {standup.key(), reminder.key()}
+    prompt, _state = decide(snap(events=(reminder, standup), granola_running=True), state, now=NOW + timedelta(seconds=5))
+    assert prompt is None
+
+
+def test_the_first_meeting_answers_the_other_too_and_a_prompt_with_no_choices_is_its_own_pick():
+    reminder, standup = reminder_and_standup()
+    prompt, _state = decide(snap(events=(reminder, standup)))
+    first = prompt.picked(0)
+    assert (first.title, first.keys, first.covers) == ("Chromium Team: Stand-Up", (standup.key(),), (reminder.key(),))
+    single, _state = decide(snap(events=(standup,)))
+    assert single.picked(0) is single
+
+
+def test_a_meeting_picked_for_a_call_keeps_the_call_s_key_and_session():
+    reminder, standup = reminder_and_standup()
+    prompt, state = decide(zoom_join(events=(reminder, standup)))
+    picked = prompt.picked(1)
+    assert (picked.kind, picked.keys, picked.call_session, picked.covers) == ("call", ("zoom:9:100", reminder.key()), "zoom:9:100", (standup.key(),))
+    apply_result(state, picked, accepted=True, now=NOW)
+    assert state.active_launch.call_session_id is None and state.active_launch.call_session == "zoom:9:100"
+    assert set(state.handled) == {"zoom:9:100", reminder.key(), standup.key()}
+    prompt, _state = decide(zoom_join(events=(reminder, standup), granola_running=True), state, now=NOW + timedelta(seconds=5))
+    assert prompt is None
+
+
+def test_a_meeting_picked_on_an_early_join_answers_the_one_ending_and_the_other_meeting_about_to_start():
+    (ending, review, vendor), prompt, state = joined_early_for_two_meetings()
+    picked = prompt.picked(1)
+    assert picked.title == "Vendor call" and picked.keys == ("zoom:4:10", vendor.key())
+    assert set(picked.covers) == {review.key(), ending.key()}
+    apply_result(state, picked, accepted=True, now=NOW)
+    assert set(state.handled) == {"zoom:4:10", vendor.key(), review.key(), ending.key()}
+
+
+def test_cancelling_meetings_that_start_together_answers_all_of_them():
+    reminder, standup = reminder_and_standup()
+    state = answered(snap(events=(reminder, standup)), accepted=False)
+    assert set(state.handled) == {reminder.key(), standup.key()}
+    prompt, _state = decide(snap(events=(reminder, standup)), state, now=NOW + timedelta(seconds=5))
+    assert prompt is None
+
+
+def listed(**changes):
+    standup = Choice("Stand-up", {}, (), NOW, NOW, NOW + timedelta(minutes=15), guests=7, calendar_name="you@shift.com")
+    return replace(standup, **changes)
+
+
+def test_the_line_under_a_meeting_on_the_card_gives_its_times_its_guests_and_its_calendar():
+    assert listed().line(NOW) == "17:00–17:15 · 7 guests · you@shift.com"
+    assert listed(guests=1).line(NOW) == "17:00–17:15 · 1 guest · you@shift.com"
+    assert listed(guests=0, calendar_name="").line(NOW) == "17:00–17:15 · No guests"
+    assert listed(end=NOW + timedelta(hours=8)).line(NOW) == "17:00–Thu 01:00 · 7 guests · you@shift.com"
+    elsewhere = timezone(timedelta(hours=-5))
+    assert listed(start=NOW.astimezone(elsewhere)).line(NOW).startswith("17:00–17:15")  # in the clock of now
+
+
+@pytest.mark.parametrize("lead_seconds", [0, 10])
+def test_a_calendar_card_comes_up_the_lead_before_the_meeting_starts_and_not_a_tick_earlier(lead_seconds):
+    lead = timedelta(seconds=lead_seconds)
+    meeting = event(start=NOW + timedelta(minutes=5))
+    assert decide(snap(events=(meeting,)), now=meeting.start - lead - timedelta(seconds=1), lead=lead)[0] is None
+    prompt, _state = decide(snap(events=(meeting,)), now=meeting.start - lead, lead=lead)
+    assert (prompt.kind, prompt.title, prompt.expires_at) == ("calendar", meeting.summary, meeting.end)
+
+
+def test_a_meeting_starting_within_the_lead_is_listed_with_one_already_under_way():
+    running = event("Standup", start=NOW - timedelta(minutes=5), event_id="running")
+    about_to_start = event("Design review", start=NOW + timedelta(seconds=8), event_id="about")
+    prompt, _state = decide(snap(events=(running, about_to_start)), lead=timedelta(seconds=10))
+    # The one about to begin has the later start, so it comes first.
+    assert prompt.title == "Design review" and [choice.title for choice in prompt.choices] == ["Design review", "Standup"]
+    assert prompt.expires_at == about_to_start.end and prompt.covers == (running.key(),)
+    prompt, _state = decide(snap(events=(running, about_to_start)))  # with no lead only the one under way counts
+    assert prompt.title == "Standup" and prompt.choices == ()
+
+
+def test_granola_closing_just_before_a_meeting_starts_gets_that_meeting_s_card_and_not_the_crash_card():
+    review = event()
+    state = answered(snap(events=(review,)), accepted=True)
+    decide(snap(events=(review,), granola_running=True), state, now=NOW + timedelta(seconds=5))
+    decide(snap(present=False, events=(review,)), state, now=NOW + timedelta(seconds=30))
+    standup = event("Standup", start=NOW + timedelta(minutes=2), event_id="standup")
+    almost = standup.start - timedelta(seconds=5)
+    prompt, _state = decide(snap(events=(review, standup)), state, now=almost, lead=timedelta(seconds=10))
+    assert (prompt.kind, prompt.title) == ("calendar", "Standup")
+    prompt, _state = decide(snap(events=(review, standup)), state, now=almost)  # the meeting isn't under way without a lead
+    assert prompt.kind == "crash"
+
+
+def weekly_notes_running_into_the_next_meeting():
+    """Notes for Weekly run in a Zoom call joined as it began, and Design review starts when it ends."""
+    weekly = event("Weekly", event_id="weekly")
+    review = event("Design review", start=NOW + timedelta(minutes=30), event_id="review")
+    call = zoom_join("1:1", age=3, events=(weekly, review))
+    state = answered(call, accepted=True)
+    decide(replace(call, call_age_seconds=60, granola_running=True), state, now=NOW + timedelta(minutes=1))
+    in_call = replace(call, call_age_seconds=30 * 60 + 3, granola_running=True)  # still in it when Design review starts
+    return weekly, review, in_call, state
+
+
+def test_a_meeting_s_card_waits_while_the_user_is_in_a_call_that_began_long_before_it_with_other_notes_running():
+    _weekly, review, in_call, state = weekly_notes_running_into_the_next_meeting()
+    prompt, state = decide(in_call, state, now=review.start)
+    assert prompt is None and review.key() not in state.handled and state.active_launch.title == "Weekly"
+    later = review.start + timedelta(minutes=10)
+    prompt, state = decide(replace(in_call, call_age_seconds=in_call.call_age_seconds + 600), state, now=later)
+    assert prompt is None  # and it goes on waiting
+    # Not even once the launch would have been forgotten, a grace period after Weekly ends: the call is still going.
+    forgotten = NOW + timedelta(minutes=30) + HANDLED_GRACE
+    prompt, _state = decide(replace(in_call, call_age_seconds=in_call.call_age_seconds + 900), state, now=forgotten)
+    assert prompt is None
+
+
+def test_the_waiting_meeting_s_card_comes_up_once_the_call_ends():
+    weekly, review, in_call, state = weekly_notes_running_into_the_next_meeting()
+    decide(in_call, state, now=review.start)
+    prompt, _state = decide(snap(events=(weekly, review), granola_running=True), state, now=review.start + timedelta(seconds=5))
+    assert (prompt.kind, prompt.title) == ("calendar", "Design review")
+
+
+def test_joining_the_waiting_meeting_s_own_call_gives_it_a_call_card():
+    weekly, review, in_call, state = weekly_notes_running_into_the_next_meeting()
+    decide(in_call, state, now=review.start)
+    own_call = zoom_join("2:2", age=3, events=(weekly, review), granola_running=True)
+    prompt, _state = decide(own_call, state, now=review.start + timedelta(seconds=30))
+    assert (prompt.kind, prompt.title) == ("call", "Design review")
+
+
+def test_a_meeting_does_not_wait_when_no_notes_are_running():
+    weekly, review, in_call, _state = weekly_notes_running_into_the_next_meeting()
+    prompt, _state = decide(in_call, WatcherState(), now=review.start)
+    assert (prompt.kind, prompt.title) == ("calendar", "Design review")
+
+
+def test_a_meeting_that_starts_during_an_ad_hoc_call_whose_card_was_cancelled_still_gets_its_card():
+    call = zoom_join("4:10", age=3, title="Quick sync", events=())
+    state = answered(call, accepted=False)  # no notes are running
+    planning = event("Planning", start=NOW + timedelta(minutes=20), event_id="planning")
+    prompt, _state = decide(replace(call, call_age_seconds=20 * 60 + 3, events=(planning,)), state, now=planning.start)
+    assert (prompt.kind, prompt.title) == ("calendar", "Planning")
+
+
+def test_notes_running_for_an_ad_hoc_call_hold_back_a_meeting_that_starts_during_it():
+    call = zoom_join("4:10", age=3, title="Quick sync", events=())
+    state = answered(call, accepted=True)
+    planning = event("Planning", start=NOW + timedelta(minutes=20), event_id="planning")
+    in_call = replace(call, call_age_seconds=20 * 60 + 3, events=(planning,), granola_running=True)
+    prompt, state = decide(in_call, state, now=planning.start)
+    assert prompt is None and planning.key() not in state.handled
+
+
+@pytest.mark.parametrize(
+    ("lead_seconds", "age", "waits"),
+    [
+        (0, 300, False),  # joined five minutes before it starts, within the 10 minutes a call may join early
+        (0, 600, False),  # exactly that early
+        (0, 601, True),
+        (0, None, True),  # its age isn't known: counted as earlier
+        (10, 600, False),  # the card time is 10 seconds before the start, and the call is measured from there
+        (10, 601, True),
+    ],
+)
+def test_a_call_joined_within_the_lookahead_of_the_meeting_does_not_hold_it_back(lead_seconds, age, waits):
+    lead = timedelta(seconds=lead_seconds)
+    weekly = event("Weekly", event_id="weekly")
+    review = event("Design review", start=NOW + timedelta(minutes=30), event_id="review")
+    state = answered(snap(events=(weekly, review)), accepted=True)  # notes for Weekly are running
+    call = zoom_join("9:9", age=age, events=(weekly, review), granola_running=True)
+    prompt, state = decide(call, state, now=review.start - lead, lead=lead)
+    assert (prompt is None) is waits and (waits or prompt.title == "Design review")
+    assert review.key() not in state.handled
+
+
+def test_the_meeting_that_waits_is_left_out_of_the_choices_and_with_none_left_there_is_no_card():
+    standup = event("Standup", start=NOW - timedelta(minutes=20), event_id="standup")
+    review = event("Design review", start=NOW - timedelta(minutes=1), event_id="review")
+    running = ActiveLaunch("Weekly", {}, ("event:weekly",), NOW + timedelta(hours=1), seen_running=True, launched_at=NOW - timedelta(hours=1))
+    # The call began 25 minutes ago: inside the lookahead of Standup's start, long before Design review's.
+    in_call = zoom_join("1:1", age=25 * 60, events=(standup, review), granola_running=True)
+    prompt, state = decide(in_call, WatcherState())  # with no notes running both are listed
+    assert [choice.title for choice in prompt.choices] == ["Design review", "Standup"]
+    prompt, state = decide(in_call, WatcherState(active_launch=running))
+    assert (prompt.title, prompt.choices, prompt.covers) == ("Standup", (), ())
+    assert review.key() not in state.handled
+    waiting_for_both = replace(in_call, call_age_seconds=3 * 3600)
+    prompt, _state = decide(waiting_for_both, WatcherState(active_launch=running))
+    assert prompt is None
+
+
+def weekly_overrunning_by(minutes):
+    """Notes for Weekly run in its call, which is still going ``minutes`` after Weekly was meant to end. Design review,
+    which runs for 90 minutes, started when Weekly was to end."""
+    weekly = event("Weekly", event_id="weekly")
+    review = event("Design review", start=NOW + timedelta(minutes=30), minutes=90, event_id="review")
+    call = zoom_join("1:1", age=3, events=(weekly, review))
+    state = answered(call, accepted=True)
+    decide(replace(call, call_age_seconds=60, granola_running=True), state, now=NOW + timedelta(minutes=1))
+    at = weekly.end + timedelta(minutes=minutes)
+    in_call = replace(call, call_age_seconds=(at - NOW).total_seconds() + 3, granola_running=True)
+    return weekly, review, in_call, state, at
+
+
+def test_notes_overrunning_in_their_call_keep_the_next_meeting_waiting_however_late():
+    weekly, review, in_call, state, at = weekly_overrunning_by(40)  # long past the grace period after Weekly's end
+    prompt, state = decide(in_call, state, now=at)
+    assert prompt is None and review.key() not in state.handled
+    assert state.active_launch.title == "Weekly" and state.active_launch.overrunning
+    assert taking_notes(state.active_launch, at) == ("Weekly", NOW)  # the status still says so
+    later = at + timedelta(minutes=10)
+    prompt, state = decide(replace(in_call, call_age_seconds=in_call.call_age_seconds + 600), state, now=later)
+    assert prompt is None and state.active_launch.overrunning
+
+
+def test_the_next_meeting_s_card_comes_when_the_overrunning_call_ends_and_the_launch_is_forgotten():
+    weekly, review, in_call, state, at = weekly_overrunning_by(40)
+    decide(in_call, state, now=at)
+    prompt, state = decide(snap(events=(weekly, review), granola_running=True), state, now=at + timedelta(seconds=5))
+    assert (prompt.kind, prompt.title) == ("calendar", "Design review") and state.active_launch is None
+
+
+def test_a_launch_that_outlives_its_meeting_while_the_call_goes_on_is_not_a_crash_when_granola_closes():
+    weekly, review, in_call, state, at = weekly_overrunning_by(40)
+    decide(in_call, state, now=at)
+    closed = replace(in_call, granola_running=False)
+    decide(closed, state, now=at + timedelta(seconds=5))
+    prompt, state = decide(closed, state, now=at + timedelta(seconds=20))
+    assert prompt is None  # no restart card for a meeting that is over, and the next meeting's card still waits
+    assert state.active_launch is not None and taking_notes(state.active_launch, at + timedelta(seconds=20)) is None
+
+
+def test_a_call_of_unknown_age_keeps_a_launch_past_its_meeting_too():
+    _weekly, _review, in_call, state, at = weekly_overrunning_by(40)
+    prompt, state = decide(replace(in_call, call_age_seconds=None), state, now=at)
+    assert prompt is None and state.active_launch.overrunning
+
+
+def test_a_call_that_began_after_the_meeting_ended_does_not_keep_its_launch():
+    _weekly, _review, in_call, state, at = weekly_overrunning_by(40)
+    rejoined = replace(in_call, call_session_id="zoom:2:2", call_age_seconds=300)  # joined again 35 minutes after Weekly's end
+    decide(rejoined, state, now=at)
+    assert state.active_launch is None
+
+
+def test_a_launch_with_no_call_expires_as_before_whatever_the_calls_were():
+    weekly = event("Weekly", event_id="weekly")
+    state = answered(snap(events=(weekly,)), accepted=True)
+    just_before = weekly.end + HANDLED_GRACE - timedelta(seconds=1)
+    decide(snap(events=(weekly,), granola_running=True), state, now=just_before)
+    assert state.active_launch is not None and not state.active_launch.overrunning
+    assert taking_notes(state.active_launch, just_before) is None  # not taking notes after the end, but not forgotten yet
+    decide(snap(events=(weekly,), granola_running=True), state, now=weekly.end + HANDLED_GRACE)
+    assert state.active_launch is None
