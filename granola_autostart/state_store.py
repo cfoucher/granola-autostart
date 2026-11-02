@@ -7,7 +7,7 @@ import logging
 from datetime import datetime
 
 from .decide import ActiveLaunch, WatcherState
-from .settings import state_path, write_json
+from .settings import CALL_PROVIDERS, state_path, write_json
 
 log = logging.getLogger("granola_autostart")
 
@@ -25,12 +25,13 @@ def load_state() -> tuple[WatcherState, datetime | None]:
 
 
 def _parse(raw: dict) -> tuple[WatcherState, datetime | None]:
+    decided_at = _either(raw, "call_decided_at", "zoom_decided_at")
     state = WatcherState(
         handled={str(key): _dt(value) for key, value in (raw.get("handled") or {}).items()},
-        zoom_session_id=raw.get("zoom_session_id"),
-        zoom_needs_decision=bool(raw.get("zoom_needs_decision")),
-        zoom_decided_session=raw.get("zoom_decided_session"),
-        zoom_decided_at=_dt(raw["zoom_decided_at"]) if raw.get("zoom_decided_at") else None,
+        call_session_id=_session(_either(raw, "call_session_id", "zoom_session_id")),
+        call_needs_decision=bool(_either(raw, "call_needs_decision", "zoom_needs_decision")),
+        call_decided_session=_session(_either(raw, "call_decided_session", "zoom_decided_session")),
+        call_decided_at=_dt(decided_at) if decided_at else None,
     )
     launch = raw.get("active_launch")
     if isinstance(launch, dict) and launch.get("expires_at") and launch.get("launched_at"):
@@ -43,13 +44,27 @@ def _parse(raw: dict) -> tuple[WatcherState, datetime | None]:
             seen_running=bool(launch.get("seen_running")),
             launched_at=_dt(launch["launched_at"]),
             warned=bool(launch.get("warned")),
-            zoom_session_id=launch.get("zoom_session_id"),
+            call_session_id=_session(_either(launch, "call_session_id", "zoom_session_id")),
             missing_since=_dt(missing) if missing else None,
             failed=bool(launch.get("failed")),
-            call_session=launch.get("call_session"),
+            call_session=_session(launch.get("call_session")),
         )
     pause = raw.get("pause_until")
     return state, _dt(pause) if pause else None
+
+
+def _either(raw: dict, name: str, old_name: str):
+    """A value saved under its current name, or under the name it had before calls covered Teams and Meet."""
+    return raw[name] if name in raw else raw.get(old_name)
+
+
+def _session(value) -> str | None:
+    """A call's session id. One saved before Teams and Meet has no provider in front: it was Zoom's, so an
+    upgrade in the middle of a call still recognises it."""
+    if not value:
+        return None
+    text = str(value)
+    return text if text.split(":", 1)[0] in CALL_PROVIDERS else f"zoom:{text}"
 
 
 def save_state(state: WatcherState, pause_until: datetime | None) -> None:
@@ -57,10 +72,10 @@ def save_state(state: WatcherState, pause_until: datetime | None) -> None:
     payload = {
         "version": 1,
         "handled": {key: until.isoformat() for key, until in state.handled.items()},
-        "zoom_session_id": state.zoom_session_id,
-        "zoom_needs_decision": state.zoom_needs_decision,
-        "zoom_decided_session": state.zoom_decided_session,
-        "zoom_decided_at": state.zoom_decided_at.isoformat() if state.zoom_decided_at else None,
+        "call_session_id": state.call_session_id,
+        "call_needs_decision": state.call_needs_decision,
+        "call_decided_session": state.call_decided_session,
+        "call_decided_at": state.call_decided_at.isoformat() if state.call_decided_at else None,
         "pause_until": pause_until.isoformat() if pause_until else None,
         "active_launch": None
         if launch is None
@@ -72,7 +87,7 @@ def save_state(state: WatcherState, pause_until: datetime | None) -> None:
             "seen_running": launch.seen_running,
             "launched_at": launch.launched_at.isoformat(),
             "warned": launch.warned,
-            "zoom_session_id": launch.zoom_session_id,
+            "call_session_id": launch.call_session_id,
             "missing_since": launch.missing_since.isoformat() if launch.missing_since else None,
             "failed": launch.failed,
             "call_session": launch.call_session,

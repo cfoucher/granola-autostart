@@ -2,9 +2,12 @@ import json
 import urllib.error
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from granola_autostart.calendar_feed import CalendarEvent
 from granola_autostart.decide import ActiveLaunch
 from granola_autostart.status import (
+    TrayView,
     AlertBook,
     FeedStatus,
     LastStart,
@@ -16,6 +19,7 @@ from granola_autostart.status import (
     find_problems,
     next_meeting,
     read_status,
+    saved_moment,
     taking_notes,
     tray_view,
     until_tomorrow,
@@ -56,10 +60,21 @@ def test_a_calendar_becomes_a_problem_after_three_failed_downloads():
     assert problem.section == "calendars"
 
 
+def test_a_calendar_that_is_off_never_becomes_a_problem():
+    off = failing_feed(5)
+    off.enabled = False
+    assert find_problems(None, [off], None) == []
+    assert [problem.key.split(":")[0] for problem in find_problems(None, [off, failing_feed(3)], None)] == ["feed"]
+
+
 def test_a_launch_that_never_opened_granola_comes_first():
     problems = find_problems("config.json is not valid JSON", [failing_feed()], launch(warned=True))
     assert [problem.key.split(":")[0] for problem in problems] == ["launch", "config", "feed"]
     assert problems[0].title == "Granola didn't open for Weekly product sync"
+    assert problems[1].detail == (
+        "config.json is not valid JSON. Until it's fixed, the app keeps the last settings it could read, "
+        "or the defaults if it started with this file."
+    )
     assert find_problems(None, [], launch(warned=True, seen_running=True)) == []
 
 
@@ -89,6 +104,56 @@ def test_the_tray_shows_the_next_meeting_a_pause_or_the_problem():
     attention = tray_view(NOW, NOW + timedelta(hours=1), problems, upcoming)
     assert (attention.kind, attention.paused, attention.problem_section) == ("attention", True, "calendars")
     assert attention.tooltip.startswith("Granola Autostart: “Granola watch”")
+
+
+def test_the_update_the_install_and_the_off_switch_are_given_by_name():
+    with pytest.raises(TypeError):
+        tray_view(NOW, None, [], None, "1.2.0")  # a bare version could as well be anything else
+    assert tray_view(NOW, None, [], None, update="1.2.0", installing=None, off=False).update == "1.2.0"
+
+
+def test_an_update_takes_the_first_line_unless_something_needs_attention_or_it_is_paused():
+    upcoming = event("Weekly product sync", NOW + timedelta(hours=1))
+    ready = tray_view(NOW, None, [], upcoming, update="1.2.0")
+    assert ready == TrayView("watching", "Version 1.2.0 is available", False, update="1.2.0")
+    assert tray_view(NOW, None, [], None, update="1.2.0").header == "Version 1.2.0 is available"
+    assert ready.tooltip == "Granola Autostart: Version 1.2.0 is available"
+    # Otherwise the existing first line wins, and the update still shows in the badge and the menu.
+    paused = tray_view(NOW, NOW + timedelta(hours=1), [], upcoming, update="1.2.0")
+    assert (paused.kind, paused.header, paused.update) == ("paused", "Paused until 10:00", "1.2.0")
+    problems = find_problems(None, [failing_feed()], None)
+    attention = tray_view(NOW, None, problems, upcoming, update="1.2.0")
+    assert (attention.kind, attention.header, attention.update) == ("attention", "“Granola watch” calendar isn't updating", "1.2.0")
+    plain = tray_view(NOW, None, [], upcoming)
+    assert (plain.header, plain.update) == ("Next: Weekly product sync, 10:00", None)
+
+
+def test_off_wins_over_a_pause_and_a_problem_in_the_header_and_the_tooltip():
+    upcoming = event("Weekly product sync", NOW + timedelta(hours=1))
+    off = tray_view(NOW, None, [], upcoming, off=True)
+    assert off == TrayView("off", "Off. Meetings and calls won't start notes", False)
+    assert off.tooltip == "Granola Autostart: Off. Meetings and calls won't start notes"
+    problems = find_problems(None, [failing_feed()], None)
+    both = tray_view(NOW, NOW + timedelta(hours=1), problems, upcoming, off=True)
+    assert (both.kind, both.paused, both.problem_section) == ("off", False, None)
+    assert tray_view(NOW, None, [], upcoming, off=False).kind == "watching"
+
+
+def test_an_update_shows_in_the_badge_and_menu_while_off_but_not_in_the_header():
+    upcoming = event("Weekly product sync", NOW + timedelta(hours=1))
+    off = tray_view(NOW, None, [], upcoming, update="1.2.0", off=True)
+    assert (off.kind, off.header, off.update) == ("off", "Off. Meetings and calls won't start notes", "1.2.0")
+    installing = tray_view(NOW, None, [], upcoming, update="1.2.0", installing="1.2.0", off=True)
+    assert (installing.kind, installing.header) == ("off", "Installing version 1.2.0…")
+
+
+def test_an_update_being_installed_takes_the_first_line_whatever_else_is_going_on():
+    upcoming = event("Weekly product sync", NOW + timedelta(hours=1))
+    problems = find_problems(None, [failing_feed()], None)
+    for paused_until, found in ((None, []), (NOW + timedelta(hours=1), []), (None, problems)):
+        view = tray_view(NOW, paused_until, found, upcoming, update="1.2.0", installing="1.2.0")
+        assert view.header == "Installing version 1.2.0…" and view.update == "1.2.0"
+    assert tray_view(NOW, None, [], upcoming, update="1.2.0", installing="1.2.0").kind == "watching"
 
 
 def test_taking_notes_while_granola_is_open_for_the_meeting():
@@ -131,6 +196,13 @@ def test_a_calendar_that_never_downloaded_survives_status_json():
         assert FeedStatus.from_json(json.loads(json.dumps(feed.to_json()))) == feed
 
 
+def test_a_calendar_that_is_off_stays_off_in_status_json_and_a_status_without_the_mark_means_on():
+    feed = FeedStatus(feed_id("https://calendar.example/watch.ics"), name="Granola watch", owner="me@example.com", enabled=False)
+    assert FeedStatus.from_json(json.loads(json.dumps(feed.to_json()))) == feed
+    assert FeedStatus.from_json({"id": "a"}).enabled and FeedStatus.from_json({"id": "a", "enabled": None}).enabled
+    assert not FeedStatus.from_json({"id": "a", "enabled": False}).enabled
+
+
 def test_a_failing_calendar_says_whether_it_is_still_retrying():
     assert failing_feed(1).failure_detail() == "The last download failed (404 Not Found). Trying again shortly."
     assert failing_feed(3).failure_detail().startswith("The last 3 downloads failed (404 Not Found). Meetings on this calendar")
@@ -170,6 +242,18 @@ def test_the_whole_status_survives_status_json(tmp_path):
     assert read_status(tmp_path / "status.json") == status
 
 
+def test_off_survives_status_json_and_anything_but_true_reads_as_on():
+    assert Status().to_json()["off"] is False
+    assert Status.from_json(json.loads(json.dumps(Status(off=True).to_json()))).off is True
+    for raw in (None, "true", 1, "yes", [True]):
+        assert Status.from_json({"off": raw}).off is False
+
+
+def test_the_problems_that_need_the_logs_or_a_look_at_the_app_point_at_general():
+    problems = find_problems(None, [], launch(warned=True), card_failed=True)
+    assert [(problem.key.split(":")[0], problem.section) for problem in problems] == [("launch", "general"), ("card", "general")]
+
+
 def test_an_unreadable_status_comes_back_empty_instead_of_raising():
     for raw in (None, [], "status", 5):
         assert Status.from_json(raw) == Status()
@@ -186,6 +270,60 @@ def test_an_unreadable_status_comes_back_empty_instead_of_raising():
     assert Status.from_json(garbled) == Status(feeds=[FeedStatus("b")], problems=[Problem("k", "Kept", "", "about")])
     assert Status.from_json({"feeds": {"id": "a"}, "problems": "config", "paused_until": 5}) == Status()
     assert Status.from_json({"feeds": [{"id": "a", "failures": float("inf")}, {"id": "b", "meetings_next_day": float("inf")}]}) == Status()
+
+
+@pytest.mark.parametrize("field", ["name", "owner", "last_error"])
+@pytest.mark.parametrize("junk", [5, True, 1.5, ["me@example.com"], {"a": 1}])
+def test_a_calendar_s_text_that_is_not_text_reads_as_missing(field, junk):
+    feed = FeedStatus.from_json({"id": "a", field: junk})
+    assert feed == FeedStatus("a")
+    assert FeedStatus.from_json({"id": "a", field: "text"}) == FeedStatus("a", **{field: "text"})
+    assert FeedStatus.from_json({"id": "a", field: None}) == FeedStatus("a")
+
+
+def test_a_calendar_with_a_name_that_is_not_text_still_gets_a_label_and_a_problem():
+    feed = FeedStatus.from_json({"id": "a", "name": ["Work"], "owner": 7, "failures": 3, "last_error": {"code": 404}})
+    assert feed.label() == "A calendar" and feed.alerting
+    # No reason, rather than the repr of whatever was in the file.
+    assert feed.failure_detail() == "The last 3 downloads failed. Meetings on this calendar won't start notes until it's fixed."
+    [problem] = find_problems(None, [feed], None)
+    assert problem.title == "A calendar isn't updating"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "0001-01-01T00:00:00",  # nothing this PC's clock can show
+        "9999-12-31T23:59:59",
+        "0001-01-01T00:00:00+14:00",  # before the year 1 in UTC
+        "9999-12-31T23:59:59-14:00",  # after the year 9999 in UTC
+    ],
+)
+def test_a_saved_time_this_pc_cannot_show_is_no_time_at_all(raw):
+    assert saved_moment(raw) is None
+    status = Status.from_json(
+        {
+            "paused_until": raw,
+            "next_meeting": {"title": "Design crit", "start": raw},
+            "taking_notes": {"title": "Design crit", "since": raw},
+            "feeds": [{"id": "a", "last_ok": raw}],
+            "last_start": {"title": "Design crit", "at": raw},
+        }
+    )
+    assert status == Status(feeds=[FeedStatus("a")])
+
+
+def test_a_saved_time_is_kept_as_it_was_written_or_as_local_time_when_it_had_no_offset():
+    written = "2026-10-30T09:00:00+02:00"
+    assert saved_moment(written) == datetime.fromisoformat(written) and saved_moment(written).utcoffset() == timedelta(hours=2)
+    assert saved_moment("2026-10-30T09:00") == datetime(2026, 10, 30, 9, 0).astimezone()
+    for nothing in (None, "", 0, 5, "yesterday", ["2026-10-30"]):
+        assert saved_moment(nothing) is None
+
+
+def test_the_reason_an_update_download_was_cut_short_is_one_to_show_as_it_is():
+    assert describe_error(ValueError("download was cut short")) == "download was cut short"
+    assert describe_error(ValueError("download was cut short at https://example.com/x")) == "ValueError"
 
 
 def test_a_hand_edited_time_without_an_offset_is_read_as_local_time():

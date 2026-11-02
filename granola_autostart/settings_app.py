@@ -1,7 +1,7 @@
 """Settings and first-run setup, in an Edge WebView2 window (pywebview). The page itself is web/.
 
-    python -m granola_autostart --settings [--section=calendars|notes|about]   Settings
-    python -m granola_autostart --setup                                         first-run setup
+    python -m granola_autostart --settings [--section=calendars|calls|notes|general]   Settings
+    python -m granola_autostart --setup                                                first-run setup
 
 Changes are saved to config.json as they are made; the running watcher reloads it. Only one of
 these windows is open at a time: opening another brings the first one forward.
@@ -18,23 +18,40 @@ import re
 import time
 import urllib.error
 import urllib.parse
+from collections.abc import Callable, Iterable
 from ctypes import wintypes
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable
 
-from . import __version__, commands, processes
+from . import __version__, commands, processes, updates
 from .calendar_feed import (
+    declined_addresses,
     events_between,
     feed_name,
     feed_owner,
     fetch_ics,
     meetings_next_day,
-    my_addresses,
     normalize_feed_url,
     skip_word,
 )
-from .settings import ConfigError, Settings, app_dir, load_or_defaults, load_settings, save_settings, setup_logging, status_path
+from .calls import installed as call_installed
+from .settings import (
+    APPEARANCES,
+    CALL_PROVIDERS,
+    DEFAULT_CALLS,
+    Calendar,
+    ConfigError,
+    Settings,
+    app_dir,
+    clean_addresses,
+    load_or_defaults,
+    load_settings,
+    saved_appearance,
+    save_settings,
+    setup_logging,
+    status_path,
+    update_config,
+)
 from .status import FeedStatus, Status, describe_error, feed_id, read_status, until_tomorrow, when
 from .winui import app_theme, set_window_attribute
 
@@ -45,10 +62,22 @@ TITLES = {"settings": "Granola Autostart settings", "setup": "Set up Granola Aut
 SIZES = {"settings": (796, 660), "setup": (656, 680)}
 COUNTDOWN_CHOICES = (5, 10, 15, 20, 30)
 IDLE_CHOICES = (1, 2, 5, 10, 15)  # minutes
-SECTIONS = ("calendars", "notes", "about")
+SECTIONS = ("calendars", "calls", "notes", "general")
+CALL_NAMES = {"zoom": "Zoom", "teams": "Microsoft Teams", "meet": "Google Meet"}  # as the Calls page and setup list them
+LIST_ORDER = {"warn": 0, "off": 2}  # where a calendar row sorts by its state; any other state sorts between
+# General was About before: an old shortcut or command line with --section=about, and a problem an older
+# version saved in status.json, still say so.
+SECTION_ALIASES = {"about": "general"}
 STARTING_SECONDS = 30  # after this window starts the watcher, how long "Starting…" shows before it counts as not running
 RESTARTING_SECONDS = 30  # a supervisor with no watcher for longer is restarting one that keeps failing
 _EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+NOT_AN_ADDRESS = "That doesn't look like an email address."
+
+
+def section_id(name: str) -> str:
+    """The Settings section a name stands for, with the old names accepted. Calendars when it isn't one."""
+    name = SECTION_ALIASES.get(name, name)
+    return name if name in SECTIONS else "calendars"
 
 
 def ago(moment: datetime, now: datetime) -> str:
@@ -72,8 +101,10 @@ def provider(url: str) -> str:
     return host or "Calendar"
 
 
-def calendar_line(feed: FeedStatus | None, now: datetime) -> tuple[str, str]:
-    """(state, text) for a calendar row: ok, pending, or warn."""
+def calendar_line(feed: FeedStatus | None, now: datetime, enabled: bool = True) -> tuple[str, str]:
+    """(state, text) for a calendar row: ok, pending, warn, or off."""
+    if not enabled:
+        return "off", "Off. Its meetings won't start notes."
     if feed is not None and feed.failures:
         return "warn" if feed.alerting else "pending", feed.failure_detail()
     if feed is None or feed.last_ok is None:
@@ -82,23 +113,91 @@ def calendar_line(feed: FeedStatus | None, now: datetime) -> tuple[str, str]:
     return "ok", f"{count} meeting{'s' if count != 1 else ''} in the next day · checked {ago(feed.last_ok, now)}"
 
 
-def summarize_feed(text: str, settings: Settings, known_owners: list[str], now: datetime) -> dict:
+def update_view(state: updates.UpdateState, now: datetime) -> dict:
+    """The General page's update row: whether updates come from git, the version available, when it was last
+    checked ("today at 09:12"), why a check or an install failed, and whether a countdown card is in the way.
+    An install that failed is only shown while that update is still on offer. ``installing`` is true while another
+    process is installing (the tray, or another Settings window), and in the answer to Install update once an
+    installer is running; the page then says so for ``install_wait_seconds``."""
+    release = state.available()
+    checked = None
+    if state.checked_at:
+        today = state.checked_at.astimezone(now.tzinfo).date() == now.date()
+        checked = f"{'today at' if today else 'on'} {when(state.checked_at, now)}"
+    return {
+        "source": not updates.enabled(),
+        "available": release.version if release else None,
+        "page": release.page if release else None,
+        "checked": checked,
+        "error": state.error,
+        "install_error": state.install_error if release else None,
+        "card_showing": processes.card_showing(),
+        "installing": processes.mutex_exists(processes.INSTALL_MUTEX),
+        "install_wait_seconds": updates.INSTALL_WAIT_SECONDS,
+    }
+
+
+def summarize_feed(
+    text: str, settings: Settings, known_owners: list[str | None], now: datetime, declined_by: tuple[str, ...] | None = None
+) -> dict:
     """What a Test shows: the calendar's name, how many meetings in the next day, and the next few.
 
-    It filters the way the watcher does, so Test agrees with what the watcher will start notes for.
+    It filters the way the watcher does for this calendar, with its ``declined_by`` list or, when that is
+    None, its automatic addresses, so Test agrees with what the watcher will start notes for. The result
+    also has the ``declined`` addresses in use, the ``note`` for them (see address_note), ``older``
+    (see adds_older_address), and ``lent`` (see calendars_lent).
     """
     if "BEGIN:VCALENDAR" not in text[:4096]:
         return {"ok": False, "error": "That address didn't return a calendar. Check you copied the secret address in iCal format."}
     owner = feed_owner(text)
     words = settings.ignore_title_substrings
-    addresses = my_addresses(settings.user_email, [owner, *known_owners])
+    note = address_note(declined_by, owner, known_owners, settings.user_email)
+    addresses = declined_addresses(declined_by, owner, known_owners, settings.user_email)
     events = events_between(text, now, now + timedelta(days=1), ignore_title_substrings=words, user_emails=addresses, keep_skipped=True)
     events = [event for event in events if event.start >= now]
     meetings = [{"time": when(event.start, now), "title": event.summary, "skipped": _skip_reason(event, words)} for event in events[:4]]
-    return {"ok": True, "name": feed_name(text) or "Calendar", "owner": owner, "count": meetings_next_day(events, now), "meetings": meetings}
+    return {
+        "ok": True,
+        "name": feed_name(text) or "Calendar",
+        "owner": owner,
+        "count": meetings_next_day(events, now),
+        "meetings": meetings,
+        "declined": list(addresses if declined_by is None else declined_by),
+        "note": note,
+        "older": adds_older_address(declined_by, owner, known_owners, settings.user_email),
+        "lent": calendars_lent(note, known_owners),
+    }
 
 
-def _skip_reason(event, words) -> str | None:
+def address_note(declined_by: tuple[str, ...] | None, owner: str | None, known_owners: Iterable[str | None], user_email: str) -> str:
+    """Where a calendar's declined addresses come from, as the page says it under them: "list" (typed in), "own"
+    (the calendar's name is an address), "copied" (it names none, so the other calendars' are used), "kept" (no
+    other calendar has one either: only the address an older version saved) or "none" (no address at all)."""
+    if declined_by is not None:
+        return "list"
+    if owner:
+        return "own"
+    if any(known_owners):
+        return "copied"
+    return "kept" if user_email else "none"
+
+
+def adds_older_address(declined_by: tuple[str, ...] | None, owner: str | None, known_owners: Iterable[str | None], user_email: str) -> bool:
+    """The address an older version saved (``user_email``) is an extra chip on an automatic calendar, on top of the ones
+    its note says (its own, or the other calendars'), so the page says so. With no others the "kept" note already does."""
+    others = list(known_owners)
+    if declined_by is not None or not (owner or any(others)):
+        return False
+    return len(declined_addresses(None, owner, others, user_email)) > len(declined_addresses(None, owner, others, ""))
+
+
+def calendars_lent(note: str, known_owners: Iterable[str | None]) -> int:
+    """How many calendars lent their address to a "copied" note, which the page needs to say "calendar" or "calendars".
+    That is not the number of addresses: two calendars can share one, and ``older`` adds another. 0 for any other note."""
+    return sum(1 for owner in known_owners if owner) if note == "copied" else 0
+
+
+def _skip_reason(event, words: Iterable[str]) -> str | None:
     if not event.skipped:
         return None
     word = skip_word(event.summary, words)  # None when the word sat past where the title was shortened
@@ -108,12 +207,14 @@ def _skip_reason(event, words) -> str | None:
 class Api:
     """Called from web/app.js as window.pywebview.api.<name>(...). Every method returns plain JSON data."""
 
-    def __init__(self, page: str, section: str) -> None:
+    def __init__(self, page: str, section: str, theme: str | None = None) -> None:
+        """``theme`` is the one the window opens with, which its title bar is styled for as it is shown."""
         self.page = page
-        self.section = section if section in SECTIONS else "calendars"
+        self.section = section_id(section)
         # Private: pywebview walks every public attribute to expose it to the page, and the window's
         # .NET object graph would send it into endless recursion.
         self._window = None
+        self._theme = theme  # the theme the title bar was last styled for
         self._started_at: float | None = None  # time.time() when this window last started the watcher
         self._waiting_since: float | None = None  # time.monotonic() when a supervisor was first seen with no watcher
 
@@ -129,36 +230,94 @@ class Api:
             self._waiting_since = None
         elif self._waiting_since is None:
             self._waiting_since = time.monotonic()
+        theme = app_theme()
+        self._follow_theme(theme)
+        # The switch is read from config.json, so it is right at once and while no watcher runs. When that can't
+        # be read, the watcher's last word is the best there is.
+        off = status.off if config_error else not settings.autostart_notes
         return {
             "page": self.page,
             "section": self.section,
-            "theme": app_theme(),
+            "theme": theme,
             "version": __version__,
+            "update": update_view(updates.read_state(), now),
             "config_error": config_error,
             "settings": None if config_error else self._settings_view(settings, status.feeds, now),
-            "status": self._status_view(status, running, now, waiting=time.monotonic() - self._waiting_since if waiting else None),
+            "status": self._status_view(
+                status,
+                running,
+                now,
+                waiting=time.monotonic() - self._waiting_since if waiting else None,
+                off=off,
+                calls=any(settings.calls.values()),
+            ),
+            # Read on its own: a config.json that can't be loaded still has the choice in it, and Auto would be wrong.
+            "appearance": saved_appearance(),
+            "start_at_sign_in": processes.start_at_sign_in(),
+            # From source there is no installed exe for the sign-in entry to start, so the page has no switch for it.
+            # Nor is there a Start menu shortcut, which the page's note on Quit leaves out.
+            "sign_in_available": processes.FROZEN,
         }
+
+    def _follow_theme(self, theme: str) -> None:
+        """Style the title bar again when the theme has changed since it was last styled: a new Appearance
+        choice, or Windows changing its own on Auto. The page itself follows ``theme`` as it renders."""
+        if theme != self._theme and self._window is not None:
+            self._theme = theme
+            _style_title_bar(self._window, theme == "dark")
 
     def _settings_view(self, settings: Settings, feeds: list[FeedStatus], now: datetime) -> dict:
         by_id = {feed.id: feed for feed in feeds}
+        owners = _owners(settings, feeds)
         calendars = []
-        for url in settings.calendar_urls():
-            feed = by_id.get(feed_id(url))
-            state, line = calendar_line(feed, now)
+        for calendar in settings.distinct_calendars():
+            feed = by_id.get(feed_id(calendar.url))
+            state, line = calendar_line(feed, now, calendar.enabled)
+            automatic = calendar.declined_by is None
+            owner = feed.owner if feed else None
+            # A calendar that hasn't downloaded since the watcher started, perhaps never, has no owner to go on: it may
+            # name an address nobody knows yet, so the page doesn't offer addresses for it.
+            unread = automatic and not owner and (feed is None or feed.last_ok is None)
+            if unread:
+                # "pending" while the watcher is about to download it, and "off" while it is off and won't until it is switched on.
+                note, older = ("pending" if calendar.enabled else "off"), False
+            else:
+                note = address_note(calendar.declined_by, owner, owners, settings.user_email)
+                older = adds_older_address(calendar.declined_by, owner, owners, settings.user_email)
             calendars.append(
                 {
-                    "id": feed_id(url),
+                    "id": feed_id(calendar.url),
                     "name": (feed.name if feed else None) or "New calendar",
-                    "provider": provider(url),
+                    "provider": provider(calendar.url),
                     "state": state,
                     "line": line,
+                    "enabled": calendar.enabled,
+                    # The chips: the list, or when automatic, the addresses the watcher uses for this calendar.
+                    "declined": _declined_chips(calendar, owner, owners, settings.user_email),
+                    "automatic": automatic,
+                    # Where the addresses come from (see address_note), or "pending" or "off" while the calendar hasn't downloaded.
+                    "note": note,
+                    "older": older,  # see adds_older_address
+                    "lent": calendars_lent(note, owners),  # see calendars_lent
                 }
             )
+        # The page lists them as given: ones that need attention first, ones that are off last, and the rest in the
+        # order they were added (the sort is stable).
+        calendars.sort(key=lambda calendar: LIST_ORDER.get(calendar["state"], 1))
         idle_minutes = min(IDLE_CHOICES, key=lambda choice: abs(choice * 60 - settings.idle_seconds))
         return {
             "calendars": calendars,
-            "detected_addresses": _owners(feeds),
-            "user_email": settings.user_email,
+            # One per provider, in the order the page lists them. ``found``: whether the app is on this PC, which
+            # is only for the page to say so (None for Meet, which is in a browser) and never decides a call.
+            "calls": [
+                {
+                    "provider": provider,
+                    "name": CALL_NAMES[provider],
+                    "on": settings.calls.get(provider, DEFAULT_CALLS[provider]),
+                    "found": call_installed(provider),
+                }
+                for provider in CALL_PROVIDERS
+            ],
             "countdown_seconds": settings.countdown_seconds,
             "countdown_choices": list(COUNTDOWN_CHOICES),
             "idle_minutes": idle_minutes,
@@ -175,11 +334,16 @@ class Api:
         except OSError:
             return True
 
-    def _status_view(self, status: Status, running: bool, now: datetime, *, waiting: float | None = None) -> dict:
+    def _status_view(
+        self, status: Status, running: bool, now: datetime, *, waiting: float | None = None, off: bool = False, calls: bool = True
+    ) -> dict:
         """The side panel's status box. Its buttons (see web/app.js) follow the state, like the tray menu.
 
         ``waiting``: for how many seconds the supervisor has been up with no watcher. Briefly, that is the
         watcher starting (at sign-in); for longer, the supervisor is restarting one that keeps failing.
+        ``off``: Autostart notes is switched off. Off wins over a problem and a pause, but not over a watcher
+        that isn't running: the box then says so, and the switch still shows.
+        ``calls``: some call provider is on, so "Calls still start notes" is true.
         """
         problems = status.problems
         paused_until = status.paused_until
@@ -194,10 +358,12 @@ class Api:
             state, detail = "starting", "Restarting after a problem. The log folder says why."
         elif not running:
             state, detail = "stopped", "Meetings won't start notes."
+        elif off:
+            state, detail = "off", "Meetings and calls won't start notes. It stays off after a restart, until you switch it on."
         elif problems:
             state, detail = "attention", problems[0].title
         elif paused and today:
-            state, detail = "paused", "Until tomorrow. Zoom calls won't be asked about later."
+            state, detail = "paused", "Until tomorrow. Calls joined meanwhile won't be asked about later."
         elif paused:
             state, detail = "paused", f"Until {when(paused_until, now)}. No countdown cards until then."
         elif status.taking_notes:
@@ -207,20 +373,30 @@ class Api:
             title, start = status.next_meeting
             state, detail = "watching", f"Next: {title} at {when(start, now)}"
         else:
-            state, detail = "watching", "No meetings coming up. Zoom calls still start notes."
+            state, detail = "watching", "No meetings coming up. Calls still start notes." if calls else "No meetings coming up."
         return {
             "running": running,
             "state": state,
             "detail": detail,
             "paused": paused,
             "paused_today": today,
-            "fix_section": problems[0].section if problems else None,
+            "autostart_notes": not off,
+            "fix_section": section_id(problems[0].section) if problems else None,
             "last_start": {"title": last.title, "when": when(last.at, now), "opened": last.granola_opened} if last else None,
         }
 
     # Calendars
 
     def test_address(self, url: str) -> dict:
+        """Test an address before adding it. Besides the meetings, the result has the ``declined`` addresses
+        the calendar would use if added as it is, and the ``note`` that says where they come from."""
+        return self._test(url, None)
+
+    def test_calendar(self, calendar_id: str) -> dict:
+        calendar = self._calendar_for(calendar_id)
+        return self._test(calendar.url, calendar.declined_by) if calendar else {"ok": False, "error": "That calendar was removed."}
+
+    def _test(self, url: str, declined_by: tuple[str, ...] | None) -> dict:
         try:
             cleaned = normalize_feed_url(url)
         except ValueError:
@@ -233,33 +409,114 @@ class Api:
         except Exception as error:
             return {"ok": False, "error": f"Couldn't download that address ({describe_error(error)})."}
         try:
-            return summarize_feed(text, settings, _owners(read_status(status_path()).feeds), datetime.now().astimezone())
+            owners = _owners(settings, read_status(status_path()).feeds)
+            return summarize_feed(text, settings, owners, datetime.now().astimezone(), declined_by)
         except Exception as error:
             log.warning("test could not read the calendar (%s)", type(error).__name__)
             return {"ok": False, "error": "That address returned a calendar this app couldn't read."}
 
-    def test_calendar(self, calendar_id: str) -> dict:
-        url = self._url_for(calendar_id)
-        return self.test_address(url) if url else {"ok": False, "error": "That calendar was removed."}
-
-    def add_calendar(self, url: str) -> dict:
+    def add_calendar(self, url: str, declined_by: list[str] | None = None) -> dict:
+        """Add a calendar. ``declined_by`` is what the editor ended with after Test, stored as it is given: the
+        page sends None while the editor holds what Test suggested, which leaves the calendar automatic."""
         cleaned = normalize_feed_url(url)
         settings = load_settings()
         if cleaned in settings.calendar_urls():
             return self.load()
+        chosen = clean_addresses(declined_by)
+        if not _valid_addresses(chosen):
+            return {**self.load(), "error": NOT_AN_ADDRESS}
         log.info("calendar added from Settings")
-        return self._save(settings, ics_urls=(*settings.calendar_urls(), cleaned))
+        calendar = Calendar(cleaned, declined_by=chosen)
+        return self._save(settings, calendars=(*settings.distinct_calendars(), calendar))
 
     def remove_calendar(self, calendar_id: str) -> dict:
         settings = load_settings()
         log.info("calendar removed from Settings")
-        return self._save(settings, ics_urls=tuple(url for url in settings.calendar_urls() if feed_id(url) != calendar_id))
+        return self._save(settings, calendars=tuple(calendar for calendar in settings.distinct_calendars() if feed_id(calendar.url) != calendar_id))
 
-    def set_email(self, email: str) -> dict:
-        email = (email or "").strip()
-        if email and not _EMAIL.fullmatch(email):
-            return {**self.load(), "error": "That doesn't look like an email address."}
-        return self._save(load_settings(), user_email=email)
+    def set_calendar_enabled(self, calendar_id: str, on: bool) -> dict:
+        settings = load_settings()
+        return self._save_calendar(settings, _find(settings, calendar_id), enabled=bool(on))
+
+    def add_declined(self, calendar_id: str, address: str) -> dict:
+        """Add an address a calendar's declines count for. The first one added to an automatic calendar
+        starts from the addresses it was using."""
+        address = (address or "").strip()
+        if not _EMAIL.fullmatch(address):
+            return {**self.load(), "error": NOT_AN_ADDRESS}
+        settings = load_settings()
+        calendar = _find(settings, calendar_id)
+        if calendar is None:
+            return self.load()
+        current = _current_chips(settings, calendar)
+        if address.casefold() in (piece.casefold() for piece in current):
+            return self.load()
+        return self._save_calendar(settings, calendar, declined_by=(*current, address))
+
+    def remove_declined(self, calendar_id: str, address: str) -> dict:
+        """Take an address away. With none left, the calendar goes back to automatic."""
+        settings = load_settings()
+        calendar = _find(settings, calendar_id)
+        if calendar is None:
+            return self.load()
+        current = _current_chips(settings, calendar)
+        remaining = [piece for piece in current if piece.casefold() != (address or "").strip().casefold()]
+        if len(remaining) == len(current):
+            return self.load()
+        return self._save_calendar(settings, calendar, declined_by=clean_addresses(remaining))
+
+    # Updates
+
+    def check_updates(self) -> dict:
+        """Check now. It waits for GitHub, up to its timeout, so the page shows it working."""
+        if updates.enabled():
+            updates.check(datetime.now().astimezone())
+        return self.load()
+
+    def install_update(self) -> dict:
+        """Install update. It downloads first, and once the installer has started it stops this window in a
+        moment: ``update.installing`` says so. A failure comes back in ``update.install_error``. A countdown card
+        that came up meanwhile, or the tray already installing, is neither: the page just shows the row again."""
+        release = updates.read_state().available() if updates.enabled() else None
+        started = release is not None and updates.install(release) is updates.Install.STARTED
+        view = self.load()
+        view["update"]["installing"] = started or view["update"]["installing"]  # the latter: another install is under way
+        return view
+
+    # Switches and appearance
+    #
+    # These two change their one key with update_config, which leaves the rest of config.json as it is on disk. The other
+    # setters save every setting with _save, from the copy they have just loaded. The tray's Turn off writes autostart_notes
+    # the same way, and a whole-file save here could put back a value it changed a moment ago. Appearance is a single key
+    # too, so it needs no other setting read or decrypted.
+
+    def set_autostart_notes(self, on: bool) -> dict:
+        """The switch at the top of the status box. The running watcher reloads config.json, and a watcher that
+        isn't running starts with it."""
+        update_config("autostart_notes", bool(on))
+        log.info("Autostart notes turned %s from Settings", "on" if on else "off")
+        return self.load()
+
+    def set_start_at_sign_in(self, on: bool) -> dict:
+        processes.set_start_at_sign_in(bool(on))
+        log.info("start at sign-in turned %s from Settings", "on" if on else "off")
+        return self.load()
+
+    def set_appearance(self, choice: str) -> dict:
+        if choice not in APPEARANCES:
+            return self.load()
+        update_config("appearance", choice)
+        return self.load()
+
+    # Calls
+
+    def set_call(self, provider: str, on: bool) -> dict:
+        """The switch on the Calls page. A provider this version doesn't know is ignored."""
+        if provider not in CALL_PROVIDERS:
+            return self.load()
+        settings = load_settings()
+        log.info("%s calls turned %s from Settings", provider, "on" if on else "off")
+        return self._save(settings, calls={**settings.calls, provider: bool(on)})
 
     # Starting notes
 
@@ -293,17 +550,19 @@ class Api:
 
     # First-run setup
 
-    def finish_setup(self, url: str | None, email: str | None) -> dict:
-        """Setup's Finish, and its "Zoom only for now", which sends neither."""
+    def finish_setup(self, url: str | None, declined_by: list[str] | None = None, calls: dict[str, bool] | None = None) -> dict:
+        """Setup's Finish, and its "Calls only for now", which sends no calendar. ``declined_by`` is as for add_calendar.
+        ``calls`` is the Calls step's switches, by provider. One it leaves out, or None, keeps its saved value."""
         settings = load_settings()
-        urls = settings.calendar_urls()
+        calendars = settings.distinct_calendars()
         cleaned = normalize_feed_url(url) if url else None
-        if cleaned and cleaned not in urls:
-            urls.append(cleaned)
-        email = (email or "").strip()
-        user_email = email if _EMAIL.fullmatch(email) else settings.user_email
-        save_settings(dataclasses.replace(settings, ics_urls=tuple(urls), user_email=user_email, setup_complete=True))
-        log.info("setup finished (%s calendars)", len(urls))
+        chosen = clean_addresses(declined_by)
+        if cleaned and not _valid_addresses(chosen):
+            return {**self.load(), "error": NOT_AN_ADDRESS}
+        if cleaned and cleaned not in settings.calendar_urls():
+            calendars.append(Calendar(cleaned, declined_by=chosen))
+        save_settings(dataclasses.replace(settings, calendars=tuple(calendars), calls=_with_calls(settings.calls, calls), setup_complete=True))
+        log.info("setup finished (%s calendars)", len(calendars))
         self._ensure_watcher()
         return self.load()
 
@@ -311,6 +570,13 @@ class Api:
         """Save ``settings`` with ``changes``, which the running watcher picks up, and return the new view."""
         save_settings(dataclasses.replace(settings, **changes))
         return self.load()
+
+    def _save_calendar(self, settings: Settings, calendar: Calendar | None, **changes) -> dict:
+        """Save one calendar with ``changes``. A calendar that was removed in the meantime is left alone."""
+        if calendar is None:
+            return self.load()
+        calendars = tuple(dataclasses.replace(each, **changes) if each == calendar else each for each in settings.distinct_calendars())
+        return self._save(settings, calendars=calendars)
 
     # Elsewhere
 
@@ -378,17 +644,48 @@ class Api:
             self._started_at = time.time()
             processes.start_supervisor()
 
-    def _url_for(self, calendar_id: str) -> str | None:
+    def _calendar_for(self, calendar_id: str) -> Calendar | None:
         try:
-            urls = load_settings().calendar_urls()
+            return _find(load_settings(), calendar_id)
         except ConfigError:
             return None
-        return next((url for url in urls if feed_id(url) == calendar_id), None)
 
 
-def _owners(feeds: list[FeedStatus]) -> list[str]:
-    """The calendars' own addresses, which also count as the user's for declined meetings."""
-    return list(dict.fromkeys(feed.owner for feed in feeds if feed.owner))
+def _find(settings: Settings, calendar_id: str) -> Calendar | None:
+    return next((calendar for calendar in settings.distinct_calendars() if feed_id(calendar.url) == calendar_id), None)
+
+
+def _owners(settings: Settings, feeds: list[FeedStatus]) -> list[str | None]:
+    """Each calendar's own address as the watcher last saw it, off calendars included, in the order they're listed.
+    A calendar that has been removed no longer lends its address."""
+    by_id = {feed.id: feed.owner for feed in feeds}
+    return [by_id.get(feed_id(url)) for url in settings.calendar_urls()]
+
+
+def _declined_chips(calendar: Calendar, owner: str | None, owners: list[str | None], user_email: str) -> list[str]:
+    """The addresses a calendar shows: its list as typed or, when it is automatic, the ones the watcher uses for it.
+    ``owner`` is its own address as the watcher last saw it, and ``owners`` is every calendar's (see _owners)."""
+    if calendar.declined_by is not None:
+        return list(calendar.declined_by)
+    return list(declined_addresses(None, owner, owners, user_email))
+
+
+def _current_chips(settings: Settings, calendar: Calendar) -> list[str]:
+    """A calendar's addresses now, from what the watcher last saw."""
+    feeds = read_status(status_path()).feeds
+    owner = next((feed.owner for feed in feeds if feed.id == feed_id(calendar.url)), None)
+    return _declined_chips(calendar, owner, _owners(settings, feeds), settings.user_email)
+
+
+def _with_calls(current: dict[str, bool], choices) -> dict[str, bool]:
+    """``current`` with the switches ``choices`` sets. Anything that isn't a provider's true or false is ignored."""
+    if not isinstance(choices, dict):
+        return current
+    return {**current, **{provider: on for provider, on in choices.items() if provider in CALL_PROVIDERS and isinstance(on, bool)}}
+
+
+def _valid_addresses(addresses: tuple[str, ...] | None) -> bool:
+    return all(_EMAIL.fullmatch(address) for address in addresses or ())
 
 
 def _wait_for(done: Callable[[], bool], seconds: float = 3) -> bool:
@@ -483,7 +780,7 @@ def _enable_text_field_menus(window) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Granola Autostart settings")
     parser.add_argument("--setup", action="store_true", help="first-run setup")
-    parser.add_argument("--section", default="calendars", choices=SECTIONS)
+    parser.add_argument("--section", default="calendars", choices=(*SECTIONS, *SECTION_ALIASES))
     args = parser.parse_args(argv)
     setup_logging("settings-log.txt")
     if not processes.hold_mutex(processes.SETTINGS_MUTEX):
@@ -492,8 +789,9 @@ def main(argv: list[str] | None = None) -> int:
     import webview
 
     page = "setup" if args.setup else "settings"
-    dark = app_theme() == "dark"
-    api = Api(page, args.section)
+    theme = app_theme()
+    dark = theme == "dark"
+    api = Api(page, args.section, theme)
     if page == "settings":
         # The Start menu shortcut opens Settings, so opening it also starts an app that was quit.
         api._ensure_watcher()
@@ -509,7 +807,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     api._window = window
     window.events.before_show += lambda: _center_on_primary(window)
-    window.events.shown += lambda: _style_title_bar(window, dark)
+    window.events.shown += lambda: _style_title_bar(window, api._theme == "dark")
     window.events.loaded += lambda: _enable_text_field_menus(window)
     try:
         webview.start(gui="edgechromium", private_mode=True)
@@ -517,4 +815,8 @@ def main(argv: list[str] | None = None) -> int:
         log.exception("the settings window could not open; opening config.json instead")
         processes.open_config_file()
         return 1
+    finally:
+        # The process can take a while to exit after its window has closed, and until it has, opening Settings again
+        # would only look for a window that is gone.
+        processes.release_mutex(processes.SETTINGS_MUTEX)
     return 0

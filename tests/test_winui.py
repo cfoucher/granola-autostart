@@ -1,4 +1,5 @@
 import ctypes
+import json
 import winreg
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -6,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from granola_autostart import winui
+from granola_autostart.settings import config_path
 
 
 class Personalize:
@@ -31,6 +33,46 @@ class Personalize:
 def test_the_app_theme_follows_windows_and_is_light_when_unset(light, theme, monkeypatch):
     monkeypatch.setattr(winui, "winreg", Personalize(light))
     assert winui.app_theme() == theme
+
+
+def save_appearance(value) -> None:
+    config_path().write_text(json.dumps({"appearance": value}), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("appearance", "windows_light", "theme"),
+    [
+        ("auto", 1, "light"),
+        ("auto", 0, "dark"),
+        ("light", 1, "light"),
+        ("light", 0, "light"),
+        ("dark", 1, "dark"),
+        ("dark", 0, "dark"),
+    ],
+)
+def test_the_app_theme_is_the_chosen_appearance_or_on_auto_whatever_windows_uses(appearance, windows_light, theme, monkeypatch):
+    monkeypatch.setattr(winui, "winreg", Personalize(windows_light))
+    save_appearance(appearance)
+    assert winui.app_theme() == theme
+
+
+@pytest.mark.parametrize("value", [None, "sepia", 3, ["dark"]])
+def test_an_appearance_this_version_does_not_know_follows_windows_like_auto(value, monkeypatch):
+    monkeypatch.setattr(winui, "winreg", Personalize(0))
+    save_appearance(value)
+    assert winui.app_theme() == "dark"
+
+
+def test_a_missing_or_broken_config_follows_windows_and_never_stops_the_card_opening(monkeypatch):
+    monkeypatch.setattr(winui, "winreg", Personalize(0))
+    assert winui.app_theme() == "dark"  # no config.json
+    config_path().write_text("{ broken", encoding="utf-8")
+    assert winui.app_theme() == "dark"
+    config_path().write_bytes(b"\xff\xfe not text")
+    assert winui.app_theme() == "dark"
+    monkeypatch.delenv("GRANOLA_AUTOSTART_HOME")
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    assert winui.app_theme() == "dark"  # nowhere to look
 
 
 def fake_ctypes(monkeypatch, **dlls) -> None:

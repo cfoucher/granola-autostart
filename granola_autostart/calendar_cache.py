@@ -11,9 +11,9 @@ from ctypes import wintypes
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from .calendar_feed import events_between, feed_name, feed_owner, fetch_ics, meetings_next_day, merge_events, my_addresses
-from .settings import Settings
-from .status import FeedStatus, describe_error, feed_id
+from .calendar_feed import declined_addresses, events_between, feed_name, feed_owner, fetch_ics, meetings_next_day, merge_events
+from .settings import Calendar, Settings, status_path
+from .status import FeedStatus, describe_error, feed_id, read_status
 
 log = logging.getLogger("granola_autostart")
 RETURN_REFRESH_SECONDS = 60
@@ -26,26 +26,35 @@ THREAD_PRIORITY_BELOW_NORMAL = -1
 class FeedLoad:
     events: dict[str, list] = field(default_factory=dict)
     names: dict[str, str | None] = field(default_factory=dict)
-    failures: list[tuple[int, str, Exception]] = field(default_factory=list)  # (1-based index, url, error)
+    failures: list[tuple[int, str, Exception]] = field(default_factory=list)  # (1-based position in the config, url, error)
 
 
-def load_feeds(urls: list[str], now: datetime, settings: Settings, owners: dict[str, str | None]) -> FeedLoad:
-    """Download every feed first, so each one's declines are checked against all of the user's addresses.
+def load_feeds(now: datetime, settings: Settings, owners: dict[str, str | None]) -> FeedLoad:
+    """Download every calendar that is on, then keep each one's meetings, leaving out those it declined.
 
-    ``owners`` holds each calendar's own address and is updated in place, so a feed that fails
-    this time still lends the address it had last time.
+    Each calendar's declines are checked against its own addresses (see ``declined_addresses``), so every
+    download comes first: a calendar that names no address borrows the others' owners. Declined meetings are kept,
+    marked, for ``merge_events`` to drop, which is how the same meeting declined on another calendar is skipped too.
+
+    ``owners`` holds each calendar's own address, calendars that are off included, and is updated in place,
+    so a feed that fails this time, or is off, still lends the address it had last time.
     """
+    calendars = settings.distinct_calendars()
     texts: dict[str, str] = {}
     result = FeedLoad()
-    for index, url in enumerate(urls, start=1):
+    for index, calendar in enumerate(calendars, start=1):
+        if not calendar.enabled:
+            continue
+        url = calendar.url
         try:
             texts[url] = fetch_ics(url)
             owners[url] = feed_owner(texts[url])
             result.names[url] = feed_name(texts[url])
         except Exception as error:
             result.failures.append((index, url, error))
-    addresses = my_addresses(settings.user_email, (owners.get(url) for url in urls))
-    for index, url in enumerate(urls, start=1):
+    known = [owners.get(calendar.url) for calendar in calendars]
+    for index, calendar in enumerate(calendars, start=1):
+        url = calendar.url
         if url not in texts:
             continue
         try:
@@ -54,8 +63,9 @@ def load_feeds(urls: list[str], now: datetime, settings: Settings, owners: dict[
                 now - timedelta(hours=12),
                 now + timedelta(hours=36),
                 ignore_title_substrings=settings.ignore_title_substrings,
-                user_emails=addresses,
+                user_emails=declined_addresses(calendar.declined_by, owners.get(url), known, settings.user_email),
                 keep_skipped=True,
+                keep_declined=True,
             )
         except Exception as error:
             result.failures.append((index, url, error))
@@ -71,21 +81,23 @@ def lower_thread_priority() -> None:
 
 
 class CalendarCache:
-    """Feeds download on a background thread so a slow server never delays a Zoom prompt."""
+    """Feeds download on a background thread so a slow server never delays a call's card."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._events: list = []
         self._by_url: dict[str, list] = {}
-        self._owners: dict[str, str | None] = {}
+        self._events: list = []
         self._status: dict[str, FeedStatus] = {}
+        # What the last run saved, so a calendar that is off, and so never downloaded, still has its name and
+        # owner after a restart. Only those two are kept: nothing else about a feed is true before it downloads.
+        self._previous = {feed.id: feed for feed in read_status(status_path()).feeds}
         self._fetched_at: datetime | None = None
         self._refresh_started: float | None = None
         self._generation = 0
 
     def current(self, now: datetime, settings: Settings, *, refresh: bool = True, eager: bool = False) -> list:
         """Return cached events. Downloads only start when ``refresh`` is set, i.e. someone is at the PC."""
-        if not settings.calendar_urls():
+        if not settings.enabled_urls():
             return []
         limit = min(settings.calendar_refresh_seconds, RETURN_REFRESH_SECONDS) if eager else settings.calendar_refresh_seconds
         with self._lock:
@@ -104,13 +116,24 @@ class CalendarCache:
             events = self._events
         return [event for event in events if event.end > now]
 
+    def known_owners(self, calendars: list[Calendar]) -> dict[str, str | None]:
+        """Each calendar's own address as last known, which a calendar that is off or failing still lends."""
+        with self._lock:
+            return {calendar.url: self._status_of(calendar.url).owner for calendar in calendars}
+
+    def _status_of(self, url: str) -> FeedStatus:
+        """A calendar's status, started from the last run's name and owner. Call with the lock held."""
+        if url not in self._status:
+            previous = self._previous.get(feed_id(url)) or FeedStatus(feed_id(url))
+            self._status[url] = FeedStatus(feed_id(url), name=previous.name, owner=previous.owner)
+        return self._status[url]
+
     def _refresh(self, settings: Settings, generation: int, now: datetime) -> None:
         try:
             lower_thread_priority()
-            urls = settings.calendar_urls()
-            with self._lock:
-                owners = dict(self._owners)
-            loaded = load_feeds(urls, now, settings, owners)
+            urls = settings.enabled_urls()
+            owners = self.known_owners(settings.distinct_calendars())
+            loaded = load_feeds(now, settings, owners)
             for index, _url, error in loaded.failures:
                 log.error("calendar feed %s failed (%s); keeping its previous events", index, describe_error(error))
             fetched_at = now
@@ -119,12 +142,11 @@ class CalendarCache:
             with self._lock:
                 if generation != self._generation:
                     return
-                self._owners = owners
                 self._by_url.update(loaded.events)
                 for _index, url, error in loaded.failures:
-                    self._status.setdefault(url, FeedStatus(feed_id(url))).failed(error)
+                    self._status_of(url).failed(error)
                 for url, events in loaded.events.items():
-                    self._status.setdefault(url, FeedStatus(feed_id(url))).succeeded(
+                    self._status_of(url).succeeded(
                         now, name=loaded.names.get(url), owner=owners.get(url), meetings_next_day=meetings_next_day(events, now)
                     )
                 self._events = merged = self._merge(urls)
@@ -140,20 +162,26 @@ class CalendarCache:
     def invalidate(self, urls: list[str]) -> None:
         """Download again on the next tick, because the calendars or their filters changed.
 
-        A download already under way used the old settings, so its result is dropped, and a
-        calendar no longer in ``urls`` stops counting at once.
+        ``urls`` are the calendars that are on. A download already under way used the old settings, so its
+        result is dropped, and a calendar no longer in ``urls``, whether removed or switched off, stops
+        counting at once. Its name and owner are kept, but its failures are forgotten: switched back on,
+        it starts clean, instead of alerting before it has been downloaded once.
         """
         with self._lock:
             self._generation += 1
             self._fetched_at = None
             self._refresh_started = None
             self._by_url = {url: events for url, events in self._by_url.items() if url in urls}
+            for url, status in self._status.items():
+                if url not in urls:
+                    status.failures, status.last_error = 0, None
             self._events = self._merge(urls)
 
     def _merge(self, urls: list[str]) -> list:
-        """Every calendar's meetings, in the order the calendars are listed. Call with the lock held."""
+        """The meetings of the calendars in ``urls``, as one list. Call with the lock held."""
         return merge_events(*(self._by_url.get(url, []) for url in urls))
 
-    def feed_statuses(self, urls: list[str]) -> list[FeedStatus]:
+    def feed_statuses(self, calendars: list[Calendar]) -> list[FeedStatus]:
+        """Every calendar's status, off ones included and marked, in the order the calendars are listed."""
         with self._lock:
-            return [dataclasses.replace(self._status[url]) if url in self._status else FeedStatus(feed_id(url)) for url in urls]
+            return [dataclasses.replace(self._status_of(calendar.url), enabled=calendar.enabled) for calendar in calendars]

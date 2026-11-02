@@ -17,6 +17,7 @@ from ctypes import wintypes
 
 from PIL import Image, ImageDraw, ImageTk
 
+from . import processes
 from .winui import app_theme, per_monitor_dpi, set_window_attribute
 
 ES_CONTINUOUS = 0x80000000
@@ -406,4 +407,10 @@ def main(argv: list[str] | None = None) -> int:
     """0 to start Granola, 1 for Cancel. __main__ turns a failure into exit code 2, with the reason logged."""
     args = build_parser().parse_args(argv)
     keep_display_on()
-    return 0 if show_notice(args.title, args.seconds, kind=args.kind) else 1
+    # An update isn't installed while the card is up, because the installer stops every process of the app. Shared:
+    # the watcher already holds it while this card starts, and a card that overlaps another keeps it up as well.
+    processes.hold_mutex(processes.CARD_MUTEX, shared=True)
+    try:
+        return 0 if show_notice(args.title, args.seconds, kind=args.kind) else 1
+    finally:
+        processes.release_mutex(processes.CARD_MUTEX)

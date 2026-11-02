@@ -1,5 +1,6 @@
-"""The watcher: each tick it checks presence, Zoom, and the calendars, then shows the countdown card when a
-meeting starts and opens Granola. It also runs the tray icon and the command line for the other modes."""
+"""The watcher: each tick it checks presence, calls, and the calendars, then shows the countdown card when a
+meeting starts and opens Granola. While Autostart notes is off it checks none of that. It also runs the tray
+icon and the command line for the other modes."""
 
 from __future__ import annotations
 
@@ -10,21 +11,35 @@ import logging
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable
 
 import pystray
 
-from . import __version__, commands, processes
+from . import __version__, commands, processes, updates
 from .calendar_cache import CalendarCache, load_feeds
 from .calendar_feed import merge_events
+from .calls import Call, CallWatch, granola_running, process_table
 from .decide import Prompt, Snapshot, evaluate, apply_result
 from .granola_launch import build_url, launch
 from .icon import draw_icon
 from .notify import Notifier, register_app_id
 from .presence import idle_seconds, is_present, is_unlocked
-from .settings import ConfigError, Settings, app_dir, config_path, load_or_defaults, load_settings, setup_logging, status_path
+from .settings import (
+    CALL_PROVIDERS,
+    ConfigError,
+    Settings,
+    app_dir,
+    config_path,
+    load_or_defaults,
+    load_settings,
+    saved_flag,
+    setup_logging,
+    status_path,
+    sweep_stale_temporaries,
+    update_config,
+)
 from .state_store import load_state, save_state
 from .status import (
     AlertBook,
@@ -34,6 +49,7 @@ from .status import (
     TrayView,
     describe_error,
     end_of_today,
+    feed_id,
     find_problems,
     launch_problem_key,
     next_meeting,
@@ -43,10 +59,11 @@ from .status import (
     write_status,
 )
 from .winui import per_monitor_dpi
-from .zoom_meetings import granola_running, process_table, zoom_session, zoom_window_title
 
 log = logging.getLogger("granola_autostart")
 LAUNCH_CHECK_SECONDS = 30
+# SetPreferredAppMode's modes for each Appearance: AllowDark follows Windows, then ForceDark and ForceLight.
+MENU_MODES = {"auto": 1, "dark": 2, "light": 3}
 
 
 class Control:
@@ -62,6 +79,8 @@ class Control:
         self.force_dry_run = False
         self.last_start: LastStart | None = None
         self.card_failed = False  # the last countdown card couldn't run
+        self.card_open = False  # a countdown card is on screen, and the watcher is waiting on it
+        self.installing: str | None = None  # the version being installed
         self.view = TrayView("watching", "Watching for meetings", False)
         self.on_view: Callable[[TrayView], None] | None = None
 
@@ -77,6 +96,29 @@ class Control:
     def paused(self, now: datetime) -> bool:
         until = self.current_pause()
         return until is not None and now < until
+
+    def set_notes(self, on: bool) -> None:
+        """Turn Autostart notes on or off in memory, at once. Writing config.json is the caller's."""
+        with self._lock:
+            self.settings.autostart_notes = on
+        self.wake.set()
+
+    def set_installing(self, version: str | None) -> None:
+        with self._lock:
+            self.installing = version
+        self.wake.set()
+
+    def set_card(self, showing: bool) -> None:
+        """The watcher waits on a countdown card and ticks nothing meanwhile, but the tray menu is only built
+        when its view changes, so it is rebuilt now. That is how Install update… follows the card."""
+        with self._lock:
+            self.card_open = showing
+            view, callback = self.view, self.on_view
+        if callback is not None:
+            try:
+                callback(view)
+            except Exception:
+                log.exception("could not rebuild the tray menu")
 
     def halt(self) -> None:
         self.stop.set()
@@ -145,13 +187,17 @@ def reload_settings(control: Control, current: Settings, cache: CalendarCache) -
         return current
     control.config_error = None
     fresh.dry_run = fresh.dry_run or control.force_dry_run
-    if (fresh.calendar_urls(), fresh.user_email, fresh.ignore_title_substrings) != (
-        current.calendar_urls(),
+    # Anything that changes which meetings count: a calendar's address, switch or declined addresses, the old
+    # extra address, or the skip words.
+    if (fresh.distinct_calendars(), fresh.user_email, fresh.ignore_title_substrings) != (
+        current.distinct_calendars(),
         current.user_email,
         current.ignore_title_substrings,
     ):
-        cache.invalidate(fresh.calendar_urls())
+        cache.invalidate(fresh.enabled_urls())
     control.settings = fresh
+    if fresh.appearance != current.appearance:
+        menu_theme(fresh.appearance)
     log.info("settings reloaded")
     return fresh
 
@@ -166,7 +212,7 @@ class Reporter:
 
     def tick(self, now: datetime, settings: Settings, cache: CalendarCache, events, launch) -> None:
         control = self.control
-        feeds = cache.feed_statuses(settings.calendar_urls())
+        feeds = cache.feed_statuses(settings.distinct_calendars())
         # Once a start's meeting is over, "Granola didn't open" has nothing left to fix (Try again won't act).
         current = launch if launch is not None and now < launch.expires_at else None
         problems = find_problems(control.config_error, feeds, current, card_failed=control.card_failed)
@@ -174,11 +220,24 @@ class Reporter:
             self.notifier.show(problem)
         upcoming = next_meeting(events, now)
         pause = control.current_pause()
-        control.show(tray_view(now, pause, problems, upcoming))
+        update = updates.read_state().available() if updates.enabled() else None
+        off = not settings.autostart_notes  # the loop's copy, which the tray's switch changes at once: what this tick did
+        control.show(
+            tray_view(
+                now,
+                pause,
+                problems,
+                upcoming,
+                update=update.version if update else None,
+                installing=control.installing,
+                off=off,
+            )
+        )
         write_status(
             status_path(),
             Status(
                 version=__version__,
+                off=off,
                 paused_until=pause if pause is not None and now < pause else None,
                 next_meeting=(upcoming.summary, upcoming.start) if upcoming else None,
                 taking_notes=taking_notes(launch, now),
@@ -191,38 +250,51 @@ class Reporter:
 
 def run_loop(settings: Settings, control: Control, state_lock: threading.Lock, state, reporter: Reporter) -> None:
     cache = CalendarCache()
-    if not settings.calendar_urls():
-        log.warning("No calendar feed configured. Calendar meetings will not start notes. Zoom joins still will.")
+    checker = updates.Checker()
+    watch = CallWatch()
+    sweep_stale_temporaries()  # once, at start: an update stops the app mid-save now and then
+    if not settings.enabled_urls():
+        log.warning("No calendar feed is on. Calendar meetings will not start notes. Calls still will.")
     stamp = config_stamp()
     was_present = False
+    was_off = False
     while not control.stop.is_set():
         try:
             now = datetime.now().astimezone()
+            checker.tick(now)
             if config_stamp() != stamp:
                 stamp = config_stamp()
                 settings = reload_settings(control, settings, cache)
+            # While off nothing is downloaded or asked: the decision runs as if paused with no call and no
+            # events, so its state stays consistent. Whether Granola is running is cheap, and still checked.
+            off = not settings.autostart_notes  # config.json as last reloaded, or the tray's switch, which is at once
+            just_on = was_off and not off
             table = process_table()
-            session_id, age = zoom_session(table)
+            call = None if off else watch.current(settings.calls, table)
             present = is_present(settings.idle_seconds)
-            events = cache.current(now, settings, refresh=present, eager=present and not was_present)
+            events = [] if off else cache.current(now, settings, refresh=present, eager=present and (not was_present or just_on))
             was_present = present
+            was_off = off
             running = granola_running(table)
-            title = zoom_window_title(table) if session_id else None
             with state_lock:
                 prompt = evaluate(
                     now,
                     Snapshot(
                         present=present,
-                        paused=control.paused(now),
-                        zoom_session_id=session_id,
-                        zoom_age_seconds=age,
-                        zoom_title=title,
+                        # The first tick back on is a pause too, with calls noticed: a call already under way is
+                        # recorded as handled, as Pause does, so turning on doesn't ask about it.
+                        paused=control.paused(now) or off or just_on,
+                        call_session_id=call.session_id if call else None,
+                        call_provider=call.provider if call else None,
+                        call_age_seconds=call.age_seconds if call else None,
+                        call_title=call.title if call else None,
                         events=events,
                         granola_running=running,
                     ),
                     state,
                     lookahead=timedelta(minutes=settings.zoom_lookahead_minutes),
-                    fresh_zoom_seconds=settings.fresh_zoom_seconds,
+                    fresh_call_seconds=settings.fresh_zoom_seconds,
+                    skip_words=settings.ignore_title_substrings,
                 )
                 _warn_if_launch_missing(state, now)
                 launch_now = dataclasses.replace(state.active_launch) if state.active_launch else None
@@ -238,6 +310,12 @@ def run_loop(settings: Settings, control: Control, state_lock: threading.Lock, s
         control.sleep(settings.poll_seconds)
 
 
+def notes_off(control: Control) -> bool:
+    """Autostart notes is off, whether the tray just turned it off or Settings saved it while a countdown card
+    held the loop, which can't reload config.json until the card closes."""
+    return not control.settings.autostart_notes or not saved_flag("autostart_notes", True)
+
+
 def still_present(settings: Settings) -> bool:
     """The countdown itself adds idle time, so allow for it on top of the presence limit."""
     return is_unlocked() and idle_seconds() <= settings.idle_seconds + settings.countdown_seconds + 5
@@ -245,7 +323,15 @@ def still_present(settings: Settings) -> bool:
 
 def handle_prompt(prompt: Prompt, settings: Settings, control: Control, state_lock: threading.Lock, state) -> None:
     log.info("countdown for %s (%s)", prompt.title, prompt.kind)
-    answer = ask_notice(prompt.title, settings.countdown_seconds, prompt.kind)
+    # Held from before the card starts, which takes a moment, until it has closed: an update isn't installed
+    # in between. The card holds it too while it is up (notice.main).
+    processes.hold_mutex(processes.CARD_MUTEX, shared=True)
+    control.set_card(True)
+    try:
+        answer = ask_notice(prompt.title, settings.countdown_seconds, prompt.kind)
+    finally:
+        processes.release_mutex(processes.CARD_MUTEX)  # first: the tray menu rebuilt next asks whether a card is up
+        control.set_card(False)
     control.card_failed = answer is None
     # A card that couldn't run counts as nobody answering, which starts notes, so a broken card never
     # quietly skips meetings. Not for restarting notes after Granola closed, though: the user may have
@@ -257,6 +343,9 @@ def handle_prompt(prompt: Prompt, settings: Settings, control: Control, state_lo
         return
     if accepted and control.paused(datetime.now().astimezone()):
         log.info("paused during the countdown; not starting Granola for %s", prompt.title)
+        return
+    if accepted and notes_off(control):
+        log.info("turned off during the countdown; not starting Granola for %s", prompt.title)
         return
     if accepted and not still_present(settings):
         log.info("left the computer during the countdown; will ask again for %s", prompt.title)
@@ -312,7 +401,7 @@ def retry_launch(state_lock: threading.Lock, state, control: Control, problem_ke
     """The notification's Try again. It does nothing for an older notification, a second click, a start
     that has opened since, or a meeting that has ended.
 
-    Trying again is a new start: its own 30-second check, its own line in About, and its own
+    Trying again is a new start: its own 30-second check, its own line in General, and its own
     "Granola didn't open" if the link fails again. In a dry run it is answered like one, with nothing to watch.
     """
     at = datetime.now().astimezone()
@@ -336,6 +425,37 @@ def retry_launch(state_lock: threading.Lock, state, control: Control, problem_ke
                 launch.failed = True
 
 
+def start_install(control: Control) -> threading.Thread | None:
+    """The tray's Install update…, on its own thread because the download takes a while.
+
+    Once the installer has started, it stops this app and restarts it on the new version, so the menu keeps
+    saying it is installing until then (and for updates.INSTALL_WAIT_SECONDS if the installer never does). If it
+    failed, Settings opens at General, which says why. A countdown card that came up during the download, or
+    another click already installing, isn't a failure: the menu just offers Install update… again.
+    Returns the thread, or None when there is nothing to do.
+    """
+    release = updates.read_state().available()
+    if release is None or control.installing is not None or control.card_open:
+        return None
+    control.set_installing(release.version)
+
+    def run() -> None:
+        outcome = updates.Install.FAILED
+        try:
+            outcome = updates.install(release)
+        except Exception:
+            log.exception("could not install version %s", release.version)
+        if outcome is updates.Install.STARTED:
+            control.stop.wait(updates.INSTALL_WAIT_SECONDS)
+        control.set_installing(None)
+        if outcome is updates.Install.FAILED:
+            processes.open_settings("general")
+
+    thread = threading.Thread(target=run, name="update-install", daemon=True)
+    thread.start()
+    return thread
+
+
 def save_app_icon() -> Path:
     """The icons Windows shows on notifications (PNG) and on windows run from source (ICO)."""
     folder = app_dir()
@@ -346,19 +466,26 @@ def save_app_icon() -> Path:
     return folder / "app.png"
 
 
-def modern_menus() -> None:
-    """A crisp Windows 11 tray menu that follows the light or dark app theme.
+def modern_menus(appearance: str = "auto") -> None:
+    """A crisp Windows 11 tray menu that follows the Appearance choice, or the Windows app theme on Auto.
 
     Without DPI awareness Windows draws the menu at 100% and stretches it on scaled displays.
+    """
+    per_monitor_dpi()
+    menu_theme(appearance)
+
+
+def menu_theme(appearance: str) -> None:
+    """Light, dark, or Windows' own theme for the tray menu, from now on.
+
     SetPreferredAppMode and FlushMenuThemes (uxtheme ordinals 135 and 136) are undocumented but
     stable since Windows 10 1903; without them menus stay light.
     """
-    per_monitor_dpi()
     try:
         uxtheme = ctypes.WinDLL("uxtheme")
         set_preferred_app_mode = uxtheme[135]
         set_preferred_app_mode.argtypes = [ctypes.c_int]
-        set_preferred_app_mode(1)  # AllowDark: follow the Windows app theme
+        set_preferred_app_mode(MENU_MODES.get(appearance, MENU_MODES["auto"]))
         uxtheme[136]()  # FlushMenuThemes
     except (AttributeError, OSError):
         pass
@@ -366,7 +493,7 @@ def modern_menus() -> None:
 
 def run_tray(settings: Settings, config_error: str | None = None, *, dry_run: bool = False) -> int:
     """Run until Quit; returns the exit code. Settings can pause, resume, and quit through commands.py."""
-    modern_menus()
+    modern_menus(settings.appearance)
     control = Control(settings, config_error)
     control.force_dry_run = dry_run
     control.last_start = read_status(status_path()).last_start
@@ -423,6 +550,18 @@ def run_tray(settings: Settings, config_error: str | None = None, *, dry_run: bo
     def resume() -> None:
         pause_until(None, "Resumed")
 
+    def switch_notes(on: bool) -> None:
+        """Turn Autostart notes on or off. config.json gets only that key: save_settings would write the
+        watcher's whole copy, which may not have caught up with a change made in Settings a moment ago."""
+        control.set_notes(on)
+        state = "on" if on else "off"
+        try:
+            update_config("autostart_notes", on)
+        except (OSError, ConfigError):
+            log.exception("could not save Autostart notes to config.json; it is %s until config.json changes or this app restarts", state)
+            return
+        log.info("Autostart notes turned %s", state)
+
     quitting = threading.Event()
 
     def quit_app() -> None:
@@ -433,7 +572,7 @@ def run_tray(settings: Settings, config_error: str | None = None, *, dry_run: bo
 
     def refresh(view: TrayView) -> None:
         icon = tray["icon"]
-        icon.icon = draw_icon(64, view.kind)
+        icon.icon = draw_icon(64, view.kind, badge=view.update is not None)
         icon.title = view.tooltip
         icon.update_menu()
 
@@ -445,9 +584,22 @@ def run_tray(settings: Settings, config_error: str | None = None, *, dry_run: bo
         control.on_view = refresh
         refresh(control.view)
 
+    def card_up() -> bool:
+        return control.card_open or processes.card_showing()
+
+    def is_off() -> bool:
+        # The switch itself, which Turn off changes at once, and not the view, which the next tick redraws.
+        return not control.settings.autostart_notes
+
     # Left-clicking the icon runs the first default item: Fix in Settings... when something is wrong, else Settings...
     menu = pystray.Menu(
         pystray.MenuItem(lambda _item: control.view.header, lambda *_: None, enabled=False),
+        pystray.MenuItem(
+            lambda _item: "Install update after the countdown" if card_up() else "Install update…",
+            lambda *_: start_install(control),
+            enabled=lambda _item: control.installing is None and not card_up(),
+            visible=lambda _item: control.view.update is not None,
+        ),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(
             "Fix in Settings…",
@@ -456,8 +608,12 @@ def run_tray(settings: Settings, config_error: str | None = None, *, dry_run: bo
             visible=lambda _item: control.view.kind == "attention",
         ),
         pystray.MenuItem("Resume", lambda *_: resume(), visible=lambda _item: control.view.paused),
-        pystray.MenuItem("Pause for 1 hour", lambda *_: pause_hour(), visible=lambda _item: not control.view.paused),
-        pystray.MenuItem("Pause for today", lambda *_: pause_today()),
+        pystray.MenuItem(
+            "Pause for 1 hour", lambda *_: pause_hour(), visible=lambda _item: not control.view.paused and not is_off()
+        ),
+        pystray.MenuItem("Pause for today", lambda *_: pause_today(), visible=lambda _item: not is_off()),
+        pystray.MenuItem("Turn off", lambda *_: switch_notes(False), visible=lambda _item: not is_off()),
+        pystray.MenuItem("Turn on", lambda *_: switch_notes(True), visible=lambda _item: is_off()),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(
             "Settings…",
@@ -466,18 +622,33 @@ def run_tray(settings: Settings, config_error: str | None = None, *, dry_run: bo
             visible=lambda _item: control.view.kind != "attention",
         ),
         pystray.MenuItem("Open log folder", lambda *_: processes.open_log_folder()),
-        pystray.MenuItem("About", lambda *_: processes.open_settings("about")),
+        pystray.MenuItem("About", lambda *_: processes.open_settings("general")),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", lambda *_: quit_app()),
     )
     try:
-        tray["icon"] = pystray.Icon("granola-autostart", draw_icon(64, control.view.kind), control.view.tooltip, menu=menu)
+        tray["icon"] = pystray.Icon(
+            "granola-autostart", draw_icon(64, control.view.kind, badge=control.view.update is not None), control.view.tooltip, menu=menu
+        )
         tray["icon"].run(setup=ready)
     finally:
         # Even when the tray fails, the loop stops, so the process exits and the supervisor starts it again.
         control.halt()
         worker.join(timeout=control.settings.countdown_seconds + 15)
     return processes.QUIT_EXIT_CODE if quitting.is_set() else 0
+
+
+def _call_state(enabled: bool | None, call: Call | None) -> str:
+    if not enabled:
+        return "off"
+    if call is None:
+        return "on, not in a call"
+    details = [call.session_id]
+    if call.age_seconds is not None:
+        details.append(f"started {call.age_seconds:.0f}s ago")
+    if call.title:
+        details.append(f'"{call.title}"')
+    return f"on, in a call ({', '.join(details)})"
 
 
 def print_check(settings: Settings, config_error: str | None) -> None:
@@ -487,17 +658,21 @@ def print_check(settings: Settings, config_error: str | None) -> None:
         print(f"config: {config_error} (using defaults)")
     now = datetime.now().astimezone()
     present = is_present(settings.idle_seconds)
-    session_id, age = zoom_session()
     print(f"present: {present} (idle {idle_seconds():.0f}s, limit {settings.idle_seconds}s)")
-    print(f"zoom: {'in meeting ' + session_id if session_id else 'not in a meeting'}")
-    if age is not None:
-        print(f"zoom age: {age:.0f}s")
+    in_calls = {call.provider: call for call in CallWatch().calls(settings.calls)}
+    for provider in CALL_PROVIDERS:
+        print(f"{provider}: {_call_state(settings.calls.get(provider), in_calls.get(provider))}")
     print(f"granola running: {granola_running()}")
-    urls = settings.calendar_urls()
-    if not urls:
+    if not settings.calendar_urls():
         print("calendar: no calendar feed in config")
         return
-    loaded = load_feeds(urls, now, settings, {})
+    if not settings.enabled_urls():
+        print("calendar: every calendar in config is switched off")
+        return
+    # Calendars that are off aren't downloaded, but still lend the address the watcher last saved on them.
+    saved = {feed.id: feed.owner for feed in read_status(status_path()).feeds}
+    owners = {calendar.url: saved.get(feed_id(calendar.url)) for calendar in settings.distinct_calendars()}
+    loaded = load_feeds(now, settings, owners)
     for index, _url, error in loaded.failures:
         print(f"calendar feed {index}: failed ({describe_error(error)})")
     events = merge_events(*loaded.events.values())
@@ -513,14 +688,13 @@ def print_check(settings: Settings, config_error: str | None) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Start Granola when a meeting begins. With no mode, run the watcher.",
-        epilog="The other modes: --settings [--section=calendars|notes|about], --setup, and --notice --title=TITLE.",
+        epilog="The other modes: --settings [--section=calendars|calls|notes|general], --setup, --stop, and --notice --title=TITLE.",
     )
     modes = parser.add_mutually_exclusive_group()
     for flag, help_text in (
         ("--install", "start at every sign-in, and start now"),
         ("--uninstall", "remove the sign-in entry and stop the watcher"),
-        ("--stop", "stop the running watcher and supervisor"),
-        ("--check", "print presence, Zoom, and calendar status"),
+        ("--check", "print presence, calls, and calendar status"),
         ("--preview-notice", "show the countdown once"),
     ):
         modes.add_argument(flag, dest="mode", action="store_const", const=flag[2:], help=help_text)
@@ -552,11 +726,6 @@ def main() -> int:
     if args.mode == "uninstall":
         processes.uninstall()
         logger.info("granola autostart removed")
-        return 0
-    if args.mode == "stop":
-        # The installer runs this before replacing files and before uninstalling.
-        processes.stop()
-        logger.info("granola autostart stopped")
         return 0
     if args.mode == "install":
         processes.install()

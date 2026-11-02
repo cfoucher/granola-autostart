@@ -17,7 +17,7 @@ def build_url(event: dict | None) -> str:
     Granola reads the custom-protocol query with URL.searchParams and then calls
     decodeURIComponent on each value. The event JSON is encoded twice so a title
     containing ``%`` still arrives intact. ``auto_transcribe=1`` starts capture.
-    The link does not open Zoom.
+    The link does not join the call, whichever app it is on.
     """
     parts = ["creation_source=autostart", "auto_transcribe=1"]
     if event is not None:

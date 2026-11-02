@@ -1,5 +1,5 @@
 """Windows look and feel shared by the countdown card, Settings, and the tray: the app theme,
-per-monitor DPI, and window colours. Standard library only, so the card still opens quickly."""
+per-monitor DPI, and window colours. The standard library and settings.py only, so the card still opens quickly."""
 
 from __future__ import annotations
 
@@ -7,8 +7,16 @@ import ctypes
 import winreg
 from ctypes import wintypes
 
+from .settings import saved_appearance
+
 
 def app_theme() -> str:
+    """"light" or "dark": the Appearance chosen in Settings, or on Auto the Windows app theme."""
+    chosen = saved_appearance()
+    return windows_theme() if chosen == "auto" else chosen
+
+
+def windows_theme() -> str:
     """"light" or "dark", following the Windows app theme."""
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:

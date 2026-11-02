@@ -15,7 +15,7 @@ PROBLEM = Problem(
     "launch:abc",
     "Granola didn't open",
     "Design review was due to start notes.",
-    "about",
+    "general",
     actions=(("Try again", "retry"), ("Open log folder", "logs")),
 )
 

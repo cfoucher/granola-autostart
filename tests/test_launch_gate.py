@@ -10,7 +10,7 @@ import pytest
 from granola_autostart import commands, processes, watcher
 from granola_autostart.calendar_feed import CalendarEvent
 from granola_autostart.decide import ActiveLaunch, Prompt, WatcherState
-from granola_autostart.settings import Settings, config_path, save_settings
+from granola_autostart.settings import Calendar, Settings, config_path, save_settings
 from granola_autostart.status import find_problems, launch_problem_key, taking_notes
 
 NOW = datetime(2026, 10, 28, 17, 0, tzinfo=timezone.utc)
@@ -52,6 +52,38 @@ def test_finished_countdown_starts_granola(gate):
     assert "event:abc" in state.handled
 
 
+def test_the_tray_menu_is_rebuilt_as_the_card_opens_and_closes(gate):
+    _world, launches, run = gate
+    control = watcher.Control()
+    seen = []
+    control.on_view = lambda view: seen.append(control.card_open)
+    run(control)
+    assert seen == [True, False] and not control.card_open and len(launches) == 1
+
+
+def test_a_tray_menu_that_cannot_be_rebuilt_never_keeps_the_card_from_showing(gate):
+    def broken(view):
+        raise RuntimeError("the menu could not be drawn")
+
+    _world, launches, run = gate
+    control = watcher.Control()
+    control.on_view = broken
+    run(control)
+    assert len(launches) == 1 and not control.card_open
+
+
+def test_a_card_that_breaks_is_not_left_marked_as_on_screen(gate, monkeypatch):
+    def boom(*_args):
+        raise RuntimeError("the card could not be started")
+
+    monkeypatch.setattr(watcher, "ask_notice", boom)
+    _world, _launches, run = gate
+    control = watcher.Control()
+    with pytest.raises(RuntimeError):
+        run(control)
+    assert not control.card_open
+
+
 def test_locking_during_the_countdown_starts_nothing_and_asks_again(gate):
     world, launches, run = gate
     world["unlocked"] = False
@@ -67,6 +99,34 @@ def test_pausing_during_the_countdown_starts_nothing(gate):
     state = run(control)
     assert launches == []
     assert state.handled == {}
+
+
+def test_turning_notes_off_during_the_countdown_starts_nothing(gate):
+    _world, launches, run = gate
+    control = watcher.Control()
+    control.set_notes(False)  # the tray's Turn off, in memory at once
+    state = run(control)
+    assert launches == [] and state.handled == {}
+
+
+def test_notes_turned_off_in_settings_during_the_countdown_start_nothing_either(gate):
+    # The loop is waiting on the card, so it hasn't reloaded config.json, and the watcher's copy still says on.
+    world, launches, run = gate
+    control = watcher.Control()
+    save_settings(Settings(autostart_notes=False, setup_complete=True))
+    assert control.settings.autostart_notes
+    assert run(control).handled == {} and launches == []
+    world["accepted"] = None  # a card that couldn't run starts notes, unless they are off
+    assert run(control).handled == {} and launches == []
+
+
+def test_the_switch_is_the_watchers_own_when_config_json_cannot_be_read(gate):
+    _world, launches, run = gate
+    config_path().write_text("{ broken", encoding="utf-8")
+    control = watcher.Control()
+    assert len(run(control).handled) == 2 and len(launches) == 1  # on in memory, and nothing saved says otherwise
+    control.set_notes(False)
+    assert run(control).handled == {} and len(launches) == 1  # off in memory, as the tray set it
 
 
 def test_cancel_records_the_decision(gate):
@@ -142,7 +202,7 @@ def failed_state() -> WatcherState:
     return WatcherState(active_launch=launch)
 
 
-def test_try_again_is_a_new_start_with_its_own_check_and_line_in_about(monkeypatch):
+def test_try_again_is_a_new_start_with_its_own_check_and_line_in_general(monkeypatch):
     opened = []
     monkeypatch.setattr(watcher, "launch", lambda url, dry_run: opened.append((url, dry_run)))
     state, control = failed_state(), watcher.Control()
@@ -222,9 +282,11 @@ def test_granola_not_seen_after_thirty_seconds_raises_the_warning():
 
 class Cache:
     invalidated = 0
+    urls = None
 
     def invalidate(self, urls):
         self.invalidated += 1
+        self.urls = urls
 
 
 def test_a_saved_config_is_picked_up_and_a_broken_one_keeps_the_last_good_settings():
@@ -243,6 +305,26 @@ def test_a_saved_config_is_picked_up_and_a_broken_one_keeps_the_last_good_settin
     assert json.loads(config_path().read_text(encoding="utf-8"))["countdown_seconds"] == 20
 
 
+def test_a_change_to_the_calendars_their_switches_or_declined_addresses_starts_the_cache_afresh():
+    work, home = "https://calendar.example/work.ics", "https://calendar.example/home.ics"
+    control, cache = watcher.Control(), Cache()
+
+    def reload(current, *calendars, **options):
+        save_settings(Settings(calendars=calendars, **options))
+        return watcher.reload_settings(control, current, cache)
+
+    settings = reload(Settings(), Calendar(work), Calendar(home))
+    assert (cache.invalidated, cache.urls) == (1, [work, home])
+    settings = reload(settings, Calendar(work), Calendar(home))
+    assert cache.invalidated == 1  # nothing changed
+    settings = reload(settings, Calendar(work), Calendar(home, enabled=False))
+    assert (cache.invalidated, cache.urls) == (2, [work])  # the one that is on
+    settings = reload(settings, Calendar(work, declined_by=("me@example.com", "alias@example.ca")), Calendar(home, enabled=False))
+    assert cache.invalidated == 3
+    settings = reload(settings, Calendar(work, declined_by=("me@example.com", "alias@example.ca")), Calendar(home, enabled=False), user_email="old@example.com")
+    assert cache.invalidated == 4  # the old typed address still counts for automatic calendars
+
+
 class Notifier:
     def __init__(self):
         self.shown = []
@@ -252,7 +334,7 @@ class Notifier:
 
 
 class Feeds:
-    def feed_statuses(self, urls):
+    def feed_statuses(self, calendars):
         return []
 
 
@@ -301,10 +383,10 @@ def test_without_a_working_card_a_crash_card_ends_that_start(gate):
     assert "event:abc" in state.handled and control.card_failed
 
 
-def test_without_a_working_card_a_zoom_join_still_starts_notes(gate):
+def test_without_a_working_card_a_call_still_starts_notes(gate):
     world, launches, run = gate
     world["accepted"] = None
-    run(kind="zoom")
+    run(kind="call")
     assert len(launches) == 1
 
 
@@ -375,7 +457,7 @@ def tray(monkeypatch):
         loops.append(control)
         control.stop.wait(10)
 
-    monkeypatch.setattr(watcher, "modern_menus", lambda: None)
+    monkeypatch.setattr(watcher, "modern_menus", lambda appearance: None)
     monkeypatch.setattr(watcher, "register_app_id", lambda logo: None)
     monkeypatch.setattr(watcher, "Notifier", lambda *args, **kwargs: None)
     monkeypatch.setattr(watcher, "run_loop", run_loop)

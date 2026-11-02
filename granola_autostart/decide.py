@@ -5,12 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from .calendar_feed import DEFAULT_MEETING_LENGTH, CalendarEvent
+from .calendar_feed import DEFAULT_MEETING_LENGTH, CalendarEvent, skip_word
 
-ZOOM_HOLD = timedelta(hours=12)
+CALL_HOLD = timedelta(hours=12)
 CRASH_GRACE = timedelta(seconds=10)
-ADHOC_ZOOM_LENGTH = timedelta(hours=4)
-ADHOC_ZOOM_TITLE = "Zoom meeting"
+ADHOC_CALL_LENGTH = timedelta(hours=4)
+# What an ad hoc call is called when its windows show no meeting name, by provider.
+ADHOC_CALL_TITLES = {"zoom": "Zoom meeting", "teams": "Teams call", "meet": "Google Meet call"}
+ADHOC_CALL_TITLE = "Call"
 # Longer than a calendar refresh, so an extension that arrives late still finds the decision.
 HANDLED_GRACE = timedelta(minutes=15)
 
@@ -19,9 +21,10 @@ HANDLED_GRACE = timedelta(minutes=15)
 class Snapshot:
     present: bool
     paused: bool
-    zoom_session_id: str | None  # the Zoom call under way, if any
-    zoom_age_seconds: float | None
-    zoom_title: str | None  # the meeting's name from Zoom's windows, when they show one
+    call_session_id: str | None  # the call under way, if any: its provider, a colon, then its own id
+    call_provider: str | None  # "zoom", "teams" or "meet"
+    call_age_seconds: float | None
+    call_title: str | None  # the meeting's name from the call's windows, when they show one
     events: tuple[CalendarEvent, ...] | list[CalendarEvent]
     granola_running: bool
 
@@ -33,13 +36,13 @@ class Prompt:
     payload: dict
     keys: tuple[str, ...]
     expires_at: datetime
-    # An ad hoc call's own session: notes for it end with the call (see _consider_zoom).
-    zoom_session_id: str | None = None
+    # An ad hoc call's own session: notes for it end with the call (see _consider_call).
+    call_session_id: str | None = None
     cancel_keys: tuple[str, ...] | None = None
     # Other meetings already under way. Notes for this one answer them too, so a double booking or
     # an overlap does not ask again seconds later; a cancel leaves them free to ask.
     covers: tuple[str, ...] = ()
-    # The Zoom call a calendar meeting was matched to (followed when the user rejoins it). Once no call
+    # The call a calendar meeting was matched to (followed when the user rejoins it). Once no call
     # for it is running, Granola closing is the end of the meeting, so there is nothing to restart.
     call_session: str | None = None
 
@@ -53,11 +56,18 @@ class ActiveLaunch:
     seen_running: bool
     launched_at: datetime
     warned: bool = False
-    zoom_session_id: str | None = None
+    call_session_id: str | None = None
     missing_since: datetime | None = None
     # Windows couldn't open Granola's link, so Granola running later says nothing about this note.
     failed: bool = False
     call_session: str | None = None  # see Prompt.call_session
+
+    def follow(self, session: str) -> None:
+        """Tie these notes to another call. It joins the keys, which also hold every call followed before it, so
+        the notes can be followed back to any of them (see _follow_call) and a restart answers them all."""
+        self.call_session = session
+        if session not in self.keys:
+            self.keys = (*self.keys, session)
 
     @property
     def opened(self) -> bool:
@@ -73,11 +83,11 @@ class ActiveLaunch:
 @dataclass
 class WatcherState:
     handled: dict[str, datetime] = field(default_factory=dict)
-    zoom_session_id: str | None = None
-    zoom_needs_decision: bool = False
+    call_session_id: str | None = None
+    call_needs_decision: bool = False
     active_launch: ActiveLaunch | None = None
-    zoom_decided_session: str | None = None
-    zoom_decided_at: datetime | None = None
+    call_decided_session: str | None = None
+    call_decided_at: datetime | None = None
 
 
 def evaluate(
@@ -86,21 +96,23 @@ def evaluate(
     state: WatcherState,
     *,
     lookahead: timedelta,
-    fresh_zoom_seconds: float,
+    fresh_call_seconds: float,
+    skip_words: tuple[str, ...] = (),
 ) -> Prompt | None:
     _prune(state, now)
     _extend_running_meetings(state, snap)
     _sync_granola(state, snap, now)
-    _consider_zoom(now, snap, state, fresh_zoom_seconds)
+    joined = _consider_call(now, snap, state, fresh_call_seconds)
+    _follow_call(now, snap, state, lookahead, joined)
     _answer_meetings_of_an_adhoc_call(now, state, snap, lookahead)
     if snap.paused:
         return None
     crash = _crash_prompt(now, snap, state)
     if crash is not None:
         return crash
-    zoom = _zoom_prompt(now, snap, state, lookahead)
-    if zoom is not None:
-        return zoom
+    call = _call_prompt(now, snap, state, lookahead, skip_words)
+    if call is not None:
+        return call
     return _calendar_prompt(now, snap, state)
 
 
@@ -112,12 +124,12 @@ def apply_result(state: WatcherState, prompt: Prompt, accepted: bool, now: datet
     for key in recorded:
         previous = state.handled.get(key)
         state.handled[key] = prompt.expires_at if previous is None else max(previous, prompt.expires_at)
-    if prompt.kind == "zoom":
-        state.zoom_needs_decision = False
-    if prompt.kind == "zoom" and prompt.zoom_session_id:
+    if prompt.kind == "call":
+        state.call_needs_decision = False
+    if prompt.kind == "call" and prompt.call_session_id:
         # An ad hoc answer means no calendar meeting was known yet; one that appears later is the same call.
-        state.zoom_decided_session = prompt.zoom_session_id
-        state.zoom_decided_at = now
+        state.call_decided_session = prompt.call_session_id
+        state.call_decided_at = now
     if not accepted:
         launch = state.active_launch
         if launch is not None and (prompt.kind == "crash" or set(prompt.keys) & set(launch.keys)):
@@ -130,7 +142,7 @@ def apply_result(state: WatcherState, prompt: Prompt, accepted: bool, now: datet
         expires_at=prompt.expires_at,
         seen_running=False,
         launched_at=now,
-        zoom_session_id=prompt.zoom_session_id,
+        call_session_id=prompt.call_session_id,
         call_session=prompt.call_session,
     )
 
@@ -164,50 +176,82 @@ def _sync_granola(state: WatcherState, snap: Snapshot, now: datetime) -> None:
         launch.missing_since = now
 
 
-def _consider_zoom(now: datetime, snap: Snapshot, state: WatcherState, fresh_zoom_seconds: float) -> None:
+def _consider_call(now: datetime, snap: Snapshot, state: WatcherState, fresh_call_seconds: float) -> bool:
+    """Note the call under way. True when it became the current one just now as a join: it is new, or it replaced another
+    (paused or not, and whether or not it gets a card)."""
     launch = state.active_launch
-    if launch is not None and launch.zoom_session_id and launch.zoom_session_id != snap.zoom_session_id:
+    if launch is not None and launch.call_session_id and launch.call_session_id != snap.call_session_id:
         state.active_launch = None
-    if not snap.zoom_session_id:
-        state.zoom_session_id = None
-        state.zoom_needs_decision = False
-        state.zoom_decided_session = None
-        state.zoom_decided_at = None
-        return
-    if snap.zoom_session_id == state.zoom_session_id:
-        return
-    age = snap.zoom_age_seconds
-    transitioning = state.zoom_session_id is not None
-    state.zoom_session_id = snap.zoom_session_id
-    zoom_key = f"zoom:{snap.zoom_session_id}"
-    fresh = transitioning or (age is not None and age <= fresh_zoom_seconds)
+    if not snap.call_session_id:
+        state.call_session_id = None
+        state.call_needs_decision = False
+        state.call_decided_session = None
+        state.call_decided_at = None
+        return False
+    if snap.call_session_id == state.call_session_id:
+        return False
+    age = snap.call_age_seconds
+    previous = state.call_session_id
+    state.call_session_id = snap.call_session_id
+    # One call replacing another counts as a join whatever its age when it can't be an older call coming back
+    # as the newest ends: its age isn't known, or it is in the same place as the one it replaces, where only one
+    # call can run (Zoom moving to another meeting).
+    replaced = previous is not None and (age is None or _place(previous) == _place(snap.call_session_id))
+    fresh = replaced or (age is not None and age <= fresh_call_seconds)
     if snap.paused or not fresh:
-        state.zoom_needs_decision = False
-        state.handled[zoom_key] = now + ZOOM_HOLD
+        state.call_needs_decision = False
+        state.handled[snap.call_session_id] = now + CALL_HOLD
+        return fresh
+    state.call_needs_decision = True
+    return True
+
+
+def _place(session_id: str) -> str:
+    """Where a call runs, which holds one call at a time: its provider, and for Meet its browser too, because a call
+    in Chrome and another in Edge can be under way together."""
+    provider, _, rest = session_id.partition(":")
+    return f"{provider}:{rest.partition(':')[0]}" if provider == "meet" else provider
+
+
+def _follow_call(now: datetime, snap: Snapshot, state: WatcherState, lookahead: timedelta, joined: bool) -> None:
+    """Notes started from a calendar meeting's call follow the user to another call during that meeting: a rejoin,
+    or a call on another provider and back. Checked every tick, because the older call that comes back isn't a
+    join and never gets as far as a card. They follow only to a call that has just been joined (``joined``), or one
+    they followed before (it is among their keys). An older call that was under way all along, such as an ad hoc
+    Teams call when the meeting's Zoom was joined, isn't the meeting's: following it when Zoom ends would bring a
+    restart card for a meeting whose call is over."""
+    launch = state.active_launch
+    if launch is None or not launch.call_session or not snap.call_session_id or snap.call_session_id == launch.call_session:
         return
-    state.zoom_needs_decision = True
+    if not (joined or snap.call_session_id in launch.keys):
+        return
+    event = _match_event([event for event in snap.events if not event.skipped], now, lookahead, state.handled)
+    if event is not None and event.key() in launch.keys:
+        launch.follow(snap.call_session_id)
 
 
 def _answer_meetings_of_an_adhoc_call(now: datetime, state: WatcherState, snap: Snapshot, lookahead: timedelta) -> None:
-    """An ad hoc Zoom answer also answers the meetings that call could have been for, when the
+    """An ad hoc call's answer also answers the meetings that call could have been for, when the
     calendar only loads them during the call. Each is recorded as answered once it is under way in
     that call, so the answer (a start or a Cancel) outlasts the call instead of a card asking about it
     once the call ends. A meeting that only starts after the call keeps its own card."""
-    if state.zoom_decided_at is None or not snap.zoom_session_id or state.zoom_decided_session != snap.zoom_session_id:
+    if state.call_decided_at is None or not snap.call_session_id or state.call_decided_session != snap.call_session_id:
         return
-    covered_until = min(now, state.zoom_decided_at + lookahead)
+    covered_until = min(now, state.call_decided_at + lookahead)
     for event in snap.events:
         if not event.skipped and event.start <= covered_until:
             previous = state.handled.get(event.key())
             state.handled[event.key()] = event.end if previous is None else max(previous, event.end)
 
 
-def _zoom_prompt(now: datetime, snap: Snapshot, state: WatcherState, lookahead: timedelta) -> Prompt | None:
-    if not state.zoom_needs_decision or not snap.present or not snap.zoom_session_id:
+def _call_prompt(
+    now: datetime, snap: Snapshot, state: WatcherState, lookahead: timedelta, skip_words: tuple[str, ...]
+) -> Prompt | None:
+    if not state.call_needs_decision or not snap.present or not snap.call_session_id:
         return None
-    zoom_key = f"zoom:{snap.zoom_session_id}"
-    if zoom_key in state.handled:
-        state.zoom_needs_decision = False
+    call_key = snap.call_session_id
+    if call_key in state.handled:
+        state.call_needs_decision = False
         return None
     meetings = [event for event in snap.events if not event.skipped]
     event = _match_event(meetings, now, lookahead, state.handled)
@@ -215,39 +259,44 @@ def _zoom_prompt(now: datetime, snap: Snapshot, state: WatcherState, lookahead: 
         # A call during a meeting whose title has a skip word is that meeting, so it is skipped too.
         skipped = _match_event([event for event in snap.events if event.skipped], now, lookahead, state.handled)
         if skipped is not None:
-            state.handled[zoom_key] = max(skipped.end, now + ZOOM_HOLD)
-            state.zoom_needs_decision = False
+            state.handled[call_key] = max(skipped.end, now + CALL_HOLD)
+            state.call_needs_decision = False
+            return None
+        # So is a call with no meeting at all whose own title has one.
+        if snap.call_title and skip_word(snap.call_title, skip_words) is not None:
+            state.handled[call_key] = now + CALL_HOLD
+            state.call_needs_decision = False
+            # A meeting that loads later and is under way in this call is covered, as an ad hoc answer covers it.
+            state.call_decided_session = call_key
+            state.call_decided_at = now
             return None
     if event is not None and event.key() in state.handled:
-        launch = state.active_launch
-        if launch is not None and launch.call_session and event.key() in launch.keys:
-            launch.call_session = snap.zoom_session_id  # the same meeting's call, rejoined
-        state.handled[zoom_key] = max(event.end, now + ZOOM_HOLD)
-        state.zoom_needs_decision = False
+        state.handled[call_key] = max(event.end, now + CALL_HOLD)
+        state.call_needs_decision = False
         return None
     if event is not None:
         upcoming = event.start > now
         return Prompt(
-            kind="zoom",
+            kind="call",
             title=event.summary,
             payload=event.payload(),
-            keys=(zoom_key, event.key()),
+            keys=(call_key, event.key()),
             expires_at=event.end,
             # Cancelling may mean "I'm still in the current meeting", so the next one keeps its own prompt.
-            cancel_keys=(zoom_key,) if upcoming else None,
+            cancel_keys=(call_key,) if upcoming else None,
             covers=_covers(_ongoing(snap.events, now, state.handled), event),
-            call_session=snap.zoom_session_id,
+            call_session=snap.call_session_id,
         )
-    title = snap.zoom_title or ADHOC_ZOOM_TITLE
+    title = snap.call_title or ADHOC_CALL_TITLES.get(snap.call_provider, ADHOC_CALL_TITLE)
     # A call with no calendar meeting goes to Granola as an hour-long meeting of its own.
-    adhoc = CalendarEvent(f"zoom-{snap.zoom_session_id.replace(':', '-')}", title, now, now + DEFAULT_MEETING_LENGTH)
+    adhoc = CalendarEvent(snap.call_session_id.replace(":", "-"), title, now, now + DEFAULT_MEETING_LENGTH)
     return Prompt(
-        kind="zoom",
+        kind="call",
         title=title,
         payload=adhoc.payload(),
-        keys=(zoom_key,),
-        expires_at=now + ADHOC_ZOOM_LENGTH,
-        zoom_session_id=snap.zoom_session_id,
+        keys=(call_key,),
+        expires_at=now + ADHOC_CALL_LENGTH,
+        call_session_id=snap.call_session_id,
     )
 
 
@@ -286,8 +335,8 @@ def _crash_prompt(now: datetime, snap: Snapshot, state: WatcherState) -> Prompt 
         return None
     if snap.granola_running or launch.missing_since is None:
         return None
-    # Notes started from a Zoom call: once that meeting's call is over, Granola closing ends the meeting too.
-    if launch.call_session and snap.zoom_session_id != launch.call_session:
+    # Notes started from a call: once that meeting's call is over, Granola closing ends the meeting too.
+    if launch.call_session and snap.call_session_id != launch.call_session:
         return None
     # Granola was seen after the launch, so going missing comes later still: one grace covers both.
     if now < launch.missing_since + CRASH_GRACE:
@@ -303,7 +352,7 @@ def _crash_prompt(now: datetime, snap: Snapshot, state: WatcherState) -> Prompt 
         payload=launch.payload,
         keys=launch.keys,
         expires_at=launch.expires_at,
-        zoom_session_id=launch.zoom_session_id,
+        call_session_id=launch.call_session_id,
         call_session=launch.call_session,
     )
 
@@ -311,7 +360,7 @@ def _crash_prompt(now: datetime, snap: Snapshot, state: WatcherState) -> Prompt 
 def _match_event(events, now: datetime, lookahead: timedelta, handled=()) -> CalendarEvent | None:
     """Joining early for the next meeting beats an ongoing one that is about to end.
 
-    An ongoing meeting that was already decided wins, because a Zoom rejoin near its end
+    An ongoing meeting that was already decided wins, because a rejoin near its end
     is far more likely than an early join.
     """
     horizon = now + lookahead

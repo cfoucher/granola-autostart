@@ -1,9 +1,11 @@
 """Entry point for every mode: ``python -m granola_autostart`` from source, and GranolaAutostart.exe when packaged.
 
 ``--notice`` shows the countdown card without importing the watcher, so the card opens quickly.
-``--supervise`` runs the supervisor, which stays up all day, so it loads only the standard library.
-``--settings`` and ``--setup`` open the Settings window. Everything else (the watcher, ``--stop``,
-``--check``, ``--install``) is watcher.py's command line.
+``--supervise`` runs the supervisor, which stays up all day, so it loads only the standard library. ``--stop`` does
+too, so it is the likeliest mode to run on libraries that a failed setup left half-copied, though it still needs
+Python's own files. Setup and the uninstaller don't rely on it: they stop the app with a PowerShell of their own.
+``--settings`` and ``--setup`` open the Settings window. Everything else (the watcher, ``--check``, ``--install``) is
+watcher.py's command line.
 """
 
 from __future__ import annotations
@@ -45,6 +47,19 @@ def main() -> int:
 
         setup_logging("supervisor-log.txt")
         return processes.supervise()
+    if mode == "--stop":
+        try:
+            from granola_autostart import processes
+            from granola_autostart.settings import setup_logging
+
+            processes.stop()
+            setup_logging("cli-log.txt").info("granola autostart stopped")
+            return 0
+        except Exception:
+            # Nothing shows an error under pythonw or in the packaged exe, so the reason goes to the log, and the exit
+            # code says this failed.
+            _log_failure("cli-log.txt", "could not stop the app")
+            return 1
     if mode in ("--settings", "--setup"):
         from granola_autostart import settings_app
 

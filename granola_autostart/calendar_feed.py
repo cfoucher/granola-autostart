@@ -5,13 +5,16 @@ from __future__ import annotations
 import logging
 import re
 import time
-import urllib.error
 import urllib.request
 import zlib
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from icalendar import Calendar
 import recurring_ical_events
+
+from .net import https_opener
+from .settings import clean_addresses
 
 log = logging.getLogger("granola_autostart")
 MAX_FEED_BYTES = 64 * 1024 * 1024
@@ -26,8 +29,11 @@ class CalendarEvent:
     summary: str
     start: datetime
     end: datetime
-    # Its title has a skip word. It never prompts, but a Zoom join during it is not asked about either.
+    # Its title has a skip word. It never prompts, but a call joined during it is not asked about either.
     skipped: bool = False
+    # One of the calendar's declined addresses declined it. It is kept through the download only so that
+    # merge_events can leave out the same meeting on another calendar too.
+    declined: bool = False
 
     def key(self) -> str:
         return f"event:{self.id}:{self.start.isoformat()}"
@@ -42,12 +48,15 @@ class CalendarEvent:
 
 
 def merge_events(*groups: list[CalendarEvent]) -> list[CalendarEvent]:
-    """Keep one copy when the same meeting is on more than one calendar."""
+    """Keep one copy when the same meeting is on more than one calendar, and none when any copy is declined."""
     by_key: dict[str, CalendarEvent] = {}
+    declined: set[str] = set()
     for events in groups:
         for event in events:
             by_key.setdefault(event.key(), event)
-    return sorted(by_key.values(), key=lambda event: event.start)
+            if event.declined:
+                declined.add(event.key())
+    return sorted((event for key, event in by_key.items() if key not in declined), key=lambda event: event.start)
 
 
 def normalize_feed_url(url: str) -> str:
@@ -60,14 +69,7 @@ def normalize_feed_url(url: str) -> str:
     return cleaned
 
 
-class _HttpsOnlyRedirects(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if not newurl.casefold().startswith("https://"):
-            raise urllib.error.HTTPError(req.full_url, code, "redirect away from https refused", headers, fp)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
-_opener = urllib.request.build_opener(_HttpsOnlyRedirects)
+_opener = https_opener()
 
 
 def fetch_ics(url: str, timeout: float = 30) -> str:
@@ -90,7 +92,9 @@ def _read_capped(response, limit: int, deadline: float) -> bytes:
     while True:
         if time.monotonic() > deadline:
             raise TimeoutError("calendar download took too long")
-        chunk = response.read(64 * 1024)
+        # read1 gives what has arrived, not a whole chunk, so a server that trickles can't outlast the deadline: it is
+        # looked at after every read, and the socket's timeout ends a read that gets nothing.
+        chunk = response.read1(64 * 1024)
         if not chunk:
             return b"".join(chunks)
         total += len(chunk)
@@ -197,10 +201,15 @@ def feed_owner(ics_text: str) -> str | None:
     return name.casefold() if name and _EMAIL.fullmatch(name) else None
 
 
-def my_addresses(user_email: str, owners) -> frozenset[str]:
-    """Every address declines are checked against: the typed one plus each calendar's own."""
-    found = {address.strip().casefold() for address in (user_email, *owners) if address and address.strip()}
-    return frozenset(found)
+def declined_addresses(declined_by: tuple[str, ...] | None, owner: str | None, known_owners, user_email: str) -> tuple[str, ...]:
+    """The addresses one calendar's declines are checked against, in lower case and once each.
+
+    A list (``declined_by``) is exactly those addresses. Automatic (None) is the calendar's own address
+    when it has one, otherwise every address the app knows, and in both cases the old ``user_email``.
+    """
+    if declined_by is not None:
+        return clean_addresses(declined_by, lower=True) or ()
+    return clean_addresses([*([owner] if owner else known_owners), user_email], lower=True) or ()
 
 
 def events_between(
@@ -209,10 +218,16 @@ def events_between(
     window_end: datetime,
     *,
     ignore_title_substrings: tuple[str, ...] = (),
-    user_emails: frozenset[str] = frozenset(),
+    user_emails: Collection[str] = frozenset(),
     keep_skipped: bool = False,
+    keep_declined: bool = False,
 ) -> list[CalendarEvent]:
-    """Meetings in the window. With ``keep_skipped``, ones with a skip word stay in, marked ``skipped``."""
+    """Meetings in the window. With ``keep_skipped``, ones with a skip word stay in, marked ``skipped``.
+
+    ``user_emails`` are the addresses a decline is looked for in, in lower case. With ``keep_declined``,
+    meetings declined by one of them stay in, marked ``declined``.
+    """
+    user_emails = frozenset(user_emails)
     calendar = Calendar.from_ical(prefilter_ics(ics_text, window_start, window_end))
     _give_missing_ends_an_hour(calendar)
     # Starts and ends are written in today's UTC offset, which stored event keys already use.
@@ -232,20 +247,22 @@ def events_between(
             user_emails=user_emails,
             series_uids=series_uids,
         )
-        if event is not None and event.end > event.start and (keep_skipped or not event.skipped):
+        if event is None or event.end <= event.start:
+            continue
+        if (keep_skipped or not event.skipped) and (keep_declined or not event.declined):
             found.append(event)
     found.sort(key=lambda item: item.start)
     return found
 
 
-def skip_word(summary: str, words) -> str | None:
+def skip_word(summary: str, words: Iterable[str]) -> str | None:
     """The first skip word in a meeting's title, if it has one."""
     return next((word for word in words if word and word.casefold() in summary.casefold()), None)
 
 
 def meetings_next_day(events: list[CalendarEvent], now: datetime) -> int:
-    """How many meetings start in the next day, leaving out skipped ones: a calendar's health at a glance."""
-    return sum(1 for event in events if not event.skipped and now <= event.start < now + timedelta(days=1))
+    """How many meetings start in the next day, leaving out skipped and declined ones: a calendar's health at a glance."""
+    return sum(1 for event in events if not event.skipped and not event.declined and now <= event.start < now + timedelta(days=1))
 
 
 def _give_missing_ends_an_hour(calendar) -> None:
@@ -272,8 +289,6 @@ def _component_to_event(
     status = str(component.get("status") or "").strip().upper()
     if status in {"CANCELLED", "CANCELED"}:
         return None
-    if _declined(component, user_emails):
-        return None
     start_value = _raw_dt(component.get("dtstart"))
     # recurring_ical_events always sets DTEND on an occurrence, working it out from DURATION if need be.
     end_value = _raw_dt(component.get("dtend"))
@@ -294,6 +309,7 @@ def _component_to_event(
         start=start,
         end=end,
         skipped=skipped,
+        declined=_declined(component, user_emails),
     )
 
 

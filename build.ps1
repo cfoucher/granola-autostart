@@ -2,8 +2,8 @@
 Build the installer: the tests under the coverage ratchet, then the PyInstaller one-folder app, then the Inno Setup
 installer.
 
-Needs requirements-build.txt installed with -c constraints.txt (in .venv, or on PATH as in CI) and Inno Setup 7
-(6 also works).
+Needs requirements-build.txt installed with -c constraints.txt (in .venv, or on PATH as in CI) and Inno Setup 7, or
+6.4 and later (the installer's script uses CopyFile).
     .\build.ps1              # everything
     .\build.ps1 -SkipTests   # CI, which runs the tests in its checks job
 The installer lands in dist\GranolaAutostart-<version>-setup.exe.
