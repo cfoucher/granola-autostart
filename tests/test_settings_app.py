@@ -1520,16 +1520,39 @@ def dotnet(monkeypatch) -> SimpleNamespace:
     return screen
 
 
+class Event:
+    """pywebview's window events and .NET's: handlers are added with +=."""
+
+    def __init__(self):
+        self.handlers = []
+
+    def __iadd__(self, handler):
+        self.handlers.append(handler)
+        return self
+
+    def fire(self, *args):
+        for handler in self.handlers:
+            handler(*args)
+
+
 def form(width: int, height: int) -> SimpleNamespace:
-    settings = SimpleNamespace(AreDefaultContextMenusEnabled=False)
+    """The window's WinForms form, before WebView2 has finished starting: there is no CoreWebView2 yet."""
     return SimpleNamespace(
         Width=width,
         Height=height,
         StartPosition="centre on the pointer's screen",
         Location=None,
         Invoke=lambda call: call(),
-        webview=SimpleNamespace(CoreWebView2=SimpleNamespace(Settings=settings)),
+        webview=SimpleNamespace(CoreWebView2=None, CoreWebView2InitializationCompleted=Event()),
     )
+
+
+def finish_starting(window: SimpleNamespace, success: bool = True) -> SimpleNamespace:
+    """WebView2 finishing its start-up: CoreWebView2 appears, and the control raises its ready event. Returns CoreWebView2."""
+    webview = window.native.webview
+    webview.CoreWebView2 = SimpleNamespace(Settings=SimpleNamespace(AreDefaultContextMenusEnabled=False), ContextMenuRequested=Event())
+    webview.CoreWebView2InitializationCompleted.fire(webview, SimpleNamespace(IsSuccess=success))
+    return webview.CoreWebView2
 
 
 def test_a_new_window_opens_in_the_middle_of_the_primary_monitor(dotnet):
@@ -1541,34 +1564,122 @@ def test_a_new_window_opens_in_the_middle_of_the_primary_monitor(dotnet):
     assert tall.native.Location == (562, 40)  # the title bar stays on screen
 
 
-def test_text_fields_get_their_right_click_menu_back(dotnet):
+def test_text_fields_get_their_right_click_menu_back_once_webview2_has_started(caplog):
     window = SimpleNamespace(native=form(796, 660))
     settings_app._enable_text_field_menus(window)
-    assert window.native.webview.CoreWebView2.Settings.AreDefaultContextMenusEnabled is True
+    assert window.native.webview.CoreWebView2 is None  # not started yet: there is nothing to switch on
+    with caplog.at_level(logging.INFO, logger="granola_autostart"):
+        core = finish_starting(window)
+    assert core.Settings.AreDefaultContextMenusEnabled is True
+    assert core.ContextMenuRequested.handlers == [settings_app._trim_context_menu]
+    assert "text field context menus enabled" in caplog.text
 
 
-def test_without_pythonnet_the_window_still_opens_uncentred_and_without_menus(monkeypatch, caplog):
+def test_the_right_click_menu_is_switched_on_after_pywebview_has_switched_it_off():
+    window = SimpleNamespace(native=form(796, 660))
+
+    def pywebview_ready(sender, args):  # as pywebview's own, which subscribed first
+        sender.CoreWebView2.Settings.AreDefaultContextMenusEnabled = False
+
+    window.native.webview.CoreWebView2InitializationCompleted += pywebview_ready
+    settings_app._enable_text_field_menus(window)
+    assert finish_starting(window).Settings.AreDefaultContextMenusEnabled is True
+
+
+def test_a_webview2_that_failed_to_start_keeps_its_right_click_menu_off():
+    window = SimpleNamespace(native=form(796, 660))
+    settings_app._enable_text_field_menus(window)
+    core = finish_starting(window, success=False)
+    assert core.Settings.AreDefaultContextMenusEnabled is False and core.ContextMenuRequested.handlers == []
+
+
+class RefusingSettings:
+    def __setattr__(self, name, value):
+        raise RuntimeError("WebView2 refused the setting")
+
+
+def test_a_right_click_menu_webview2_will_not_switch_on_is_logged_not_raised(caplog):
+    window = SimpleNamespace(native=form(796, 660))
+    settings_app._enable_text_field_menus(window)
+    sender = SimpleNamespace(CoreWebView2=SimpleNamespace(Settings=RefusingSettings(), ContextMenuRequested=Event()))
+    window.native.webview.CoreWebView2InitializationCompleted.fire(sender, SimpleNamespace(IsSuccess=True))
+    assert "right-click menus stay off (RuntimeError)" in caplog.text
+    assert sender.CoreWebView2.ContextMenuRequested.handlers == []
+
+
+def test_without_pythonnet_the_window_still_opens_uncentred(monkeypatch, caplog):
     monkeypatch.setitem(sys.modules, "System", None)
     window = SimpleNamespace(native=form(796, 660))
     settings_app._center_on_primary(window)
-    settings_app._enable_text_field_menus(window)
-    assert window.native.Location is None and not window.native.webview.CoreWebView2.Settings.AreDefaultContextMenusEnabled
-    assert "window not centered" in caplog.text and "right-click menus stay off" in caplog.text
+    assert window.native.Location is None and "window not centered" in caplog.text
 
 
-class Event:
-    """pywebview's window events: handlers are added with +=."""
+def test_without_a_webview2_control_the_window_still_opens_without_menus(caplog):
+    settings_app._enable_text_field_menus(SimpleNamespace(native=SimpleNamespace(webview=None)))
+    assert "right-click menus stay off (AttributeError)" in caplog.text
 
-    def __init__(self):
-        self.handlers = []
 
-    def __iadd__(self, handler):
-        self.handlers.append(handler)
-        return self
+class MenuItem:
+    """A WebView2 context menu item, told apart from the others by identity. Kind is a .NET enum there, which pythonnet gives as its name."""
 
-    def fire(self):
-        for handler in self.handlers:
-            handler()
+    def __init__(self, name: str, kind: str = "Command"):
+        self.Name, self.Kind = name, kind
+
+
+def separator() -> MenuItem:
+    return MenuItem("other", "Separator")
+
+
+class MenuItems(list):
+    """A .NET IList: Clear and Add, as well as a list's own."""
+
+    def Clear(self):
+        self.clear()
+
+    def Add(self, item):
+        self.append(item)
+
+
+def right_click(*items: MenuItem) -> SimpleNamespace:
+    return SimpleNamespace(MenuItems=MenuItems(items), Handled=False)
+
+
+def shown(args: SimpleNamespace) -> list[str]:
+    return ["-" if item.Kind == "Separator" else item.Name for item in args.MenuItems]
+
+
+def test_the_right_click_menu_in_a_text_field_is_cut_down_to_the_editing_commands():
+    # What WebView2 offers for a right-click in a text field, in its order.
+    emoji, undo, redo, cut, copy, paste, plain, select_all, direction, more_tools = (
+        MenuItem(name) for name in ("emoji", "undo", "redo", "cut", "copy", "paste", "pasteAndMatchStyle", "selectAll", "other", "moreTools")
+    )
+    direction.Kind = "Submenu"
+    after_emoji, after_redo, after_select_all, after_direction = (separator() for _ in range(4))
+    args = right_click(emoji, after_emoji, undo, redo, after_redo, cut, copy, paste, plain, select_all, after_select_all, direction, after_direction, more_tools)
+    settings_app._trim_context_menu(None, args)
+    assert shown(args) == ["undo", "redo", "-", "cut", "copy", "paste", "selectAll"]
+    assert list(args.MenuItems) == [undo, redo, after_redo, cut, copy, paste, select_all]  # the original items, separator included
+    assert args.Handled is False
+
+
+def test_separators_in_the_trimmed_menu_are_collapsed_and_never_lead_or_trail():
+    items = [separator(), separator(), MenuItem("undo"), MenuItem("emoji"), MenuItem("redo"), separator(), separator(), MenuItem("moreTools")]
+    items += [separator(), MenuItem("cut"), separator(), separator()]
+    args = right_click(*items)
+    settings_app._trim_context_menu(None, args)
+    assert shown(args) == ["undo", "redo", "-", "cut"]  # none between Undo and Redo, which nothing divided
+
+
+def test_a_menu_with_no_editing_commands_is_not_shown():
+    args = right_click(MenuItem("back"), separator(), MenuItem("reload"))
+    settings_app._trim_context_menu(None, args)
+    assert args.Handled is True
+
+
+def test_a_right_click_menu_that_cannot_be_trimmed_is_left_as_it_is(caplog):
+    args = SimpleNamespace(MenuItems=None, Handled=False)
+    settings_app._trim_context_menu(None, args)
+    assert args.Handled is False and "right-click menu left as it is (TypeError)" in caplog.text
 
 
 @pytest.fixture
@@ -1609,9 +1720,10 @@ def test_settings_opens_its_page_in_a_dark_window_and_starts_a_quit_app(webview)
     assert window.options["js_api"]._window is window
     assert webview.started == [{"gui": "edgechromium", "private_mode": True}]
     assert webview.spawned[-1][-1] == "--supervise"
-    for event in ("before_show", "shown", "loaded"):
+    for event in ("before_show", "shown"):
         getattr(window.events, event).fire()
-    assert webview.styled == ["_center_on_primary", ("_style_title_bar", True), "_enable_text_field_menus"]
+    assert webview.styled == ["_center_on_primary", "_enable_text_field_menus", ("_style_title_bar", True)]
+    assert window.events.loaded.handlers == []  # too late for the menu: it is switched on before the page loads
 
 
 def test_settings_lets_go_of_its_mutex_once_its_window_has_closed(webview, monkeypatch):
