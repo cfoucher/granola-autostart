@@ -16,10 +16,12 @@ TABLE = {
     "ms-teams.exe": [70],
     "chrome.exe": [50, 51],
     "msedge.exe": [60],
+    "shift.exe": [80, 81],
 }
 ALL_ON = {"zoom": True, "teams": True, "meet": True}
 CHROME = "C:#Program Files#Google#Chrome#Application#chrome.exe"
 EDGE = "C:#Program Files (x86)#Microsoft#Edge#Application#msedge.exe"
+SHIFT = "C:#Users#me#AppData#Local#PurpleShift#chromium#shift.exe"
 TEAMS = "MSTeams_8wekyb3d8bbwe"
 
 
@@ -350,6 +352,14 @@ def test_teams_windows_name_the_meeting_unless_they_only_name_teams():
     assert calls.teams_window_title([]) is None
 
 
+def test_a_leading_unread_count_does_not_make_one_of_teams_own_pages_a_meeting_name():
+    assert calls.teams_window_title(["(2) Chat | Microsoft Teams"]) is None
+    assert calls.teams_window_title(["(12) Weekly sync | Microsoft Teams", "(2) Chat | Microsoft Teams"]) == "Weekly sync"
+    for page in ("Meeting", "Meetings", "Home", "People", "Copilot", "Microsoft Teams (free)", "Microsoft Teams meeting"):
+        assert calls.teams_window_title([f"{page} | Microsoft Teams", f"(4) {page} | Microsoft Teams"]) is None
+    assert calls.teams_window_title(["Microsoft Teams meeting | Microsoft Teams", "Weekly sync | Microsoft Teams"]) == "Weekly sync"
+
+
 def test_teams_main_window_titles_with_a_chat_or_channel_in_them_never_name_the_meeting():
     # Chat and channel titles keep a " | " after the suffix is gone, and can be longer than the meeting's own.
     titles = ["Chat | Alexandra Montgomery-Whitfield | Microsoft Teams", "Design team | General | Microsoft Teams", "Standup | Microsoft Teams"]
@@ -381,6 +391,12 @@ def test_teams_windows_are_read_once_a_tick_and_only_its_visible_ones_count(monk
         ("Meet - Weekly sync and 3 more pages - Work - Microsoft\u200b Edge", "Weekly sync"),
         ("Meet - Weekly sync and 1 more page - Personal - Microsoft\u200b Edge", "Weekly sync"),
         ("Meet - Weekly sync - Google Chrome - Work", "Weekly sync"),
+        ("Meet - Weekly sync - Shift Browser", "Weekly sync"),
+        ("Meet – Weekly sync - Shift Browser", "Weekly sync"),
+        ("Meet - Q3 - planning - Shift Browser", "Q3 - planning"),
+        ("Meet - Weekly sync and 2 more pages - Shift Browser", "Weekly sync"),
+        ("Meet - abc-defg-hij - Shift Browser", None),
+        ("Meet - Shift Browser", None),
         ("Meet - Q3 - planning - Google Chrome", "Q3 - planning"),
         ("Meet - Weekly sync", "Weekly sync"),  # an app window, with no browser name
         ("  Meet - Weekly sync - Google Chrome  ", "Weekly sync"),
@@ -404,10 +420,11 @@ def test_only_a_title_that_starts_with_meet_and_a_dash_is_a_meet_tab():
     assert calls.is_meet_title("Meet - abc-defg-hij - Google Chrome")
     assert calls.is_meet_title("Meet \u2013 Weekly sync - Google Chrome")
     assert calls.is_meet_title("\u200bMeet - Weekly sync")
+    assert calls.is_meet_title("Meet - abc-defg-hij - Shift Browser")
     assert not any(calls.is_meet_title(title) for title in ("Google Meet", "Meet", "Meeting - x", "Roadmap - Meet - x", "meet - x"))
 
 
-def meet_world(monkeypatch, *windows, browser=CHROME, values=None):
+def browser_world(monkeypatch, *windows, browser=CHROME, values=None):
     """A browser holding the microphone, with the windows it shows."""
     use_registry(monkeypatch, non_packaged={browser: values or in_use(20)})
     return use_windows(monkeypatch, *windows)
@@ -415,7 +432,7 @@ def meet_world(monkeypatch, *windows, browser=CHROME, values=None):
 
 def test_a_browser_holding_the_microphone_in_front_of_a_meet_tab_is_a_meet_call(monkeypatch):
     values = in_use(20)
-    meet_world(monkeypatch, (1, 50, True, "Meet - Weekly sync - Google Chrome"), values=values)
+    browser_world(monkeypatch, (1, 50, True, "Meet - Weekly sync - Google Chrome"), values=values)
     call = CallWatch().current({"meet": True}, TABLE)
     assert call.provider == "meet" and call.title == "Weekly sync"
     assert call.session_id == f"meet:chrome:{values['LastUsedTimeStart']}" and 19 < call.age_seconds < 30
@@ -423,13 +440,13 @@ def test_a_browser_holding_the_microphone_in_front_of_a_meet_tab_is_a_meet_call(
 
 def test_a_meet_call_in_edge_is_recognised_the_same_way(monkeypatch):
     values = in_use(5)
-    meet_world(monkeypatch, (1, 60, True, "Meet - abc-defg-hij - Work - Microsoft\u200b Edge"), browser=EDGE, values=values)
+    browser_world(monkeypatch, (1, 60, True, "Meet - abc-defg-hij - Work - Microsoft\u200b Edge"), browser=EDGE, values=values)
     call = CallWatch().current({"meet": True}, TABLE)
     assert call.session_id == f"meet:msedge:{values['LastUsedTimeStart']}" and call.title is None
 
 
 def test_a_browser_holding_the_microphone_without_a_meet_tab_in_front_is_not_a_call(monkeypatch):
-    meet_world(
+    browser_world(
         monkeypatch,
         (1, 50, True, "Voice recorder - Google Chrome"),
         (2, 50, False, "Meet - Hidden - Google Chrome"),  # not visible
@@ -440,7 +457,7 @@ def test_a_browser_holding_the_microphone_without_a_meet_tab_in_front_is_not_a_c
 
 def test_a_meet_call_is_decided_when_its_session_appears_and_kept_for_the_whole_session(monkeypatch):
     watch = CallWatch()
-    windows = meet_world(monkeypatch, (1, 50, True, "Meet - Weekly sync - Google Chrome"))
+    windows = browser_world(monkeypatch, (1, 50, True, "Meet - Weekly sync - Google Chrome"))
     first = watch.current({"meet": True}, TABLE)
     # The user switches to another tab: the window now carries that tab's title.
     windows.windows[1] = (50, True, "Inbox - Google Chrome")
@@ -451,7 +468,7 @@ def test_a_meet_call_is_decided_when_its_session_appears_and_kept_for_the_whole_
 
 def test_a_session_that_was_not_a_meet_call_stays_not_a_call_even_if_a_meet_tab_comes_to_the_front(monkeypatch):
     watch = CallWatch()
-    windows = meet_world(monkeypatch, (1, 50, True, "Voice recorder - Google Chrome"))
+    windows = browser_world(monkeypatch, (1, 50, True, "Voice recorder - Google Chrome"))
     assert watch.current({"meet": True}, TABLE) is None
     windows.windows[1] = (50, True, "Meet - Weekly sync - Google Chrome")
     assert watch.current({"meet": True}, TABLE) is None
@@ -460,7 +477,7 @@ def test_a_session_that_was_not_a_meet_call_stays_not_a_call_even_if_a_meet_tab_
 
 def test_a_new_browser_session_is_looked_at_afresh_and_an_ended_one_is_forgotten(monkeypatch):
     watch = CallWatch()
-    windows = meet_world(monkeypatch, (1, 50, True, "Meet - Weekly sync - Google Chrome"))
+    windows = browser_world(monkeypatch, (1, 50, True, "Meet - Weekly sync - Google Chrome"))
     assert watch.current({"meet": True}, TABLE).title == "Weekly sync"
     use_registry(monkeypatch, non_packaged={CHROME: stopped()})
     assert watch.current({"meet": True}, TABLE) is None
@@ -471,7 +488,7 @@ def test_a_new_browser_session_is_looked_at_afresh_and_an_ended_one_is_forgotten
 
 
 def test_a_browser_that_is_not_running_is_not_in_a_call_whatever_the_record_says(monkeypatch):
-    windows = meet_world(monkeypatch, (1, 50, True, "Meet - Weekly sync - Google Chrome"))
+    windows = browser_world(monkeypatch, (1, 50, True, "Meet - Weekly sync - Google Chrome"))
     without_chrome = {name: pids for name, pids in TABLE.items() if name != "chrome.exe"}
     watch = CallWatch()
     assert watch.current({"meet": True}, without_chrome) is None  # a crash left the record saying it is in use
@@ -485,7 +502,7 @@ def test_a_browser_that_is_not_running_is_not_in_a_call_whatever_the_record_says
 
 def test_a_session_that_ended_with_its_browser_is_forgotten(monkeypatch):
     watch = CallWatch()
-    windows = meet_world(monkeypatch, (1, 50, True, "Meet - Weekly sync - Google Chrome"))
+    windows = browser_world(monkeypatch, (1, 50, True, "Meet - Weekly sync - Google Chrome"))
     assert watch.current({"meet": True}, TABLE) is not None
     assert watch.current({"meet": True}, {"granola.exe": [77]}) is None  # the browser has gone
     windows.windows[1] = (50, True, "Inbox - Google Chrome")
@@ -495,7 +512,7 @@ def test_a_session_that_ended_with_its_browser_is_forgotten(monkeypatch):
 def test_a_record_that_cannot_be_read_this_time_keeps_the_meet_calls_known(monkeypatch):
     watch = CallWatch()
     values = in_use(20)
-    windows = meet_world(monkeypatch, (1, 50, True, "Meet - Weekly sync - Google Chrome"), values=values)
+    windows = browser_world(monkeypatch, (1, 50, True, "Meet - Weekly sync - Google Chrome"), values=values)
     first = watch.current({"meet": True}, TABLE)
     windows.windows[1] = (50, True, "Inbox - Google Chrome")
     monkeypatch.setattr(calls, "winreg", Unreadable({}))
@@ -513,7 +530,7 @@ def test_a_record_that_cannot_be_read_this_time_keeps_the_meet_calls_known(monke
 
 def test_a_process_list_that_could_not_be_read_keeps_the_meet_calls_known(monkeypatch):
     watch = CallWatch()
-    windows = meet_world(monkeypatch, (1, 50, True, "Meet - Weekly sync - Google Chrome"))
+    windows = browser_world(monkeypatch, (1, 50, True, "Meet - Weekly sync - Google Chrome"))
     first = watch.current({"meet": True}, TABLE)
     windows.windows[1] = (50, True, "Inbox - Google Chrome")
     for _ in range(2):
@@ -574,7 +591,7 @@ def test_a_teams_call_kept_through_a_failed_read_goes_on_growing_older(monkeypat
 
 
 def test_a_call_kept_with_an_id_that_has_no_readable_start_keeps_its_age():
-    for session_id in ("zoom:604", "zoom:604:soon", "teams:soon", "teams", "meet:chrome:1"):
+    for session_id in ("zoom:604", "zoom:604:soon", "teams:soon", "teams", "meet:chrome:1", "teams:shift:1", "teams:shift:soon"):
         call = Call(session_id.split(":")[0], session_id, 12.0, None)
         assert calls._reaged(call) is call
 
@@ -666,7 +683,7 @@ def test_a_record_that_cannot_be_read_knows_no_call_that_was_never_seen(monkeypa
     monkeypatch.setattr(calls, "user32", Denied())
     assert watch.calls({"meet": True}, TABLE) == []
     # Nor does it keep a session that wasn't a Meet call.
-    windows = meet_world(monkeypatch, (1, 50, True, "Voice recorder - Google Chrome"))
+    windows = browser_world(monkeypatch, (1, 50, True, "Voice recorder - Google Chrome"))
     assert watch.calls({"meet": True}, TABLE) == [] and windows.enumerations == 1
     monkeypatch.setattr(calls, "winreg", Unreadable({}))
     assert watch.calls({"meet": True}, TABLE) == []
@@ -674,7 +691,7 @@ def test_a_record_that_cannot_be_read_knows_no_call_that_was_never_seen(monkeypa
 
 def test_one_key_that_cannot_be_read_makes_the_whole_record_unknown_not_stopped(monkeypatch):
     watch = CallWatch()
-    windows = meet_world(monkeypatch, (1, 50, True, "Meet - Weekly sync - Google Chrome"))
+    windows = browser_world(monkeypatch, (1, 50, True, "Meet - Weekly sync - Google Chrome"))
     assert watch.current({"meet": True}, TABLE) is not None
     # Edge's key is refused while Chrome's can be read, and Chrome's says it stopped.
     use_registry(monkeypatch, non_packaged={CHROME: stopped(), EDGE: DENIED})
@@ -683,7 +700,7 @@ def test_one_key_that_cannot_be_read_makes_the_whole_record_unknown_not_stopped(
 
 
 def test_with_two_meet_tabs_the_named_one_gives_the_title(monkeypatch):
-    meet_world(
+    browser_world(
         monkeypatch,
         (1, 50, True, "Meet - abc-defg-hij - Google Chrome"),
         (2, 51, True, "Meet - Weekly sync - Google Chrome"),
@@ -691,23 +708,354 @@ def test_with_two_meet_tabs_the_named_one_gives_the_title(monkeypatch):
     assert CallWatch().current({"meet": True}, TABLE).title == "Weekly sync"
 
 
-def test_only_chrome_and_edge_count_as_meet_browsers(monkeypatch):
+def test_a_meet_call_in_shift_is_recognised_the_same_way(monkeypatch):
+    values = in_use(5)
+    browser_world(monkeypatch, (1, 80, True, "Meet - Weekly sync - Shift Browser"), browser=SHIFT, values=values)
+    call = CallWatch().current({"meet": True}, TABLE)
+    assert call.provider == "meet" and call.title == "Weekly sync"
+    assert call.session_id == f"meet:shift:{values['LastUsedTimeStart']}"
+
+
+def test_only_chrome_edge_and_shift_count_as_browsers(monkeypatch):
     use_registry(
         monkeypatch,
         non_packaged={
-            "C:#Users#me#AppData#Local#PurpleShift#chromium#shift.exe": in_use(10),
             "C:#Users#me#AppData#Roaming#Zoom#bin#Zoom.exe": in_use(10),
             "C:#Tools#notchrome.exe": in_use(10),
+            "C:#Tools#notshift.exe": in_use(10),
+            "C:#Tools#shift.exe.bak": in_use(10),
         },
     )
     monkeypatch.setattr(calls, "user32", Denied())
-    assert CallWatch().current({"meet": True}, TABLE) is None
+    assert CallWatch().current({"meet": True, "teams": True}, TABLE) is None
 
 
-def test_the_meet_browser_s_key_is_matched_whatever_its_case_or_folder(monkeypatch):
+def test_the_browser_s_key_is_matched_whatever_its_case_or_folder(monkeypatch):
     browser = "C:#Users#me#AppData#Local#Google#Chrome#Application#CHROME.EXE"
-    meet_world(monkeypatch, (1, 50, True, "Meet - Standup - Google Chrome"), browser=browser)
+    browser_world(monkeypatch, (1, 50, True, "Meet - Standup - Google Chrome"), browser=browser)
     assert CallWatch().current({"meet": True}, TABLE).title == "Standup"
+
+
+# Microsoft Teams, in a browser
+
+@pytest.mark.parametrize(
+    ("window", "expected"),
+    [
+        ("Weekly sync | Microsoft Teams - Shift Browser", "Weekly sync"),
+        ("(3) Weekly sync | Microsoft Teams - Shift Browser", "Weekly sync"),
+        ("Weekly sync | Microsoft Teams - Google Chrome - Work", "Weekly sync"),
+        ("Weekly sync | Microsoft Teams - Work - Microsoft​ Edge", "Weekly sync"),
+        ("Weekly sync | Microsoft Teams and 2 more pages - Work - Microsoft​ Edge", "Weekly sync"),
+        ("Weekly sync | Microsoft Teams", "Weekly sync"),  # an installed web app's window, with no browser name
+        ("(3) Weekly sync | Microsoft Teams", "Weekly sync"),
+        ("Weekly sync | Microsoft Teams (free) - Shift Browser", "Weekly sync"),
+        ("Q3 - planning | Microsoft Teams - Shift Browser", "Q3 - planning"),
+        ("  Weekly sync | microsoft teams - Shift Browser  ", "Weekly sync"),
+        ("x" * 500 + " | Microsoft Teams - Shift Browser", "x" * MAX_TITLE),
+        # Teams' own pages are Teams tabs that name no meeting, and so are chats and channels.
+        ("(3) Chat | Microsoft Teams - Shift Browser", None),
+        ("Calendar | Microsoft Teams and 2 more pages - Work - Microsoft​ Edge", None),
+        ("Chat | Jane Doe | Microsoft Teams - Shift Browser", None),
+        ("Design team | General | Microsoft Teams", None),
+        ("Microsoft Teams - Shift Browser", None),
+        ("(2) Microsoft Teams - Google Chrome - Work", None),
+        ("Microsoft Teams (free) - Shift Browser", None),
+        ("Home | Microsoft Teams (free)", None),
+        ("Microsoft Teams", None),
+        # Seen in Shift: a meeting's page, and the page that joins one by its ID.
+        ("Microsoft Teams meeting | Microsoft Teams - Shift Browser", None),
+        ("Join a Microsoft Teams Meeting by ID | Microsoft Teams - Shift Browser", None),
+    ],
+)
+def test_the_meeting_name_comes_from_a_teams_tab_s_window_title(window, expected):
+    assert calls.is_teams_web_title(window)
+    assert calls.teams_web_title(window) == expected
+
+
+@pytest.mark.parametrize(
+    "window",
+    [
+        "(1) WhatsApp - Shift Browser",
+        "Weekly sync - Shift Browser",
+        "Meet - Weekly sync - Shift Browser",
+        "Microsoft Teams admin center - Google Chrome",
+        "How to use Microsoft Teams - Shift Browser",
+        "Teams | Microsoft Teams Blog - Shift Browser",
+        "Notes on Microsoft Teams",
+        "",
+        "   ",
+    ],
+)
+def test_a_window_that_is_not_showing_teams_is_not_a_teams_tab(window):
+    assert not calls.is_teams_web_title(window)
+    assert calls.teams_web_title(window) is None
+
+
+def test_an_ordinary_shift_tab_is_neither_a_meet_nor_a_teams_tab():
+    window = "(1) WhatsApp - Shift Browser"
+    assert not calls.is_meet_title(window) and calls.meet_title(window) is None
+    assert not calls.is_teams_web_title(window) and calls.teams_web_title(window) is None
+
+
+@pytest.mark.parametrize(
+    ("browser", "pid", "window", "exe"),
+    [
+        (CHROME, 50, "Weekly sync | Microsoft Teams - Google Chrome - Work", "chrome"),
+        (EDGE, 60, "Weekly sync | Microsoft Teams - Work - Microsoft​ Edge", "msedge"),
+        (SHIFT, 80, "Weekly sync | Microsoft Teams - Shift Browser", "shift"),
+        (EDGE, 60, "Weekly sync | Microsoft Teams", "msedge"),  # an installed web app's window
+    ],
+)
+def test_a_browser_holding_the_microphone_in_front_of_a_teams_tab_is_a_teams_call(monkeypatch, browser, pid, window, exe):
+    values = in_use(20)
+    browser_world(monkeypatch, (1, pid, True, window), browser=browser, values=values)
+    call = CallWatch().current({"teams": True}, TABLE)
+    assert call.provider == "teams" and call.title == "Weekly sync"
+    assert call.session_id == f"teams:{exe}:{values['LastUsedTimeStart']}" and 19 < call.age_seconds < 30
+
+
+def test_a_teams_tab_that_names_no_meeting_is_still_a_teams_call_without_a_name(monkeypatch):
+    browser_world(monkeypatch, (1, 80, True, "(3) Chat | Microsoft Teams - Shift Browser"), browser=SHIFT)
+    call = CallWatch().current({"teams": True}, TABLE)
+    assert call.provider == "teams" and call.title is None
+
+
+def test_with_several_teams_windows_the_first_that_names_a_meeting_gives_the_title(monkeypatch):
+    browser_world(
+        monkeypatch,
+        (1, 80, True, "Chat | Jane Doe | Microsoft Teams - Shift Browser"),
+        (2, 80, True, "Calendar | Microsoft Teams - Shift Browser"),
+        (3, 80, True, "Weekly sync | Microsoft Teams - Shift Browser"),
+        (4, 81, True, "Standup | Microsoft Teams - Shift Browser"),
+        browser=SHIFT,
+    )
+    assert CallWatch().current({"teams": True}, TABLE).title == "Weekly sync"
+
+
+def test_a_browser_holding_the_microphone_in_front_of_neither_meet_nor_teams_is_not_a_call(monkeypatch):
+    windows = browser_world(
+        monkeypatch,
+        (1, 80, True, "(1) WhatsApp - Shift Browser"),
+        (2, 80, False, "Weekly sync | Microsoft Teams - Shift Browser"),  # not visible
+        (3, 50, True, "Weekly sync | Microsoft Teams - Google Chrome"),  # the other browser's
+        (4, 60, True, "Meet - Standup - Microsoft​ Edge"),
+        browser=SHIFT,
+    )
+    assert CallWatch().calls({"meet": True, "teams": True}, TABLE) == []
+    assert windows.enumerations == 1
+
+
+def test_a_meet_tab_in_front_makes_it_a_meet_call_even_with_a_teams_tab_in_front_too(monkeypatch):
+    values = in_use(20)
+    teams = (1, 80, True, "Weekly sync | Microsoft Teams - Shift Browser")  # the first window, and still not the call
+    browser_world(monkeypatch, teams, (2, 81, True, "Meet - Standup - Shift Browser"), browser=SHIFT, values=values)
+    call = CallWatch().current({"meet": True, "teams": True}, TABLE)
+    assert (call.provider, call.title) == ("meet", "Standup")
+    assert call.session_id == f"meet:shift:{values['LastUsedTimeStart']}"
+
+
+def test_a_meet_call_with_only_a_meeting_code_has_no_name_and_does_not_borrow_teams_one(monkeypatch):
+    teams = (1, 80, True, "Weekly sync | Microsoft Teams - Shift Browser")
+    browser_world(monkeypatch, teams, (2, 80, True, "Meet - abc-defg-hij - Shift Browser"), browser=SHIFT)
+    call = CallWatch().current({"meet": True, "teams": True}, TABLE)
+    assert (call.provider, call.title) == ("meet", None)
+
+
+def test_a_teams_call_in_a_browser_is_decided_when_its_session_appears_and_kept_for_the_whole_session(monkeypatch):
+    watch = CallWatch()
+    windows = browser_world(monkeypatch, (1, 80, True, "Weekly sync | Microsoft Teams - Shift Browser"), browser=SHIFT)
+    first = watch.current({"teams": True}, TABLE)
+    for tab in ("(1) WhatsApp - Shift Browser", "Meet - Standup - Shift Browser"):
+        windows.windows[1] = (80, True, tab)  # the user switches to another tab
+        later = watch.current({"meet": True, "teams": True}, TABLE)
+        assert (later.provider, later.session_id, later.title) == ("teams", first.session_id, "Weekly sync")
+    assert windows.enumerations == 1  # looked once, when the session was new
+
+
+def test_a_session_in_front_of_neither_stays_not_a_call_even_if_a_teams_tab_comes_to_the_front(monkeypatch):
+    watch = CallWatch()
+    windows = browser_world(monkeypatch, (1, 80, True, "(1) WhatsApp - Shift Browser"), browser=SHIFT)
+    assert watch.calls({"meet": True, "teams": True}, TABLE) == []
+    windows.windows[1] = (80, True, "Weekly sync | Microsoft Teams - Shift Browser")
+    assert watch.calls({"meet": True, "teams": True}, TABLE) == []
+    assert windows.enumerations == 1
+
+
+def test_a_teams_session_that_ended_is_forgotten_and_the_next_one_is_looked_at_afresh(monkeypatch):
+    watch = CallWatch()
+    windows = browser_world(monkeypatch, (1, 80, True, "Weekly sync | Microsoft Teams - Shift Browser"), browser=SHIFT)
+    assert watch.current({"teams": True}, TABLE).title == "Weekly sync"
+    use_registry(monkeypatch, non_packaged={SHIFT: stopped()})
+    assert watch.current({"teams": True}, TABLE) is None
+    windows.windows[1] = (80, True, "(1) WhatsApp - Shift Browser")
+    use_registry(monkeypatch, non_packaged={SHIFT: in_use(1)})
+    assert watch.current({"teams": True}, TABLE) is None  # the next use of the microphone isn't the old call
+    assert windows.enumerations == 2
+
+
+def test_a_browser_that_is_not_running_is_not_in_a_teams_call_whatever_the_record_says(monkeypatch):
+    windows = browser_world(monkeypatch, (1, 80, True, "Weekly sync | Microsoft Teams - Shift Browser"), browser=SHIFT)
+    without_shift = {name: pids for name, pids in TABLE.items() if name != "shift.exe"}
+    assert CallWatch().calls({"teams": True}, without_shift) == []  # a crash left the record saying it is in use
+    assert windows.enumerations == 0
+
+
+# The switches, for calls in a browser
+
+def switch_world(monkeypatch) -> Windows:
+    """Teams in Shift and Meet in Chrome, both holding the microphone, in the order of the record."""
+    use_registry(monkeypatch, non_packaged={SHIFT: in_use(30), CHROME: in_use(20)})
+    return use_windows(
+        monkeypatch,
+        (1, 80, True, "Weekly sync | Microsoft Teams - Shift Browser"),
+        (2, 50, True, "Meet - Standup - Google Chrome"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("enabled", "reported"),
+    [
+        ({"teams": True}, [("teams", "Weekly sync")]),
+        ({"meet": True}, [("meet", "Standup")]),
+        ({"teams": True, "meet": True}, [("teams", "Weekly sync"), ("meet", "Standup")]),
+        ({"teams": True, "meet": False}, [("teams", "Weekly sync")]),
+        ({"teams": False, "meet": True}, [("meet", "Standup")]),
+        ({"teams": False, "meet": False}, []),
+    ],
+)
+def test_a_call_in_a_browser_is_reported_only_while_its_own_provider_is_switched_on(monkeypatch, enabled, reported):
+    switch_world(monkeypatch)
+    found = CallWatch().calls(enabled, TABLE)
+    assert [(call.provider, call.title) for call in found] == reported
+
+
+def test_a_meet_and_a_teams_tab_in_front_make_a_meet_call_that_only_the_meet_switch_reports(monkeypatch):
+    browser_world(
+        monkeypatch,
+        (1, 50, True, "Weekly sync | Microsoft Teams - Google Chrome"),
+        (2, 50, True, "Meet - Standup - Google Chrome"),
+    )
+    assert CallWatch().calls({"teams": True}, TABLE) == []  # not a Teams call, though a Teams tab was in front
+    assert [call.provider for call in CallWatch().calls({"meet": True}, TABLE)] == ["meet"]
+
+
+def test_a_session_is_decided_whichever_switches_are_on_when_it_appears(monkeypatch):
+    watch = CallWatch()
+    windows = browser_world(monkeypatch, (1, 80, True, "Weekly sync | Microsoft Teams - Shift Browser"), browser=SHIFT)
+    assert watch.calls({"meet": True}, TABLE) == []  # looked at here, with Teams off
+    windows.windows[1] = (80, True, "(1) WhatsApp - Shift Browser")
+    call = watch.current({"meet": True, "teams": True}, TABLE)
+    assert (call.provider, call.title) == ("teams", "Weekly sync")
+    assert windows.enumerations == 1
+
+
+def test_turning_meet_or_teams_off_alone_keeps_what_a_browser_session_decided(monkeypatch):
+    watch = CallWatch()
+    windows = browser_world(monkeypatch, (1, 80, True, "Weekly sync | Microsoft Teams - Shift Browser"), browser=SHIFT)
+    assert watch.current({"teams": True}, TABLE) is not None
+    assert watch.current({"meet": True}, TABLE) is None  # Teams is off, so its call isn't reported
+    windows.windows[1] = (80, True, "(1) WhatsApp - Shift Browser")
+    assert watch.current({"teams": True}, TABLE).title == "Weekly sync"  # and it was kept, not decided again
+    assert windows.enumerations == 1
+
+
+def test_turning_meet_and_teams_both_off_forgets_what_a_browser_session_decided(monkeypatch):
+    watch = CallWatch()
+    windows = browser_world(monkeypatch, (1, 80, True, "Weekly sync | Microsoft Teams - Shift Browser"), browser=SHIFT)
+    assert watch.current({"teams": True}, TABLE) is not None
+    assert watch.current({"teams": False, "meet": False}, TABLE) is None
+    windows.windows[1] = (80, True, "(1) WhatsApp - Shift Browser")
+    assert watch.current({"teams": True}, TABLE) is None  # decided afresh, with another tab in front
+    assert windows.enumerations == 2
+
+
+def test_the_browsers_are_not_looked_at_unless_meet_or_teams_is_on(monkeypatch):
+    monkeypatch.setattr(calls, "winreg", Denied())
+    monkeypatch.setattr(calls, "user32", Denied())
+    assert CallWatch().calls({"zoom": True}, {"granola.exe": [77]}) == []
+    assert CallWatch().calls({"zoom": True, "teams": False, "meet": False}, {"granola.exe": [77]}) == []
+
+
+def test_a_teams_call_in_the_desktop_app_and_one_in_a_browser_are_both_reported(monkeypatch):
+    desktop, web = in_use(300), in_use(40)
+    use_registry(monkeypatch, packaged={TEAMS: desktop}, non_packaged={SHIFT: web})
+    use_windows(
+        monkeypatch,
+        (1, 70, True, "Standup | Microsoft Teams"),
+        (2, 80, True, "Weekly sync | Microsoft Teams - Shift Browser"),
+    )
+    watch = CallWatch()
+    found = watch.calls({"teams": True}, TABLE)
+    assert [(call.provider, call.session_id, call.title) for call in found] == [
+        ("teams", f"teams:{desktop['LastUsedTimeStart']}", "Standup"),
+        ("teams", f"teams:shift:{web['LastUsedTimeStart']}", "Weekly sync"),
+    ]
+    assert watch.current({"teams": True}, TABLE).session_id == f"teams:shift:{web['LastUsedTimeStart']}"  # the newer
+    assert watch.calls({"meet": True}, TABLE) == []  # with Teams off neither Teams call is reported
+
+
+def test_a_process_list_that_could_not_be_read_keeps_the_teams_call_in_a_browser_known(monkeypatch):
+    watch = CallWatch()
+    values = in_use(20)
+    windows = browser_world(monkeypatch, (1, 80, True, "Weekly sync | Microsoft Teams - Shift Browser"), browser=SHIFT, values=values)
+    first = watch.current({"teams": True}, TABLE)
+    windows.windows[1] = (80, True, "(1) WhatsApp - Shift Browser")
+    monkeypatch.setattr(calls, "winreg", Denied())  # kept, not read again
+    for _ in range(2):
+        kept = watch.current({"teams": True}, {})  # no list is not a list with no browser in it
+        assert (kept.session_id, kept.title, kept.provider) == (first.session_id, "Weekly sync", "teams")
+    use_registry(monkeypatch, non_packaged={SHIFT: values})
+    assert watch.current({"teams": True}, TABLE).title == "Weekly sync"  # the same session, never looked at again
+    assert windows.enumerations == 1
+    assert watch.current({"teams": True}, {"granola.exe": [77]}) is None  # a list that works is what ends it
+    assert watch.current({"teams": True}, {}) is None  # and the call that ended isn't kept
+
+
+def test_a_record_that_cannot_be_read_this_time_keeps_the_teams_call_in_a_browser_known(monkeypatch):
+    watch = CallWatch()
+    values = in_use(20)
+    windows = browser_world(monkeypatch, (1, 80, True, "Weekly sync | Microsoft Teams - Shift Browser"), browser=SHIFT, values=values)
+    first = watch.current({"teams": True}, TABLE)
+    windows.windows[1] = (80, True, "(1) WhatsApp - Shift Browser")
+    for unreadable in (Unreadable({}), CutShort(calls.winreg.HKEY_CURRENT_USER.node, after=0)):
+        monkeypatch.setattr(calls, "winreg", unreadable)
+        kept = watch.current({"teams": True}, TABLE)
+        assert (kept.session_id, kept.title, kept.provider) == (first.session_id, "Weekly sync", "teams")
+    use_registry(monkeypatch, non_packaged={SHIFT: values})  # readable again, and still the same session
+    assert watch.current({"teams": True}, TABLE).session_id == first.session_id
+    assert windows.enumerations == 1
+    use_registry(monkeypatch, non_packaged={SHIFT: stopped()})  # a read that works is what ends it
+    assert watch.current({"teams": True}, TABLE) is None
+
+
+@pytest.mark.parametrize("by", ["process list", "record"])
+def test_sessions_kept_through_a_failed_read_are_reported_only_while_their_provider_is_on(monkeypatch, by):
+    watch = CallWatch()
+    switch_world(monkeypatch)
+    assert len(watch.calls({"teams": True, "meet": True}, TABLE)) == 2
+    if by == "record":
+        monkeypatch.setattr(calls, "winreg", Unreadable({}))
+    table = TABLE if by == "record" else {}
+    assert [call.provider for call in watch.calls({"teams": True}, table)] == ["teams"]
+    assert [call.provider for call in watch.calls({"meet": True}, table)] == ["meet"]
+    assert [call.provider for call in watch.calls({"teams": True, "meet": True}, table)] == ["teams", "meet"]
+
+
+@pytest.mark.parametrize("by", ["process list", "record"])
+def test_a_teams_call_in_a_browser_kept_through_a_failed_read_goes_on_growing_older(monkeypatch, by):
+    watch = CallWatch()
+    browser_world(monkeypatch, (1, 80, True, "Weekly sync | Microsoft Teams - Shift Browser"), browser=SHIFT, values=in_use(100))
+    first = watch.current({"teams": True}, TABLE)
+    assert 99 < first.age_seconds < 110
+    real = time.time()
+    monkeypatch.setattr(calls, "time", SimpleNamespace(time=lambda: real + 400))
+    if by == "record":
+        monkeypatch.setattr(calls, "winreg", Unreadable({}))
+    kept = watch.current({"teams": True}, TABLE if by == "record" else {})
+    assert kept.session_id == first.session_id
+    assert 499 < kept.age_seconds < 510
+    monkeypatch.setattr(calls, "time", SimpleNamespace(time=lambda: real + 700))
+    assert 799 < watch.current({"teams": True}, TABLE if by == "record" else {}).age_seconds < 810  # and again, from the start
 
 
 # Which provider, and which call
@@ -759,7 +1107,7 @@ def test_a_provider_that_is_off_or_not_mentioned_is_not_looked_at_at_all(monkeyp
 
 def test_turning_meet_off_forgets_what_it_decided(monkeypatch):
     watch = CallWatch()
-    windows = meet_world(monkeypatch, (1, 50, True, "Meet - Weekly sync - Google Chrome"))
+    windows = browser_world(monkeypatch, (1, 50, True, "Meet - Weekly sync - Google Chrome"))
     assert watch.current({"meet": True}, TABLE) is not None
     assert watch.current({"meet": False}, TABLE) is None
     windows.windows[1] = (50, True, "Inbox - Google Chrome")
@@ -807,7 +1155,7 @@ def test_a_list_of_keys_that_stops_with_an_error_is_cut_short_not_complete_and_o
 
 def test_a_list_of_keys_that_cannot_be_read_makes_meet_keep_what_it_knew(monkeypatch):
     watch = CallWatch()
-    windows = meet_world(monkeypatch, (1, 50, True, "Meet - Weekly sync - Google Chrome"))
+    windows = browser_world(monkeypatch, (1, 50, True, "Meet - Weekly sync - Google Chrome"))
     first = watch.current({"meet": True}, TABLE)
     tree = calls.winreg.HKEY_CURRENT_USER.node
     monkeypatch.setattr(calls, "winreg", CutShort(tree, after=0))  # listing fails at once, which isn't "no browsers"
@@ -882,7 +1230,7 @@ def test_teams_is_found_by_its_alias_or_its_microphone_entry(monkeypatch, tmp_pa
     assert calls.installed("teams") is True
 
 
-def test_meet_is_never_found_on_the_pc_because_it_is_in_chrome_or_edge():
+def test_meet_is_never_found_on_the_pc_because_it_is_in_a_browser():
     assert calls.installed("meet") is None
     assert calls.installed("something-else") is None
 

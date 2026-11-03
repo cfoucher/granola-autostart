@@ -278,10 +278,14 @@ def _consider_call(now: datetime, snap: Snapshot, state: WatcherState, fresh_cal
 
 
 def _place(session_id: str) -> str:
-    """Where a call runs, which holds one call at a time: its provider, and for Meet its browser too, because a call
-    in Chrome and another in Edge can be under way together."""
+    """Where a call runs, which holds one call at a time: its provider, and for a call in a browser its browser too, as
+    "meet:chrome" or "teams:shift", because a call in Chrome and another in Edge can be under way together. A browser
+    call is Meet, or a Teams id with a browser in it ("teams:shift:<start>", where the desktop app's is "teams:<start>").
+    That is by provider, not by the parts of the id: Zoom's ("zoom:<pid>:<start>") has three too, and is just "zoom"."""
     provider, _, rest = session_id.partition(":")
-    return f"{provider}:{rest.partition(':')[0]}" if provider == "meet" else provider
+    browser, colon, _ = rest.partition(":")
+    in_browser = provider == "meet" or (provider == "teams" and bool(colon))
+    return f"{provider}:{browser}" if in_browser else provider
 
 
 def _follow_call(now: datetime, snap: Snapshot, state: WatcherState, lookahead: timedelta, joined: bool) -> None:
