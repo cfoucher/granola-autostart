@@ -13,6 +13,7 @@ from granola_autostart.decide import (
     Prompt,
     Snapshot,
     WatcherState,
+    _place,
     apply_result,
     evaluate,
 )
@@ -113,6 +114,35 @@ def test_a_teams_or_meet_call_is_a_session_of_its_own_like_a_zoom_one():
     meet = call_join("meet", "chrome:134400000000000001", title="Standup")
     prompt, _state = decide(meet)
     assert prompt.keys == ("meet:chrome:134400000000000001",) and prompt.payload["id"] == "meet-chrome-134400000000000001"
+
+
+def test_a_teams_call_in_a_browser_is_a_teams_call_to_the_rest_of_the_app():
+    web = call_join("teams", "shift:134400000000000002")
+    prompt, state = decide(web)
+    assert prompt.keys == ("teams:shift:134400000000000002",) and prompt.payload["id"] == "teams-shift-134400000000000002"
+    assert prompt.title == "Teams call"
+    apply_result(state, prompt, accepted=True, now=NOW)
+    assert decide(web, state, now=NOW + timedelta(seconds=5))[0] is None
+    prompt, _state = decide(call_join("teams", "shift:134400000000000003", title="Weekly sync"))
+    assert prompt.title == "Weekly sync"
+
+
+@pytest.mark.parametrize(
+    ("session_id", "place"),
+    [
+        ("zoom:9:100", "zoom"),  # three parts, as a browser call has, and still just Zoom
+        ("zoom:9", "zoom"),
+        ("teams:134400000000000000", "teams"),  # the desktop app
+        ("teams:shift:134400000000000000", "teams:shift"),
+        ("teams:chrome:134400000000000000", "teams:chrome"),
+        ("meet:chrome:134400000000000000", "meet:chrome"),
+        ("meet:msedge:134400000000000000", "meet:msedge"),
+        ("meet:shift:134400000000000000", "meet:shift"),
+        ("webex:1:2", "webex"),
+    ],
+)
+def test_where_a_call_runs_is_its_provider_and_for_a_call_in_a_browser_its_browser_too(session_id, place):
+    assert _place(session_id) == place
 
 
 def test_a_teams_call_during_a_meeting_is_that_meeting():
@@ -728,6 +758,16 @@ def test_a_meet_call_in_chrome_and_one_in_edge_are_different_places_but_two_in_c
     assert prompt is None and not state.call_needs_decision and "meet:chrome:100" in state.handled
     prompt, _state = decide(call_join("meet", "chrome:300", age=900), state, now=NOW + timedelta(seconds=50))
     assert prompt is not None and prompt.keys == ("meet:chrome:300",)
+
+
+def test_a_teams_call_in_the_desktop_app_and_one_in_a_browser_are_different_places_but_two_in_a_browser_are_not():
+    # Both can be under way at once. The desktop app's, the newer, is the current one; when it ends, the browser's older
+    # call becomes current without being a join. A Shift session replacing another Shift one is.
+    state = answered(call_join("teams", "55", age=30), accepted=False)
+    prompt, state = decide(call_join("teams", "shift:100", age=900), state, now=NOW + timedelta(seconds=40))
+    assert prompt is None and not state.call_needs_decision and "teams:shift:100" in state.handled
+    prompt, _state = decide(call_join("teams", "shift:300", age=900), state, now=NOW + timedelta(seconds=50))
+    assert prompt is not None and prompt.keys == ("teams:shift:300",)
 
 
 def test_restarted_notes_still_end_with_the_zoom_meeting_s_call():

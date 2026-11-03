@@ -412,9 +412,11 @@ function addPanel() {
 
 // Calls: the settings page and setup's second step share the rows and the warning.
 const CALL_ICONS = { zoom: "video", teams: "people", meet: "browser" };
-const callFound = (c) => (c.found === null
-  ? "In Chrome or Edge. Join with the Meet tab in front, so the call is recognised."
-  : `Desktop app, ${c.found ? "found" : "not found"} on this PC`);
+const callFound = (c) => {
+  if (c.found === null) return "In Chrome, Edge or Shift. Join with the Meet tab in front, so the call is recognised.";
+  const app = `Desktop app, ${c.found ? "found" : "not found"} on this PC`;
+  return c.provider === "teams" ? `${app}. In Chrome, Edge or Shift, join with the Teams tab in front.` : app;
+};
 
 // A switch for each call, with whether its app was found on this PC. ``action`` changes a switch by its data-provider.
 function callList(calls, action) {
