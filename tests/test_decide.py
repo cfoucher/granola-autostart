@@ -795,16 +795,16 @@ def test_an_adhoc_answer_does_not_answer_the_meeting_of_the_next_call():
 
 def reminder_and_standup():
     """Two meetings that start together: a reminder with no guests, which the feed lists first, and a stand-up with 7."""
-    reminder = event("Reload 2Captcha Credits", event_id="reminder", minutes=15, calendar_name="Personal")
-    standup = event("Chromium Team: Stand-Up", event_id="standup", minutes=15, guests=7, calendar_name="you@shift.com")
+    reminder = event("Renew parking permit", event_id="reminder", minutes=15, calendar_name="Personal")
+    standup = event("Team stand-up", event_id="standup", minutes=15, guests=7, calendar_name="you@shift.com")
     return reminder, standup
 
 
 def test_a_meeting_with_guests_is_the_default_over_a_reminder_the_feed_lists_first():
     reminder, standup = reminder_and_standup()
     prompt, _state = decide(snap(events=(reminder, standup)))
-    assert (prompt.title, prompt.keys) == ("Chromium Team: Stand-Up", (standup.key(),))
-    assert [choice.title for choice in prompt.choices] == ["Chromium Team: Stand-Up", "Reload 2Captcha Credits"]
+    assert (prompt.title, prompt.keys) == ("Team stand-up", (standup.key(),))
+    assert [choice.title for choice in prompt.choices] == ["Team stand-up", "Renew parking permit"]
 
 
 EARLIER = NOW - timedelta(minutes=20)
@@ -857,7 +857,7 @@ def test_meetings_starting_together_are_listed_with_the_default_first_and_matchi
     assert (first.title, first.payload, first.keys, first.expires_at) == (prompt.title, prompt.payload, prompt.keys, prompt.expires_at)
     assert (first.start, first.end, first.guests, first.calendar_name) == (NOW, NOW + timedelta(minutes=15), 7, "you@shift.com")
     assert (second.title, second.payload, second.keys, second.guests, second.calendar_name) == (
-        "Reload 2Captcha Credits",
+        "Renew parking permit",
         reminder.payload(),
         (reminder.key(),),
         0,
@@ -890,7 +890,7 @@ def test_the_card_lists_at_most_four_meetings_and_cancel_leaves_the_fifth_to_ask
 def test_a_call_joined_while_meetings_are_under_way_lists_them_with_the_call_in_each_one_s_keys():
     reminder, standup = reminder_and_standup()
     prompt, _state = decide(zoom_join(events=(reminder, standup)))
-    assert prompt.kind == "call" and prompt.title == "Chromium Team: Stand-Up"
+    assert prompt.kind == "call" and prompt.title == "Team stand-up"
     assert [choice.keys for choice in prompt.choices] == [("zoom:9:100", standup.key()), ("zoom:9:100", reminder.key())]
     assert prompt.choices[0].keys == prompt.keys and prompt.cancel_keys is None
 
@@ -938,7 +938,7 @@ def test_picking_another_meeting_gives_its_notes_and_answers_the_others():
     picked = prompt.picked(1)
     assert (picked.kind, picked.title, picked.payload, picked.keys, picked.expires_at) == (
         "calendar",
-        "Reload 2Captcha Credits",
+        "Renew parking permit",
         reminder.payload(),
         (reminder.key(),),
         reminder.end,
@@ -956,7 +956,7 @@ def test_the_first_meeting_answers_the_other_too_and_a_prompt_with_no_choices_is
     reminder, standup = reminder_and_standup()
     prompt, _state = decide(snap(events=(reminder, standup)))
     first = prompt.picked(0)
-    assert (first.title, first.keys, first.covers) == ("Chromium Team: Stand-Up", (standup.key(),), (reminder.key(),))
+    assert (first.title, first.keys, first.covers) == ("Team stand-up", (standup.key(),), (reminder.key(),))
     single, _state = decide(snap(events=(standup,)))
     assert single.picked(0) is single
 

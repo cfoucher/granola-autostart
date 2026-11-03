@@ -500,8 +500,8 @@ def test_the_card_stops_looking_for_the_popup_when_it_is_done(card):
     assert card.root.jobs == {}
 
 
-STANDUP = ("Chromium Team: Stand-Up", "09:00\u201309:15 \u00b7 7 guests")
-REMINDER = ("Reload 2Captcha Credits", "09:00\u201309:15 \u00b7 No guests")
+STANDUP = ("Team stand-up", "09:00\u201309:15 \u00b7 7 guests")
+REMINDER = ("Renew parking permit", "09:00\u201309:15 \u00b7 No guests")
 ACCENT_SOFT = (0xE8, 0xEF, 0xDF, 255)
 BUTTON_HOVER = (0xF1, 0xEA, 0xDB, 255)
 
