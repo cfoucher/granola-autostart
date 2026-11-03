@@ -750,6 +750,10 @@ def test_the_browser_s_key_is_matched_whatever_its_case_or_folder(monkeypatch):
         ("(3) Weekly sync | Microsoft Teams", "Weekly sync"),
         ("Weekly sync | Microsoft Teams (free) - Shift Browser", "Weekly sync"),
         ("Q3 - planning | Microsoft Teams - Shift Browser", "Q3 - planning"),
+        # Edge with no profile in its title: the last " - " is the page's own.
+        ("Q3 - planning | Microsoft Teams - Microsoft​ Edge", "Q3 - planning"),
+        ("Q3 - planning | Microsoft Teams and 2 more pages - Microsoft​ Edge", "Q3 - planning"),
+        ("Q3 - planning | Microsoft Teams - Work - Microsoft​ Edge", "Q3 - planning"),
         ("  Weekly sync | microsoft teams - Shift Browser  ", "Weekly sync"),
         ("x" * 500 + " | Microsoft Teams - Shift Browser", "x" * MAX_TITLE),
         # Teams' own pages are Teams tabs that name no meeting, and so are chats and channels.

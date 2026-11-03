@@ -354,10 +354,13 @@ _MEETING_CODE = re.compile(r"[a-z]{3}-[a-z]{4}-[a-z]{3}", re.IGNORECASE)
 _TEAMS_PAGE = re.compile(r"(?:^|\s+\|\s+)Microsoft Teams(?: \(free\))?$", re.IGNORECASE)
 
 
-def _strip_browser(text: str) -> str:
+def _strip_browser(text: str, *, edge_profile: bool = True) -> str:
     """A window title without the browser's part of it: its name, the profile beside the name, and "and 2 more
     pages". A title with none of them, such as an installed web app's window, comes back as it was. The text has
-    had its invisible characters taken out already."""
+    had its invisible characters taken out already.
+
+    Edge's profile is taken to be the last " - " part before its name. ``edge_profile`` false keeps that part, for
+    an Edge title with no profile in it, where the last " - " is in the page's own title."""
     chrome = _CHROME_SUFFIX.search(text)
     edge = _EDGE_SUFFIX.search(text)
     shift = _SHIFT_SUFFIX.search(text)
@@ -366,7 +369,7 @@ def _strip_browser(text: str) -> str:
     elif edge:
         text = text[: edge.start()]
         separators = list(_SEPARATOR.finditer(text))
-        if separators:
+        if edge_profile and separators:
             text = text[: separators[-1].start()]  # the profile's name
     elif shift:
         text = text[: shift.start()]
@@ -391,10 +394,15 @@ def meet_title(window_title: str) -> str | None:
 
 def _teams_page(window_title: str) -> str | None:
     """A browser window's page title without "| Microsoft Teams", the browser's part and an unread count, or None
-    when the window isn't showing Teams. Teams' own title alone is a Teams page with an empty name."""
-    text = _UNREAD_COUNT.sub("", _strip_browser(window_title.translate(_INVISIBLE).strip()))
-    suffix = _TEAMS_PAGE.search(text)
-    return text[: suffix.start()] if suffix else None
+    when the window isn't showing Teams. Teams' own title alone is a Teams page with an empty name. An Edge title
+    is also tried as if it had no profile, so "Q3 - planning | Microsoft Teams - Microsoft Edge" is still Teams."""
+    text = window_title.translate(_INVISIBLE).strip()
+    for page in (_strip_browser(text), _strip_browser(text, edge_profile=False)):
+        page = _UNREAD_COUNT.sub("", page)
+        suffix = _TEAMS_PAGE.search(page)
+        if suffix:
+            return page[: suffix.start()]
+    return None
 
 
 def is_teams_web_title(window_title: str) -> bool:
