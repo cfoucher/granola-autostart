@@ -182,8 +182,8 @@ def meeting(title, key, guests, calendar, *call):
 
 def together(call=(), cancel_keys=None) -> Prompt:
     """Two meetings starting together, the stand-up first, as the watcher is handed them."""
-    standup = meeting("Chromium Team: Stand-Up", "standup", 7, "you@shift.com", *call)
-    reminder = meeting("Reload 2Captcha Credits", "reminder", 0, "Personal", *call)
+    standup = meeting("Team stand-up", "standup", 7, "you@shift.com", *call)
+    reminder = meeting("Renew parking permit", "reminder", 0, "Personal", *call)
     return Prompt(
         kind="call" if call else "calendar",
         title=standup.title,
@@ -201,8 +201,8 @@ def test_the_card_is_asked_to_list_the_meetings_each_with_its_line_and_a_single_
     world, _launches, run = gate
     run(shown=together())
     title, seconds, kind, listed = world["asked"][0]
-    assert (title, seconds, kind) == ("Chromium Team: Stand-Up", Settings().countdown_seconds, "calendar")
-    assert [name for name, _line in listed] == ["Chromium Team: Stand-Up", "Reload 2Captcha Credits"]
+    assert (title, seconds, kind) == ("Team stand-up", Settings().countdown_seconds, "calendar")
+    assert [name for name, _line in listed] == ["Team stand-up", "Renew parking permit"]
     assert listed[0][1].endswith(" · 7 guests · you@shift.com") and listed[1][1].endswith(" · No guests · Personal")
     run()
     assert world["asked"][1][3] == []
@@ -215,9 +215,9 @@ def test_the_meeting_ticked_on_the_card_is_the_one_opened_and_the_other_is_answe
     state = run(control, shown=together())
     [(url, _dry_run)] = launches
     assert "reminder" in url and "standup" not in url
-    assert state.active_launch.title == "Reload 2Captcha Credits" and state.active_launch.keys == ("event:reminder",)
+    assert state.active_launch.title == "Renew parking permit" and state.active_launch.keys == ("event:reminder",)
     assert set(state.handled) == {"event:reminder", "event:standup"}
-    assert control.last_start.title == "Reload 2Captcha Credits"
+    assert control.last_start.title == "Renew parking permit"
 
 
 def test_the_first_meeting_is_opened_when_nothing_else_is_ticked_and_the_other_is_answered_too(gate):
@@ -265,8 +265,8 @@ def test_the_log_says_how_many_meetings_the_countdown_was_for_and_which_was_pick
     world["picked"] = 1
     with caplog.at_level(logging.INFO, logger="granola_autostart"):
         run(shown=together())
-    assert "countdown for Chromium Team: Stand-Up (calendar), 2 meetings" in caplog.text
-    assert "picked Reload 2Captcha Credits on the card" in caplog.text
+    assert "countdown for Team stand-up (calendar), 2 meetings" in caplog.text
+    assert "picked Renew parking permit on the card" in caplog.text
     assert "Personal" not in caplog.text and "you@shift.com" not in caplog.text
     caplog.clear()
     world["picked"] = 0
