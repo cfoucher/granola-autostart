@@ -6,7 +6,8 @@ When meetings start together the card lists them (--choices, a JSON list of {"ti
 ticked, and a click on another ticks it. Starting then means the ticked meeting: the exit code is 0 for the first
 and 10 + i for the one at place i (processes.CHOICE_EXIT_CODE). Cancel is still 1, whichever is ticked.
 
-The card never takes keyboard focus, so typing in the current app is not interrupted.
+The card never takes keyboard focus, so typing in the current app is not interrupted. Pressing it anywhere but a button
+or a meeting and dragging moves it out of the way. That answers nothing, and the countdown carries on.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import argparse
 import ctypes
 import json
 import math
+import ntpath
 import time
 import tkinter as tk
 import tkinter.font as tkfont
@@ -33,6 +35,23 @@ MAX_CHOICES = 4  # the most meetings the card lists (the same number as decide.M
 RING_STEPS = 120
 # A click already on its way to that corner when the card appears must not skip the countdown.
 START_NOW_DELAY_SECONDS = 0.75
+# How often the card looks again for Granola's own meeting popup, which can appear after the card does.
+POPUP_CHECK_MS = 500
+# The pointer has to move this far from a press on the card's background before the card follows it, so a click never
+# moves it. Scaled like the rest of the card.
+DRAG_THRESHOLD = 4
+# How much of a dragged card stays inside the virtual screen (all the monitors together), so it can't be lost off an edge.
+# Scaled too.
+KEEP_ON_SCREEN = 40
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+GWL_EXSTYLE = -20
+WS_EX_TOPMOST = 0x00000008
+DWMWA_CLOAKED = 14
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+GRANOLA_IMAGE = "granola.exe"  # not GranolaAutostart.exe, which is this app
 
 PALETTES = {
     # The ring keeps "accent"; text and the Start button use darker greens so they reach 4.5:1.
@@ -112,6 +131,116 @@ def _primary_monitor() -> tuple[int, int, int, int, int]:
         pass
     work = info.rcWork
     return work.left, work.top, work.right, work.bottom, int(dpi_y.value or 96)
+
+
+def _virtual_screen() -> tuple[int, int, int, int] | None:
+    """The (left, top, right, bottom) of all the monitors together, which reaches into negative coordinates when one sits
+    left of or above the primary. None when Windows won't say."""
+    try:
+        metrics = ctypes.windll.user32.GetSystemMetrics
+        left, top, width, height = (metrics(index) for index in (SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN))
+    except Exception:
+        return None
+    return (left, top, left + width, top + height) if width > 0 and height > 0 else None
+
+
+def _granola_windows() -> list[tuple[int, int, int, int]]:
+    """The (left, top, right, bottom), in physical pixels, of Granola's visible windows that stay on top, which its meeting
+    popup is. [] when Windows won't say, because the card shows regardless."""
+    try:
+        user32, kernel32, dwmapi = ctypes.windll.user32, ctypes.windll.kernel32, ctypes.windll.dwmapi
+        enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows.argtypes = [enum_proc, wintypes.LPARAM]
+        user32.EnumWindows.restype = wintypes.BOOL
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
+        user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(_RECT)]
+        user32.GetWindowRect.restype = wintypes.BOOL
+        dwmapi.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
+        dwmapi.DwmGetWindowAttribute.restype = wintypes.LONG  # an HRESULT: 0 is success
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        # The callback only collects, so nothing in it can raise: the checks run out here, where a failure gives [].
+        hwnds: list[int] = []
+
+        def collect(hwnd, _lparam):
+            hwnds.append(hwnd)
+            return True
+
+        callback = enum_proc(collect)  # kept until EnumWindows is done with it
+        user32.EnumWindows(callback, 0)
+
+        is_granola: dict[int, bool] = {}  # by process id, so each is opened once
+
+        def granola_process(pid: int) -> bool:
+            if pid not in is_granola:
+                is_granola[pid] = False
+                handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                if handle:
+                    try:
+                        size = wintypes.DWORD(1024)
+                        path = ctypes.create_unicode_buffer(size.value)
+                        if kernel32.QueryFullProcessImageNameW(handle, 0, path, ctypes.byref(size)):
+                            is_granola[pid] = ntpath.basename(path.value).casefold() == GRANOLA_IMAGE
+                    finally:
+                        kernel32.CloseHandle(handle)
+            return is_granola[pid]
+
+        found = []
+        for hwnd in hwnds:
+            if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+                continue
+            if not user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST:
+                continue
+            cloaked = wintypes.DWORD(0)  # stays 0 if the call fails, which counts as not cloaked
+            if dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked)) == 0 and cloaked.value:
+                continue
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            rect = _RECT()
+            if granola_process(pid.value) and user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                found.append((rect.left, rect.top, rect.right, rect.bottom))
+        return found
+    except Exception:
+        return []
+
+
+def _clear_of(x: int, y: int, width: int, height: int, windows: Sequence[tuple[int, int, int, int]], bottom: int) -> int:
+    """The top for a width x height card at x that overlaps none of ``windows`` (touching is not overlapping): y when
+    nothing is in its way, else just below the lowest window that is, and then below any in the way there. Where that
+    would end past ``bottom``, the work area's, y is kept and the card shows over them.
+
+    There is no gap under a window. Granola's popup window has a transparent margin of its own, about 27 px at 100%
+    below the popup, which is as much as the card's 24 px margin from the top of the screen.
+    """
+    top = y
+    while True:
+        in_the_way = [
+            w_bottom
+            for w_left, w_top, w_right, w_bottom in windows
+            if min(w_right, x + width) > max(w_left, x) and min(w_bottom, top + height) > max(w_top, top)
+        ]
+        if not in_the_way:
+            break
+        top = max(in_the_way)  # always lower than before, so this ends
+    return top if top + height <= bottom else y
+
+
+def _keep_on_screen(x: int, y: int, width: int, height: int, screen: tuple[int, int, int, int], visible: int) -> tuple[int, int]:
+    """x and y, moved the least that leaves ``visible`` pixels of a width x height card inside ``screen``, across and down."""
+    left, top, right, bottom = screen
+    return min(max(x, left + visible - width), right - visible), min(max(y, top + visible - height), bottom - visible)
 
 
 def _wrapper_hwnd(root: tk.Tk) -> int:
@@ -398,7 +527,7 @@ def show_notice(title: str, seconds: int, *, kind: str = "calendar", choices: Se
     y += button_h + pad
     canvas.configure(height=y)
 
-    timer = {"job": None}
+    timer = {"job": None, "check": None}  # the countdown's next tick, and the next look for Granola's popup
 
     def finish(answer: int | None) -> None:
         # quit() rather than destroy(): destroying inside a canvas click handler crashes Tk.
@@ -406,8 +535,9 @@ def show_notice(title: str, seconds: int, *, kind: str = "calendar", choices: Se
             return
         state["done"] = True
         state["value"] = answer
-        if timer["job"] is not None:
-            root.after_cancel(timer["job"])
+        for name in ("job", "check"):
+            if timer[name] is not None:
+                root.after_cancel(timer[name])
         root.quit()
 
     pressed = {"tag": None, "at": 0.0}
@@ -487,12 +617,58 @@ def show_notice(title: str, seconds: int, *, kind: str = "calendar", choices: Se
     top_y = top + margin
     if top_y + height > bottom:
         top_y = max(top, bottom - height - margin)
+    # Granola's own meeting popup shows in the same corner, so the card goes below it.
+    top_y = _clear_of(x, top_y, width, height, _granola_windows(), bottom)
     root.geometry(f"{width}x{height}+{x}+{top_y}")
+    placed = {"x": x, "y": top_y, "dragged": False}  # where the card is, and whether the user has moved it
+    screen = _virtual_screen() or (left, top, right, bottom)  # read once; the primary monitor when Windows won't say
+    drag = {"from": None, "moving": False, "cursor": ""}  # a press on the background: pointer and card then, and whether it moves the card yet
+
+    def grab(event) -> None:
+        # Item bindings run before this one, so a press on a button or a meeting has already set pressed["tag"].
+        if pressed["tag"] is None:
+            drag["from"] = (event.x_root, event.y_root, placed["x"], placed["y"])
+
+    def move(event) -> None:
+        if drag["from"] is None:
+            return
+        from_x, from_y, card_x, card_y = drag["from"]
+        across, down = event.x_root - from_x, event.y_root - from_y
+        if not drag["moving"]:
+            if math.hypot(across, down) < px(DRAG_THRESHOLD):
+                return
+            drag["moving"] = placed["dragged"] = True
+            drag["cursor"] = canvas.cget("cursor")
+            canvas.configure(cursor="fleur")
+        placed["x"], placed["y"] = _keep_on_screen(card_x + across, card_y + down, width, height, screen, px(KEEP_ON_SCREEN))
+        root.geometry(f"{width}x{height}+{placed['x']}+{placed['y']}")
+
+    def drop(_event) -> None:
+        if drag["moving"]:
+            canvas.configure(cursor=drag["cursor"])
+        drag["from"], drag["moving"] = None, False
+
+    canvas.bind("<ButtonPress-1>", grab)
+    canvas.bind("<B1-Motion>", move)
+    canvas.bind("<ButtonRelease-1>", drop)
+
+    def keep_clear() -> None:
+        """The popup can come up after the card. Then the card moves down below it, and never back up, so nothing shifts
+        under the pointer when the popup goes. It stays put while the pointer is held down on the card, and for good once
+        the user has dragged it somewhere."""
+        if pressed["tag"] is None and drag["from"] is None and not placed["dragged"]:
+            lower = _clear_of(x, placed["y"], width, height, _granola_windows(), bottom)
+            if lower > placed["y"]:
+                placed["y"] = lower
+                root.geometry(f"{width}x{height}+{x}+{lower}")
+        timer["check"] = root.after(POPUP_CHECK_MS, keep_clear)
+
     _style_card(_wrapper_hwnd(root), border=colors["border"])
     root.deiconify()
     root.lift()
     shown_at["at"] = time.monotonic()
     tick()
+    timer["check"] = root.after(POPUP_CHECK_MS, keep_clear)
     root.mainloop()
     root.destroy()
     return state["value"]

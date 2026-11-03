@@ -2,7 +2,7 @@
 
 > **Disclaimer:** this is a small personal project, to fix a frustration I have with missing meeting notes. It is 100% AI-built, on a best-effort basis, with no guarantee of success.
 
-Starts [Granola](https://granola.ai) when a meeting begins on this PC, or when you join a Zoom call. Microsoft Teams and Google Meet calls work too, once you switch them on: they're off by default. A small card appears first in the top-right corner of your main display, with the meeting title and a 10-second ring. For a calendar meeting it appears that long before the start, so notes start as the meeting begins.
+Starts [Granola](https://granola.ai) when a meeting begins on this PC, or when you join a Zoom call. Microsoft Teams and Google Meet calls work too, once you switch them on: they're off by default. A small card appears first in the top-right corner of your main display (below Granola's own meeting popup, when that's showing there), with the meeting title and a 10-second ring. For a calendar meeting it appears that long before the start, so notes start as the meeting begins. If the card is in the way, drag it by its background to move it. The countdown carries on.
 
 **Cancel** leaves Granola alone. **Start now** or doing nothing opens that meeting's note and starts transcription. It does not join the call. The card never takes keyboard focus, so typing in another app is not interrupted (and Esc is not used). If the card itself can't open, notes for a meeting start anyway, as if nobody had answered it, and the tray says the card is broken. Notes aren't restarted after Granola closes without a card to cancel.
 
