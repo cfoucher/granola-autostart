@@ -440,7 +440,7 @@ function callsSection() {
 
 function notesSection() {
   const intro = `<div class="intro"><h1>Starting notes</h1>
-    <p>Just before a meeting begins, or when you join a call, a card counts down in the top-right corner of your main display. Granola opens that meeting's note when it reaches zero, unless you cancel.</p></div>`;
+    <p>Just before a meeting begins, or when you join a call, a card counts down in the top-right corner of your main display, below Granola's own meeting popup if it's showing there. Granola opens that meeting's note when it reaches zero, unless you cancel.</p></div>`;
   if (!data.settings) return intro + configBanner();
   const st = data.settings;
   const length = "countdown" in ui.chosen ? ui.chosen.countdown : st.countdown_seconds;

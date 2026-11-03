@@ -1,4 +1,5 @@
 import ctypes
+import itertools
 import json
 import logging
 import math
@@ -143,12 +144,13 @@ class Font:
 
 
 class Canvas:
-    """Records what the card draws, and the handlers bound to its buttons."""
+    """Records what the card draws, and the handlers bound to its buttons and to the canvas itself."""
 
     def __init__(self, root, **options):
         self.options = options
         self.items: dict[int, dict] = {}
-        self.bindings: dict[str, dict] = {}
+        self.bindings: dict[str, dict] = {}  # the items', by tag
+        self.widget_bindings: dict[str, object] = {}  # the canvas's own
         root.canvas = self
 
     def pack(self):
@@ -176,8 +178,14 @@ class Canvas:
     def configure(self, **options):
         self.options.update(options)
 
+    def cget(self, name):
+        return self.options.get(name, "")
+
     def tag_bind(self, tag, sequence, handler):
         self.bindings.setdefault(tag, {})[sequence] = handler
+
+    def bind(self, sequence, handler):
+        self.widget_bindings[sequence] = handler
 
     def bbox(self, tag):
         face = next(item for item in self.items.values() if item["kind"] == "image" and item.get("tags") == tag)  # a row's first
@@ -191,21 +199,26 @@ class Root:
     def __init__(self, card):
         self.card = card
         self.tk = SimpleNamespace(call=lambda *_args: None)
-        self.jobs: dict[str, object] = {}
+        self.jobs: dict[str, tuple[float, object]] = {}  # by name: when it is due, and what it runs
+        self.job_numbers = itertools.count()
         self.protocols = {}
         self.ended_at = None
         self.destroyed = False
         self.size = None
+        self.moves: list[str] = []  # every geometry the card was given
+        self.called: list[str] = []  # every other call the card made that does nothing here: focus_force would show up in it
 
     def __getattr__(self, name):  # withdraw, overrideredirect, attributes, configure, deiconify, lift, ...
+        self.called.append(name)
         return lambda *_args, **_kwargs: None
 
     def geometry(self, spec):
         self.size = spec
+        self.moves.append(spec)
 
-    def after(self, _milliseconds, callback):
-        job = f"after#{len(self.jobs)}"
-        self.jobs[job] = callback
+    def after(self, milliseconds, callback):
+        job = f"after#{next(self.job_numbers)}"
+        self.jobs[job] = (self.card.now + milliseconds / 1000, callback)
         return job
 
     def after_cancel(self, job):
@@ -232,9 +245,11 @@ class Card:
     def __init__(self):
         self.now = 1000.0
         self.monitor = (0, 0, 1920, 1040, 96)  # the work area and DPI of the primary monitor
+        self.screen: tuple[int, int, int, int] | None = (0, 0, 1920, 1080)  # all the monitors together, None when Windows won't say
         self.theme = "light"
         self.user = lambda card: None
         self.styled = []
+        self.granola: list[tuple[int, int, int, int]] = []  # the rects of Granola's own windows on top
         self.root: Root | None = None
 
     def make_root(self):
@@ -249,19 +264,38 @@ class Card:
         return [item["text"] for item in self.canvas.items.values() if item["kind"] == "text"]
 
     def wait(self, seconds: float) -> None:
-        """Let the countdown run, ticking as Tk's timer would, until it ends or the time is up."""
+        """Let the countdown run, in steps of a quarter second, until it ends or the time is up. Each step runs the timers
+        that have come due, as Tk's would."""
         end = self.now + seconds
         while self.now < end and self.root.ended_at is None:
             self.now = min(end, self.now + 0.25)
-            jobs, self.root.jobs = self.root.jobs, {}
-            for job in jobs.values():
-                job()
+            for job, (due, callback) in list(self.root.jobs.items()):
+                if due <= self.now and job in self.root.jobs:  # not cancelled by a timer that ran before it
+                    del self.root.jobs[job]
+                    callback()
+
+    def pointer(self, sequence: str, x: int, y: int, *, over: str | None = None) -> None:
+        """A mouse event with the pointer at (x, y) on the screen, over the button or meeting with that tag or over the
+        card's background. As in Tk, the item's binding runs before the canvas's own."""
+        window_x, window_y = position(self)
+        event = SimpleNamespace(x=x - window_x, y=y - window_y, x_root=x, y_root=y)
+        if sequence in self.canvas.bindings.get(over, {}):
+            self.canvas.bindings[over][sequence](event)
+        if sequence in self.canvas.widget_bindings:
+            self.canvas.widget_bindings[sequence](event)
+
+    def spot(self, tag: str | None = None) -> tuple[int, int]:
+        """A point on the screen inside the button or meeting with that tag, or on the background, where nothing is drawn."""
+        window_x, window_y = position(self)
+        if tag is None:
+            return window_x + 4, window_y + 4
+        x1, y1, _x2, _y2 = self.canvas.bbox(tag)
+        return window_x + x1 + 2, window_y + y1 + 2
 
     def click(self, tag: str, *, let_go_outside: bool = False) -> None:
-        x1, y1, x2, _y2 = self.canvas.bbox(tag)
-        handlers = self.canvas.bindings[tag]
-        handlers["<ButtonPress-1>"](SimpleNamespace(x=x1 + 2, y=y1 + 2))
-        handlers["<ButtonRelease-1>"](SimpleNamespace(x=x2 + 40 if let_go_outside else x1 + 2, y=y1 + 2))
+        x, y = self.spot(tag)
+        self.pointer("<ButtonPress-1>", x, y, over=tag)
+        self.pointer("<ButtonRelease-1>", x + 400 if let_go_outside else x, y, over=tag)  # 400 is past any button
 
     def close(self) -> None:
         self.root.protocols["WM_DELETE_WINDOW"]()
@@ -284,6 +318,8 @@ def card(monkeypatch) -> Card:
     monkeypatch.setattr(notice, "per_monitor_dpi", lambda: None)
     monkeypatch.setattr(notice, "app_theme", lambda: harness.theme)
     monkeypatch.setattr(notice, "_primary_monitor", lambda: harness.monitor)
+    monkeypatch.setattr(notice, "_virtual_screen", lambda: harness.screen)
+    monkeypatch.setattr(notice, "_granola_windows", lambda: list(harness.granola))
     monkeypatch.setattr(notice, "_wrapper_hwnd", lambda root: 0x10)
     monkeypatch.setattr(notice, "_style_card", lambda hwnd, *, border: harness.styled.append((hwnd, border)))
     return harness
@@ -380,6 +416,88 @@ def test_a_card_too_tall_for_the_screen_keeps_its_top_on_screen(card):
     height, y = (int(part) for part in re.fullmatch(r"\d+x(\d+)\+\d+\+(\d+)", card.root.size).groups())
     assert height > 150 and y == 100
     assert card.canvas.options["bg"] == notice.PALETTES["dark"]["bg"]
+
+
+POPUP = (3228, 78, 3834, 234)  # Granola's meeting popup, transparent margin and all, on a 4K primary monitor at 150%
+CORNER = (0, 72, 3840, 2088, 144)  # that monitor's work area and DPI, which put the card at x=3198, y=108 without the popup
+
+
+def position(card) -> tuple[int, int]:
+    """Where the card is now, as (x, y)."""
+    x, y = re.fullmatch(r"\d+x\d+\+(-?\d+)\+(-?\d+)", card.root.size).groups()
+    return int(x), int(y)
+
+
+def test_the_card_sits_below_granola_s_meeting_popup_in_the_same_corner(card):
+    card.monitor = CORNER
+    card.granola = [POPUP]
+    card.show()
+    assert position(card) == (3198, 234)
+    assert len(card.root.moves) == 1  # it was never on top of the popup
+
+
+def test_a_card_with_no_room_below_the_popup_shows_over_it_anyway(card):
+    card.monitor = (0, 0, 1920, 300, 96)
+    card.granola = [(1490, 0, 1900, 200)]
+    card.show()
+    height = int(re.fullmatch(r"\d+x(\d+)\+\d+\+\d+", card.root.size).group(1))
+    assert position(card) == (1492, 24) and 200 + height > 300
+
+
+def test_a_popup_that_comes_up_after_the_card_moves_it_down_at_the_next_look(card):
+    seen = []
+
+    def user(card):
+        card.wait(1)
+        card.granola.append(POPUP)
+        card.wait(0.25)
+        seen.append(card.root.size)  # it looks every half second
+        card.wait(0.25)
+        seen.append(card.root.size)
+
+    card.monitor = CORNER
+    card.user = user
+    card.show()
+    before, after = seen
+    assert before.endswith("+3198+108") and after == before.removesuffix("+108") + "+234"  # the same width, height and x
+    assert len(card.root.moves) == 2
+
+
+def test_the_card_does_not_move_back_up_when_the_popup_goes(card):
+    def user(card):
+        card.wait(1)
+        card.granola.clear()
+        card.wait(3)
+        assert position(card) == (3198, 234)
+
+    card.monitor = CORNER
+    card.granola = [POPUP]
+    card.user = user
+    card.show()
+    assert len(card.root.moves) == 1
+
+
+def test_the_card_stays_put_while_a_button_is_held_and_moves_once_it_is_let_go(card):
+    def user(card):
+        x1, y1, x2, _y2 = card.canvas.bbox("start")
+        start = card.canvas.bindings["start"]
+        start["<ButtonPress-1>"](SimpleNamespace(x=x1 + 2, y=y1 + 2))
+        card.granola.append(POPUP)
+        card.wait(2)
+        assert position(card) == (3198, 108)
+        start["<ButtonRelease-1>"](SimpleNamespace(x=x2 + 40, y=y1 + 2))  # let go outside the button, which starts nothing
+        card.wait(0.5)
+        assert position(card) == (3198, 234)
+
+    card.monitor = CORNER
+    card.user = user
+    assert card.show() == (0, 10)
+
+
+def test_the_card_stops_looking_for_the_popup_when_it_is_done(card):
+    card.user = lambda card: card.click("cancel")
+    card.show()
+    assert card.root.jobs == {}
 
 
 STANDUP = ("Chromium Team: Stand-Up", "09:00\u201309:15 \u00b7 7 guests")
@@ -536,6 +654,294 @@ def test_the_card_for_meetings_says_opening_granola_for_the_last_second(card):
     assert [" ".join(text.split()) for text in statuses] == ["Granola opens the ticked meeting when the timer runs out.", "Opening Granola\u2026"]
 
 
+def drag(card, across, down, *, let_go=True) -> tuple[int, int]:
+    """Press on the card's background, move the pointer by (across, down) and let go, unless told not to. Where it pressed."""
+    x, y = card.spot()
+    card.pointer("<ButtonPress-1>", x, y)
+    card.pointer("<B1-Motion>", x + across, y + down)
+    if let_go:
+        card.pointer("<ButtonRelease-1>", x + across, y + down)
+    return x, y
+
+
+def size_of(card) -> tuple[int, int]:
+    """The card's width and height."""
+    width, height = re.fullmatch(r"(\d+)x(\d+)\+-?\d+\+-?\d+", card.root.size).groups()
+    return int(width), int(height)
+
+
+def test_dragging_the_card_by_its_background_moves_it_by_the_pointer_s_movement(card):
+    def user(card):
+        card.wait(1)
+        shape = card.root.size.split("+")[0]
+        start_x, start_y = position(card)
+        x, y = card.spot()
+        card.pointer("<ButtonPress-1>", x, y)
+        card.pointer("<B1-Motion>", x - 100, y + 60)
+        assert card.root.size == f"{shape}+{start_x - 100}+{start_y + 60}"  # the size is the same
+        card.pointer("<B1-Motion>", x - 300, y + 40)  # from where it was pressed, not from the last move
+        assert position(card) == (start_x - 300, start_y + 40)
+        card.pointer("<ButtonRelease-1>", x - 300, y + 40)
+        drag(card, 50, 0)  # and it can be picked up again from where it is
+        assert position(card) == (start_x - 250, start_y + 40)
+
+    card.user = user
+    card.show()
+
+
+@pytest.mark.parametrize(("dpi", "threshold"), [(96, 4), (144, 6)])
+def test_the_card_follows_the_pointer_only_once_it_has_moved_a_few_pixels(dpi, threshold, card):
+    def user(card):
+        start_x, start_y = position(card)
+        x, y = card.spot()
+        card.pointer("<ButtonPress-1>", x, y)
+        card.pointer("<B1-Motion>", x + threshold - 1, y)
+        card.pointer("<B1-Motion>", x, y + threshold - 1)
+        assert position(card) == (start_x, start_y) and len(card.root.moves) == 1 and card.canvas.cget("cursor") == ""
+        card.pointer("<B1-Motion>", x + threshold, y)
+        assert position(card) == (start_x + threshold, start_y)  # all of the way from the press, not from the threshold
+        card.pointer("<B1-Motion>", x + 1, y)  # and once it follows, it follows any movement
+        assert position(card) == (start_x + 1, start_y)
+
+    card.monitor = (0, 0, 1920, 1040, dpi)
+    card.user = user
+    card.show()
+
+
+def test_a_click_on_the_background_is_just_a_click_and_the_popup_check_carries_on(card):
+    def user(card):
+        card.wait(1)
+        x, y = card.spot()
+        card.pointer("<ButtonPress-1>", x, y)
+        card.pointer("<ButtonRelease-1>", x, y)
+        card.pointer("<ButtonPress-1>", x, y)
+        card.pointer("<B1-Motion>", x + 2, y + 2)  # a click that wobbled
+        card.pointer("<ButtonRelease-1>", x + 2, y + 2)
+        assert len(card.root.moves) == 1 and card.root.ended_at is None and card.canvas.cget("cursor") == ""
+        card.granola.append(POPUP)  # the card was never dragged, so it still gets out of the popup's way
+        card.wait(0.5)
+        assert position(card) == (3198, 234)
+
+    card.monitor = CORNER
+    card.screen = (0, 0, 3840, 2160)
+    card.user = user
+    assert card.show() == (0, 10)
+
+
+@pytest.mark.parametrize(
+    ("tag", "answer"), [("start", (0, 10)), ("cancel", (None, 1)), ("row0", (0, 10)), ("row1", (0, 10))], ids=["Start now", "Cancel", "first meeting", "second meeting"]
+)
+def test_pressing_a_button_or_a_meeting_and_moving_does_not_drag_the_card(tag, answer, card):
+    def user(card):
+        card.wait(1)
+        x, y = card.spot(tag)
+        card.pointer("<ButtonPress-1>", x, y, over=tag)
+        card.pointer("<B1-Motion>", x - 300, y + 200)  # Tk sends the moves to the canvas, whatever is under the pointer
+        assert len(card.root.moves) == 1 and card.canvas.cget("cursor") == ""
+        card.pointer("<ButtonRelease-1>", x - 300, y + 200, over=tag)  # and lets go far from it
+        assert len(card.root.moves) == 1 and ticked_rows(card) == [True, False]
+
+    card.user = user
+    assert card.show(choices=[STANDUP, REMINDER]) == answer  # as it was: only Cancel answers wherever it is let go
+
+
+@pytest.mark.parametrize(("tag", "answer"), [("start", (0, 1)), ("row1", (1, 10))], ids=["Start now", "second meeting"])
+def test_a_press_that_wanders_over_a_button_or_a_meeting_still_clicks_it_where_it_is_let_go(tag, answer, card):
+    def user(card):
+        card.wait(1)
+        x, y = card.spot(tag)
+        card.pointer("<ButtonPress-1>", x, y, over=tag)
+        card.pointer("<B1-Motion>", x + 20, y + 10)  # well past the threshold, but still on it
+        card.pointer("<ButtonRelease-1>", x + 20, y + 10, over=tag)
+        assert len(card.root.moves) == 1
+
+    card.user = user
+    assert card.show(choices=[STANDUP, REMINDER]) == answer
+
+
+def test_start_now_and_cancel_still_work_on_a_card_that_was_dragged(card):
+    card.user = lambda card: (drag(card, -200, 100), card.wait(1), card.click("start"))
+    assert card.show() == (0, 1)
+    card.user = lambda card: (drag(card, -200, 100), card.click("cancel"))
+    assert card.show() == (None, 0)
+
+
+def test_the_cursor_is_the_move_cursor_while_dragging_and_what_it_was_before_afterwards(card):
+    def user(card):
+        x, y = card.spot()
+        assert card.canvas.cget("cursor") == ""
+        card.pointer("<ButtonPress-1>", x, y)
+        assert card.canvas.cget("cursor") == ""  # not yet
+        card.pointer("<B1-Motion>", x + 100, y)
+        card.pointer("<B1-Motion>", x + 200, y + 50)
+        assert card.canvas.cget("cursor") == "fleur"
+        card.pointer("<ButtonRelease-1>", x + 200, y + 50)
+        assert card.canvas.cget("cursor") == ""
+        card.canvas.configure(cursor="hand2")  # had the pointer come from a meeting
+        drag(card, 0, 100)
+        assert card.canvas.cget("cursor") == "hand2"
+        card.canvas.bindings["row1"]["<Leave>"](None)  # the meetings light up as before
+        card.canvas.bindings["row1"]["<Enter>"](None)
+        assert card.canvas.cget("cursor") == "hand2"
+        card.canvas.bindings["row1"]["<Leave>"](None)
+        assert card.canvas.cget("cursor") == ""
+
+    card.user = user
+    card.show(choices=[STANDUP, REMINDER])
+
+
+def test_the_countdown_carries_on_during_and_after_a_drag_and_finishes_on_its_own(card):
+    def user(card):
+        card.wait(1)
+        x, y = drag(card, -200, 100, let_go=False)
+        card.wait(2)  # held down
+        assert "7" in card.texts() and card.root.ended_at is None
+        card.pointer("<ButtonRelease-1>", x - 200, y + 100)
+        assert card.root.ended_at is None  # dragging is not an answer
+        card.wait(3)
+        assert "4" in card.texts() and card.root.ended_at is None
+
+    card.user = user
+    assert card.show(seconds=10) == (0, 10)
+
+
+def test_dragging_asks_tk_for_nothing_but_a_new_position_so_the_card_never_takes_focus(card):
+    def user(card):
+        before = list(card.root.called)
+        drag(card, -200, 100)
+        assert card.root.called == before and len(card.root.moves) == 2  # the first is where the card appeared
+        assert "focus" not in " ".join(before)
+
+    card.user = user
+    card.show()
+
+
+def test_a_popup_that_comes_up_after_the_card_was_dragged_does_not_move_it(card):
+    def user(card):
+        card.wait(1)
+        drag(card, -10, 0)  # to where the popup is about to be
+        dragged = position(card)
+        card.granola.append(POPUP)
+        card.wait(3)
+        assert position(card) == dragged == (3188, 108) and len(card.root.moves) == 2
+
+    card.monitor = CORNER
+    card.screen = (0, 0, 3840, 2160)
+    card.user = user
+    card.show()
+
+
+def test_a_popup_that_comes_up_during_a_drag_does_not_move_the_card_then_or_after(card):
+    def user(card):
+        x, y = card.spot()
+        card.pointer("<ButtonPress-1>", x, y)
+        card.granola.append(POPUP)
+        card.wait(1)
+        assert position(card) == (3198, 108)  # held, but not dragged yet
+        card.pointer("<B1-Motion>", x - 10, y)
+        card.wait(1)
+        assert position(card) == (3188, 108)
+        card.pointer("<ButtonRelease-1>", x - 10, y)
+        card.wait(1)
+        assert position(card) == (3188, 108)
+
+    card.monitor = CORNER
+    card.screen = (0, 0, 3840, 2160)
+    card.user = user
+    card.show()
+
+
+def test_the_card_waits_for_the_background_to_be_let_go_before_getting_out_of_a_popup_s_way(card):
+    def user(card):
+        x, y = card.spot()
+        card.pointer("<ButtonPress-1>", x, y)
+        card.granola.append(POPUP)
+        card.wait(2)
+        assert position(card) == (3198, 108)
+        card.pointer("<ButtonRelease-1>", x, y)  # never dragged
+        card.wait(0.5)
+        assert position(card) == (3198, 234)
+
+    card.monitor = CORNER
+    card.screen = (0, 0, 3840, 2160)
+    card.user = user
+    card.show()
+
+
+@pytest.mark.parametrize(("dpi", "visible"), [(96, 40), (144, 60)])
+def test_a_card_dragged_far_off_the_screen_keeps_part_of_itself_on_it(dpi, visible, card):
+    def user(card):
+        width, height = size_of(card)
+        drag(card, 5000, 5000)
+        assert position(card) == (1920 - visible, 1080 - visible)
+        drag(card, -9000, -9000)
+        assert position(card) == (visible - width, visible - height)
+        drag(card, 9000, -9000)
+        assert position(card) == (1920 - visible, visible - height)
+        drag(card, -9000, 9000)
+        assert position(card) == (visible - width, 1080 - visible)
+
+    card.monitor = (0, 0, 1920, 1040, dpi)
+    card.user = user
+    card.show()
+
+
+def test_a_card_can_be_dragged_onto_a_monitor_left_of_or_above_the_primary(card):
+    def user(card):
+        width, height = size_of(card)
+        drag(card, -2500, -400)  # from x=1492, y=24
+        assert position(card) == (-1008, -376) and card.root.size.endswith("+-1008+-376")  # as Tk takes it
+        drag(card, -9000, -9000)
+        assert position(card) == (-1920 + 40 - width, -1080 + 40 - height)
+
+    card.screen = (-1920, -1080, 1920, 1080)  # a monitor to the left of the primary one, and another above it
+    card.user = user
+    card.show()
+
+
+def test_without_the_virtual_screen_a_dragged_card_keeps_part_of_itself_on_the_primary_monitor(card):
+    def user(card):
+        width, height = size_of(card)
+        drag(card, 5000, 5000)
+        assert position(card) == (1920 - 40, 1040 - 40)  # the work area's corner
+        drag(card, -9000, -9000)
+        assert position(card) == (40 - width, 40 - height)
+
+    card.screen = None
+    card.user = user
+    card.show()
+
+
+def test_a_card_keeps_part_of_itself_inside_the_screen():
+    def keep(x, y):
+        return notice._keep_on_screen(x, y, 400, 200, (-100, -50, 1000, 800), 40)
+
+    assert keep(300, 300) == (300, 300)
+    assert keep(-460, -210) == (-460, -210) and keep(-461, -211) == (-460, -210)  # 40 pixels of it left at the top left
+    assert keep(960, 760) == (960, 760) and keep(961, 761) == (960, 760)  # and at the bottom right
+    assert keep(-9000, 9000) == (-460, 760)
+
+
+def test_the_virtual_screen_is_all_the_monitors_together(monkeypatch):
+    asked = []
+    metrics = {76: -1920, 77: -1080, 78: 5760, 79: 2160}  # SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN
+    fake_ctypes(monkeypatch, user32=SimpleNamespace(GetSystemMetrics=lambda index: asked.append(index) or metrics[index]))
+    assert notice._virtual_screen() == (-1920, -1080, 3840, 1080)
+    assert asked == [76, 77, 78, 79]
+
+
+def test_when_windows_will_not_say_there_is_no_virtual_screen(monkeypatch):
+    def broken(_index):
+        raise OSError("access denied")
+
+    fake_ctypes(monkeypatch, user32=SimpleNamespace(GetSystemMetrics=lambda index: 0))  # 0 is how it says it failed
+    assert notice._virtual_screen() is None
+    fake_ctypes(monkeypatch, user32=SimpleNamespace(GetSystemMetrics=broken))
+    assert notice._virtual_screen() is None
+    fake_ctypes(monkeypatch)  # the call is missing
+    assert notice._virtual_screen() is None
+
+
 def test_the_palettes_have_the_ticked_row_s_colour():
     assert (notice.PALETTES["light"]["accent_soft"], notice.PALETTES["dark"]["accent_soft"]) == ("#e8efdf", "#2c3627")
 
@@ -588,7 +994,8 @@ def test_fonts_fall_back_to_segoe_ui(monkeypatch):
 
 def fake_ctypes(monkeypatch, **dlls) -> None:
     """ctypes with only the DLLs given, so a call the test leaves out is missing, as on an older Windows."""
-    kept = {name: getattr(ctypes, name) for name in ("POINTER", "byref", "sizeof", "c_int", "c_ssize_t", "c_size_t", "HRESULT")}
+    names = ("POINTER", "byref", "sizeof", "c_int", "c_ssize_t", "c_size_t", "HRESULT", "WINFUNCTYPE", "create_unicode_buffer")
+    kept = {name: getattr(ctypes, name) for name in names}
     monkeypatch.setattr(notice, "ctypes", SimpleNamespace(windll=SimpleNamespace(**dlls), **kept))
 
 
@@ -674,6 +1081,223 @@ def test_windows_10_ignoring_rounded_corners_is_fine(monkeypatch):
     fake_ctypes(monkeypatch, user32=user32)
     monkeypatch.setattr(notice, "set_window_attribute", unsupported)
     notice._style_card(0x20, border="#e2d9c6")
+
+
+def test_a_card_nothing_is_in_front_of_stays_where_it_is():
+    assert notice._clear_of(100, 50, 400, 200, [], 1000) == 50
+
+
+def test_a_card_under_a_window_goes_just_below_it():
+    assert notice._clear_of(100, 50, 400, 200, [(300, 0, 700, 120)], 1000) == 120
+
+
+@pytest.mark.parametrize(
+    "window",
+    [(0, 0, 100, 400), (500, 0, 800, 400), (100, 0, 500, 50), (100, 250, 500, 400), (600, 0, 800, 400), (100, 300, 500, 400), (300, 100, 300, 300)],
+    ids=["touching on the left", "touching on the right", "touching above", "touching below", "beside", "under", "without any area"],
+)
+def test_a_window_that_only_touches_the_card_or_is_beside_it_does_not_move_it(window):
+    assert notice._clear_of(100, 50, 400, 200, [window], 1000) == 50  # the card is x 100 to 500, y 50 to 250
+
+
+def test_a_card_under_two_stacked_windows_goes_below_both():
+    assert notice._clear_of(100, 50, 400, 200, [(100, 120, 500, 200), (100, 0, 500, 120)], 1000) == 200
+
+
+def test_a_card_moved_down_into_another_window_goes_below_that_one_too():
+    assert notice._clear_of(100, 50, 400, 200, [(100, 0, 500, 100), (100, 260, 500, 400)], 1000) == 400
+
+
+def test_a_card_with_no_room_below_the_windows_keeps_its_place():
+    windows = [(100, 0, 500, 120)]
+    assert notice._clear_of(100, 50, 400, 200, windows, 319) == 50
+    assert notice._clear_of(100, 50, 400, 200, windows, 320) == 120  # as low as it fits
+
+
+def test_the_card_clears_granola_s_popup_as_measured_on_a_4k_monitor_at_150_percent():
+    assert notice._clear_of(3198, 108, 606, 250, [(3228, 78, 3834, 234)], 2088) == 234
+
+
+GRANOLA = r"C:\Users\Conrad\AppData\Local\Programs\Granola\Granola.exe"
+ZOOM = r"C:\Users\Conrad\AppData\Roaming\Zoom\bin\Zoom.exe"
+HRESULT_FAILED = 0x80070057
+
+
+class Desktop:
+    """Fake windows, and the user32, kernel32 and dwmapi that answer about them. A window belongs to the process running
+    an image, which is its full path, or None when Windows won't give the name."""
+
+    def __init__(self):
+        self.windows: dict[int, SimpleNamespace] = {}
+        self.images: dict[int, str | None] = {}  # by process id
+        self.unopenable: set[int] = set()  # the processes Windows won't open
+        self.opened: list[int] = []  # the process ids that were opened, in order
+        self.handles: set[int] = set()  # what is open now
+        self.dwm_answers = True
+
+    def add(self, image, rect=(0, 0, 100, 100), *, visible=True, iconic=False, cloaked=False, topmost=True) -> int:
+        pid = next((pid for pid, known in self.images.items() if known == image), 100 + len(self.images))
+        self.images[pid] = image
+        hwnd = 0x1000 + len(self.windows)
+        self.windows[hwnd] = SimpleNamespace(pid=pid, rect=rect, visible=visible, iconic=iconic, cloaked=cloaked, topmost=topmost)
+        return hwnd
+
+    def pid_of(self, image) -> int:
+        return next(pid for pid, known in self.images.items() if known == image)
+
+    def user32(self) -> SimpleNamespace:
+        windows = self.windows
+
+        def enum_windows(callback, lparam):
+            for hwnd in windows:
+                if not callback(hwnd, lparam):
+                    break
+            return 1
+
+        def style(hwnd, index):
+            assert index == -20  # GWL_EXSTYLE
+            return 0x100 | (0x8 if windows[hwnd].topmost else 0)
+
+        def process_id(hwnd, pid):
+            pid._obj.value = windows[hwnd].pid
+            return 1
+
+        def window_rect(hwnd, rect):
+            if windows[hwnd].rect is None:  # the window was destroyed since it was listed
+                return 0
+            area = rect._obj
+            area.left, area.top, area.right, area.bottom = windows[hwnd].rect
+            return 1
+
+        return SimpleNamespace(
+            EnumWindows=enum_windows,
+            IsWindowVisible=lambda hwnd: windows[hwnd].visible,
+            IsIconic=lambda hwnd: windows[hwnd].iconic,
+            GetWindowLongPtrW=style,
+            GetWindowThreadProcessId=process_id,
+            GetWindowRect=window_rect,
+        )
+
+    def kernel32(self) -> SimpleNamespace:
+        def open_process(access, inherit, pid):
+            assert access == 0x1000 and not inherit  # PROCESS_QUERY_LIMITED_INFORMATION
+            self.opened.append(pid)
+            if pid in self.unopenable:
+                return None
+            self.handles.add(0x7000 + pid)
+            return 0x7000 + pid
+
+        def image_name(handle, flags, buffer, size):
+            image = self.images[handle - 0x7000]
+            if image is None:
+                return 0
+            assert size._obj.value >= len(image)  # the buffer holds that many characters
+            buffer.value = image
+            size._obj.value = len(image)
+            return 1
+
+        def close_handle(handle):
+            self.handles.remove(handle)  # a handle closed twice, or never opened, is a mistake
+            return 1
+
+        return SimpleNamespace(OpenProcess=open_process, QueryFullProcessImageNameW=image_name, CloseHandle=close_handle)
+
+    def dwmapi(self) -> SimpleNamespace:
+        def window_attribute(hwnd, attribute, value, size):
+            assert attribute == 14 and size == 4  # DWMWA_CLOAKED, a DWORD
+            if not self.dwm_answers:
+                return HRESULT_FAILED
+            value._obj.value = int(self.windows[hwnd].cloaked)
+            return 0
+
+        return SimpleNamespace(DwmGetWindowAttribute=window_attribute)
+
+    def granola_windows(self, monkeypatch) -> list[tuple[int, int, int, int]]:
+        fake_ctypes(monkeypatch, user32=self.user32(), kernel32=self.kernel32(), dwmapi=self.dwmapi())
+        found = notice._granola_windows()
+        assert self.handles == set()  # whatever was opened was closed
+        return found
+
+
+def test_granola_s_windows_are_found_by_the_image_name_of_their_process_in_any_case(monkeypatch):
+    desktop = Desktop()
+    desktop.add(GRANOLA, (3228, 78, 3834, 234))
+    desktop.add(GRANOLA.replace("Granola.exe", "granola.exe"), (10, 20, 30, 40))
+    desktop.add(GRANOLA.replace("Granola.exe", "GRANOLA.EXE"), (1, 2, 3, 4))
+    assert desktop.granola_windows(monkeypatch) == [(3228, 78, 3834, 234), (10, 20, 30, 40), (1, 2, 3, 4)]
+
+
+def test_the_windows_of_other_apps_are_not_granola_s_and_nor_are_this_app_s_own(monkeypatch):
+    desktop = Desktop()
+    for image in (ZOOM, GRANOLA.replace("Granola.exe", "GranolaAutostart.exe"), GRANOLA.replace("Granola.exe", "NotGranola.exe"), GRANOLA + r"\..\other.exe"):
+        desktop.add(image)
+    assert desktop.granola_windows(monkeypatch) == []
+
+
+@pytest.mark.parametrize(
+    "unwanted",
+    [{"visible": False}, {"iconic": True}, {"cloaked": True}, {"topmost": False}],
+    ids=["invisible", "minimized", "cloaked", "not on top"],
+)
+def test_a_granola_window_that_is_not_showing_on_top_is_not_one_the_card_avoids(unwanted, monkeypatch):
+    desktop = Desktop()
+    desktop.add(GRANOLA, (1, 2, 3, 4), **unwanted)
+    desktop.add(GRANOLA, (5, 6, 7, 8))
+    assert desktop.granola_windows(monkeypatch) == [(5, 6, 7, 8)]
+
+
+def test_a_window_is_not_cloaked_when_windows_cannot_say(monkeypatch):
+    desktop = Desktop()
+    desktop.add(GRANOLA, (1, 2, 3, 4), cloaked=True)
+    desktop.dwm_answers = False
+    assert desktop.granola_windows(monkeypatch) == [(1, 2, 3, 4)]
+
+
+def test_a_process_windows_will_not_open_or_name_is_not_granola(monkeypatch):
+    desktop = Desktop()
+    locked = GRANOLA.replace("Granola.exe", "Locked.exe")
+    desktop.add(GRANOLA, (1, 2, 3, 4))
+    desktop.add(locked)
+    desktop.add(None)
+    desktop.unopenable.add(desktop.pid_of(locked))
+    assert desktop.granola_windows(monkeypatch) == [(1, 2, 3, 4)]
+    assert len(desktop.opened) == 3  # each was tried
+
+
+def test_each_process_is_looked_up_once_however_many_windows_it_has(monkeypatch):
+    desktop = Desktop()
+    for image in (GRANOLA, ZOOM, GRANOLA, ZOOM, GRANOLA, "locked", "locked"):
+        desktop.add(image)
+    desktop.unopenable.add(desktop.pid_of("locked"))
+    assert len(desktop.granola_windows(monkeypatch)) == 3
+    assert sorted(desktop.opened) == sorted(desktop.pid_of(image) for image in (GRANOLA, ZOOM, "locked"))
+
+
+def test_a_granola_window_destroyed_since_it_was_listed_is_skipped(monkeypatch):
+    desktop = Desktop()
+    desktop.add(GRANOLA, None)
+    desktop.add(GRANOLA, (5, 6, 7, 8))
+    assert desktop.granola_windows(monkeypatch) == [(5, 6, 7, 8)]
+
+
+def test_when_windows_cannot_be_listed_there_are_none_so_the_card_shows_regardless(monkeypatch):
+    desktop = Desktop()
+    desktop.add(GRANOLA, (1, 2, 3, 4))
+
+    def broken(*_args):
+        raise OSError("access denied")
+
+    user32 = desktop.user32()
+    user32.EnumWindows = broken
+    fake_ctypes(monkeypatch, user32=user32, kernel32=desktop.kernel32(), dwmapi=desktop.dwmapi())
+    assert notice._granola_windows() == []
+    kernel32 = desktop.kernel32()
+    kernel32.QueryFullProcessImageNameW = broken
+    fake_ctypes(monkeypatch, user32=desktop.user32(), kernel32=kernel32, dwmapi=desktop.dwmapi())
+    assert notice._granola_windows() == []
+    assert desktop.handles == set()  # the process it had open was still closed
+    fake_ctypes(monkeypatch, user32=desktop.user32(), kernel32=desktop.kernel32())  # no dwmapi
+    assert notice._granola_windows() == []
 
 
 def test_the_display_stays_on_while_a_card_counts_down(monkeypatch):
