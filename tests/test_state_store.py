@@ -33,6 +33,7 @@ def test_every_field_survives_a_restart():
         ),
         call_decided_session="teams:77",
         call_decided_at=now - timedelta(minutes=1),
+        call_noticed_at=now - timedelta(minutes=2),
     )
     # A field added later fails here until it is filled in above, and so saved and loaded.
     assert all(getattr(state, field.name) for field in fields(WatcherState))

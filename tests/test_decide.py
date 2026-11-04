@@ -14,6 +14,7 @@ from granola_autostart.decide import (
     Snapshot,
     WatcherState,
     _place,
+    adhoc_title,
     apply_result,
     evaluate,
 )
@@ -90,17 +91,67 @@ def test_a_zoom_call_with_no_meeting_becomes_an_hour_long_note_of_its_own():
     prompt, _state = decide(zoom_join(session="10:20", title="Roadmap", events=()))
     assert (prompt.title, prompt.payload["summary"], prompt.payload["id"]) == ("Roadmap", "Roadmap", "zoom-10-20")
     assert prompt.payload["end"]["dateTime"] == (NOW + timedelta(hours=1)).isoformat()
-    prompt, _state = decide(zoom_join(events=()))
-    assert prompt.title == "Zoom meeting"
+    prompt, _state = decide(zoom_join(age=0, events=()))
+    assert prompt.title == prompt.payload["summary"] == "Zoom call at 5:00 PM"
 
 
 @pytest.mark.parametrize(
-    ("provider", "fallback"),
-    [("zoom", "Zoom meeting"), ("teams", "Teams call"), ("meet", "Google Meet call"), ("webex", "Call"), (None, "Call")],
+    ("provider", "name"),
+    [("zoom", "Zoom call"), ("teams", "Teams call"), ("meet", "Google Meet call"), ("webex", "Call"), (None, "Call")],
 )
-def test_a_call_whose_windows_name_no_meeting_is_called_after_its_provider(provider, fallback):
-    prompt, _state = decide(snap(call_session_id=f"{provider}:7", call_provider=provider, call_age_seconds=1))
+def test_a_call_whose_windows_name_no_meeting_is_called_after_its_provider_and_when_it_began(provider, name):
+    began = NOW - timedelta(seconds=90)
+    prompt, _state = decide(snap(call_session_id=f"{provider}:7", call_provider=provider, call_age_seconds=90, call_started=began))
+    fallback = f"{name} at 4:58 PM"  # 90 seconds before 5:00 PM
     assert prompt.kind == "call" and prompt.title == fallback and prompt.payload["summary"] == fallback
+
+
+@pytest.mark.parametrize(
+    ("hour", "minute", "clock"), [(0, 5, "12:05 AM"), (9, 7, "9:07 AM"), (11, 59, "11:59 AM"), (12, 30, "12:30 PM"), (23, 0, "11:00 PM")]
+)
+def test_an_ad_hoc_call_s_time_is_on_a_twelve_hour_clock(hour, minute, clock):
+    assert adhoc_title("zoom", NOW.replace(hour=hour, minute=minute)) == f"Zoom call at {clock}"
+
+
+def test_an_ad_hoc_call_is_named_for_its_start_not_now_less_its_age():
+    # The watcher reads the clock, then the call: this one began a moment after that, on the minute, and its age was
+    # worked out later still. Now less its age would be 4:59 PM.
+    prompt, _state = decide(zoom_join(age=0.1, call_started=NOW + timedelta(milliseconds=200)))
+    assert prompt.title == "Zoom call at 5:00 PM"
+
+
+def test_an_ad_hoc_call_s_start_is_shown_in_the_time_zone_it_comes_in_not_now_s():
+    # The watcher gives the start in local time by the rules of that moment: here 40 seconds before the clocks went back
+    # an hour. In now's time zone it would be 12:59 AM.
+    summer, winter = timezone(timedelta(hours=-4)), timezone(timedelta(hours=-5))
+    began = datetime(2026, 11, 1, 1, 59, 30, tzinfo=summer)
+    prompt, _state = decide(zoom_join(age=40, call_started=began), now=datetime(2026, 11, 1, 1, 0, 10, tzinfo=winter))
+    assert prompt.title == "Zoom call at 1:59 AM"
+
+
+def test_an_ad_hoc_call_of_unknown_age_is_named_for_when_it_was_noticed():
+    # A Zoom meeting whose start Windows wouldn't give, moving on from another one: a join, so it gets a card.
+    _prompt, state = decide(zoom_join("1:100", age=5))
+    prompt, state = decide(zoom_join("2:200", age=None), state, now=NOW + timedelta(minutes=41))
+    assert prompt.title == "Zoom call at 5:41 PM" and state.call_noticed_at == NOW + timedelta(minutes=41)
+    assert decide(snap(), state, now=NOW + timedelta(minutes=50))[1].call_noticed_at is None  # forgotten when it ends
+
+
+def test_a_call_restored_without_when_it_was_noticed_is_named_for_when_it_is_first_seen_again():
+    # A state saved before the app kept that time: the call is already the current one, its card still to come.
+    state = WatcherState(call_session_id="zoom:2:200", call_needs_decision=True)
+    away = zoom_join("2:200", age=None, present=False)
+    assert decide(away, state, now=NOW + timedelta(minutes=3))[0] is None
+    prompt, _state = decide(replace(away, present=True), state, now=NOW + timedelta(minutes=20))
+    assert prompt.title == "Zoom call at 5:03 PM"
+
+
+def test_an_unknown_age_call_noticed_while_away_is_named_for_then_not_for_the_return():
+    _prompt, state = decide(zoom_join("1:100", age=5))
+    away = zoom_join("2:200", age=None, present=False)
+    assert decide(away, state, now=NOW + timedelta(minutes=41))[0] is None
+    prompt, _state = decide(replace(away, present=True), state, now=NOW + timedelta(minutes=58))
+    assert prompt.title == "Zoom call at 5:41 PM"
 
 
 def test_a_teams_or_meet_call_is_a_session_of_its_own_like_a_zoom_one():
@@ -117,10 +168,10 @@ def test_a_teams_or_meet_call_is_a_session_of_its_own_like_a_zoom_one():
 
 
 def test_a_teams_call_in_a_browser_is_a_teams_call_to_the_rest_of_the_app():
-    web = call_join("teams", "shift:134400000000000002")
+    web = call_join("teams", "shift:134400000000000002", age=0)
     prompt, state = decide(web)
     assert prompt.keys == ("teams:shift:134400000000000002",) and prompt.payload["id"] == "teams-shift-134400000000000002"
-    assert prompt.title == "Teams call"
+    assert prompt.title == "Teams call at 5:00 PM"
     apply_result(state, prompt, accepted=True, now=NOW)
     assert decide(web, state, now=NOW + timedelta(seconds=5))[0] is None
     prompt, _state = decide(call_join("teams", "shift:134400000000000003", title="Weekly sync"))
@@ -209,9 +260,9 @@ def test_skip_words_cover_calls_on_every_provider_whatever_their_case(provider):
 
 
 def test_a_call_with_no_title_is_never_skipped_for_its_fallback_name():
-    # "meeting" is a skip word, and the fallback "Zoom meeting" has it, but that isn't the call's own title.
-    prompt, _state = decide(zoom_join("4:10", age=3), skip_words=("meeting", "call"))
-    assert prompt is not None and prompt.title == "Zoom meeting"
+    # "call" is a skip word, and the fallback "Zoom call at 5:00 PM" has it, but that isn't the call's own title.
+    prompt, _state = decide(zoom_join("4:10", age=0), skip_words=("meeting", "call"))
+    assert prompt is not None and prompt.title == "Zoom call at 5:00 PM"
 
 
 def test_a_call_that_matches_a_meeting_uses_the_meeting_not_its_own_title_for_skip_words():

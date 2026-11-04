@@ -23,6 +23,7 @@ CHROME = "C:#Program Files#Google#Chrome#Application#chrome.exe"
 EDGE = "C:#Program Files (x86)#Microsoft#Edge#Application#msedge.exe"
 SHIFT = "C:#Users#me#AppData#Local#PurpleShift#chromium#shift.exe"
 TEAMS = "MSTeams_8wekyb3d8bbwe"
+MEETING = "ConfMultiTabContentWndClass"  # Zoom's meeting window
 
 
 def test_the_meeting_name_is_the_longest_title_that_is_not_zoom_itself():
@@ -92,10 +93,12 @@ def test_a_process_list_or_start_time_windows_refuses_reads_as_none(monkeypatch)
 
 
 class Windows:
-    """user32's top-level windows, each (hwnd, pid, visible, title). Change ``windows`` to move a tab."""
+    """user32's top-level windows, each (hwnd, pid, visible, title), with its window class after them when it matters.
+    Change ``windows`` to move a tab."""
 
     def __init__(self, *windows):
-        self.windows = {hwnd: (pid, visible, title) for hwnd, pid, visible, title in windows}
+        self.windows = {hwnd: (pid, visible, title) for hwnd, pid, visible, title, *_ in windows}
+        self.classes = {window[0]: window[4] for window in windows if len(window) > 4}
         self.enumerations = 0
 
     def EnumWindows(self, callback, lparam):
@@ -116,6 +119,10 @@ class Windows:
 
     def GetWindowTextW(self, hwnd, buffer, size):
         buffer.value = self.windows[hwnd][2][: size - 1]
+        return len(buffer.value)
+
+    def GetClassNameW(self, hwnd, buffer, size):
+        buffer.value = self.classes.get(hwnd, "")[: size - 1]
         return len(buffer.value)
 
 
@@ -221,10 +228,10 @@ def test_a_zoom_meeting_is_its_first_cpthost_and_when_that_started(monkeypatch):
     started = datetime.now(timezone.utc) - timedelta(minutes=3)
     asked = []
     monkeypatch.setattr(calls, "process_start", lambda pid: asked.append(pid) or started)
-    use_windows(monkeypatch, (2, 604, True, "Roadmap review"))
+    use_windows(monkeypatch, (2, 300, True, "Roadmap review", MEETING))
     call = calls.zoom_call(TABLE)
     assert asked == [604]
-    assert call.provider == "zoom" and call.title == "Roadmap review"
+    assert call.provider == "zoom" and call.title == "Roadmap review" and call.started == started
     assert call.session_id == f"zoom:604:{int(started.timestamp())}" and 179 < call.age_seconds < 240
 
 
@@ -241,16 +248,36 @@ def test_a_meeting_that_seems_to_start_in_the_future_is_brand_new(monkeypatch):
     assert calls.zoom_call(TABLE).age_seconds == 0.0
 
 
-def test_the_meeting_name_comes_from_zoom_s_visible_titled_windows(monkeypatch):
+def test_the_meeting_name_comes_from_zoom_s_visible_meeting_window(monkeypatch):
     use_windows(
         monkeypatch,
-        (1, 300, True, "Zoom Workplace"),
-        (2, 604, True, "Roadmap review"),
-        (3, 604, False, "Roadmap review and its hidden twin"),
-        (4, 999, True, "A longer title in some other app"),
-        (5, 300, True, ""),
+        (1, 300, True, "Zoom Workplace", "ZPPTMainFrmWndClassEx"),
+        (2, 300, True, "Roadmap review", MEETING),
+        (3, 300, False, "Roadmap review and its hidden twin", MEETING),
+        (4, 999, True, "A longer title in some other app", MEETING),
+        (5, 300, True, "", MEETING),
     )
     assert calls.zoom_window_title(TABLE) == "Roadmap review"
+    use_windows(monkeypatch, (1, 300, True, "Roadmap review", "ZPContentViewWndClass"))  # an older Zoom's meeting window
+    assert calls.zoom_window_title(TABLE) == "Roadmap review"
+
+
+def test_zoom_s_toolbars_and_panels_never_name_the_meeting(monkeypatch):
+    # The windows a Zoom meeting shows, its screen shared or not. Zoom titles the meeting window after itself, and every
+    # other window after what it is, so none of them is the meeting's name.
+    monkeypatch.setattr(calls, "process_start", lambda pid: datetime.now(timezone.utc))
+    use_windows(
+        monkeypatch,
+        (1, 300, True, "Zoom Meeting", MEETING),
+        (2, 300, True, "ZPToolBarParentWnd", "ZPToolBarParentWndClass"),
+        (3, 300, True, "Screen sharing meeting controls", "ZPFloatToolbarClass"),
+        (4, 300, True, "VideoFrameWnd", "VideoFrameWndClass"),
+        (5, 300, True, "Annotation - Zoom", "ZoomAnnoWindowWndClass"),
+        (6, 300, True, "Zoom Workplace", "ZPPTMainFrmWndClassEx"),
+        (7, 604, True, "A window of the meeting's own process", "sharing frame"),
+        (8, 300, True, "A window whose class can't be read"),
+    )
+    assert calls.zoom_call(TABLE).title is None
 
 
 def test_without_zoom_running_no_window_is_looked_at(monkeypatch):
@@ -275,6 +302,8 @@ def test_teams_is_in_a_call_while_it_holds_the_microphone_and_the_call_began_whe
     assert call.provider == "teams" and call.title == "Weekly sync"
     assert call.session_id == f"teams:{values['LastUsedTimeStart']}"
     assert 149 < call.age_seconds < 160
+    assert call.started == calls.filetime_datetime(values["LastUsedTimeStart"])
+    assert timedelta(seconds=149) < datetime.now(timezone.utc) - call.started < timedelta(seconds=160)
 
 
 def test_a_teams_session_is_named_by_its_start(monkeypatch):
@@ -436,6 +465,7 @@ def test_a_browser_holding_the_microphone_in_front_of_a_meet_tab_is_a_meet_call(
     call = CallWatch().current({"meet": True}, TABLE)
     assert call.provider == "meet" and call.title == "Weekly sync"
     assert call.session_id == f"meet:chrome:{values['LastUsedTimeStart']}" and 19 < call.age_seconds < 30
+    assert call.started == calls.filetime_datetime(values["LastUsedTimeStart"])
 
 
 def test_a_meet_call_in_edge_is_recognised_the_same_way(monkeypatch):
@@ -614,13 +644,13 @@ def test_zoom_keeps_its_call_while_the_process_list_cannot_be_read(monkeypatch):
     watch = CallWatch()
     started = datetime.now(timezone.utc) - timedelta(minutes=3)
     monkeypatch.setattr(calls, "process_start", lambda pid: started)
-    use_windows(monkeypatch, (1, 604, True, "Roadmap review"))
+    use_windows(monkeypatch, (1, 300, True, "Roadmap review", MEETING))
     first = watch.current({"zoom": True}, TABLE)
     monkeypatch.setattr(calls, "user32", Denied())  # kept, not looked at again
     for _ in range(2):
         kept = watch.current({"zoom": True}, {})  # no list is not a list with no meeting in it
         assert (kept.session_id, kept.title) == (first.session_id, "Roadmap review")
-    use_windows(monkeypatch, (1, 604, True, "Roadmap review"))
+    use_windows(monkeypatch, (1, 300, True, "Roadmap review", MEETING))
     assert watch.current({"zoom": True}, TABLE).session_id == first.session_id
     assert watch.current({"zoom": True}, {"granola.exe": [77]}) is None  # a list that works is what ends it
     assert watch.current({"zoom": True}, {}) is None  # and the meeting that ended isn't kept
@@ -630,7 +660,7 @@ def test_a_zoom_call_kept_through_an_unreadable_process_list_goes_on_growing_old
     watch = CallWatch()
     started = datetime.now(timezone.utc) - timedelta(seconds=30)
     monkeypatch.setattr(calls, "process_start", lambda pid: started)
-    use_windows(monkeypatch, (1, 604, True, "Roadmap review"))
+    use_windows(monkeypatch, (1, 300, True, "Roadmap review", MEETING))
     first = watch.current({"zoom": True}, TABLE)
     assert first.age_seconds < 40
     monkeypatch.setattr(calls, "time", SimpleNamespace(time=lambda: started.timestamp() + 500))
