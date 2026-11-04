@@ -265,6 +265,8 @@ def _consider_call(now: datetime, snap: Snapshot, state: WatcherState, fresh_cal
         state.call_noticed_at = None
         return False
     if snap.call_session_id == state.call_session_id:
+        if state.call_noticed_at is None:
+            state.call_noticed_at = now  # a call kept in a state saved before this was, first seen here
         return False
     age = snap.call_age_seconds
     previous = state.call_session_id

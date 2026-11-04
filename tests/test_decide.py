@@ -137,6 +137,15 @@ def test_an_ad_hoc_call_of_unknown_age_is_named_for_when_it_was_noticed():
     assert decide(snap(), state, now=NOW + timedelta(minutes=50))[1].call_noticed_at is None  # forgotten when it ends
 
 
+def test_a_call_restored_without_when_it_was_noticed_is_named_for_when_it_is_first_seen_again():
+    # A state saved before the app kept that time: the call is already the current one, its card still to come.
+    state = WatcherState(call_session_id="zoom:2:200", call_needs_decision=True)
+    away = zoom_join("2:200", age=None, present=False)
+    assert decide(away, state, now=NOW + timedelta(minutes=3))[0] is None
+    prompt, _state = decide(replace(away, present=True), state, now=NOW + timedelta(minutes=20))
+    assert prompt.title == "Zoom call at 5:03 PM"
+
+
 def test_an_unknown_age_call_noticed_while_away_is_named_for_then_not_for_the_return():
     _prompt, state = decide(zoom_join("1:100", age=5))
     away = zoom_join("2:200", age=None, present=False)
