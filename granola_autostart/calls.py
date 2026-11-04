@@ -102,6 +102,7 @@ class Call:
     session_id: str  # the provider, a colon, then what tells this call from the next
     age_seconds: float | None  # None when Windows wouldn't say when it started
     title: str | None  # the meeting's name, when its windows show one
+    started: datetime | None = None  # when it began (UTC), when Windows says
 
 
 def process_table() -> ProcessTable:
@@ -144,8 +145,7 @@ def process_start(pid: int) -> datetime | None:
             ctypes.byref(ignored),
         ):
             return None
-        ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
-        return datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=ticks / 10)
+        return filetime_datetime((created.dwHighDateTime << 32) | created.dwLowDateTime)
     finally:
         kernel32.CloseHandle(handle)
 
@@ -227,7 +227,7 @@ def zoom_call(table: ProcessTable | None = None) -> Call | None:
     if started is None:
         return Call("zoom", f"zoom:{pid}", None, title)
     age = (datetime.now(timezone.utc) - started).total_seconds()
-    return Call("zoom", f"zoom:{pid}:{int(started.timestamp())}", max(0.0, age), title)
+    return Call("zoom", f"zoom:{pid}:{int(started.timestamp())}", max(0.0, age), title, started)
 
 
 # The microphone record, which Teams and the browsers' calls are noticed from
@@ -248,6 +248,11 @@ class MicApp:
 def filetime_age(ticks: int) -> float:
     """Seconds since a FILETIME, which counts 100 ns from 1601."""
     return max(0.0, time.time() - (ticks / FILETIME_TICKS - FILETIME_UNIX_EPOCH))
+
+
+def filetime_datetime(ticks: int) -> datetime:
+    """A FILETIME as a moment in UTC."""
+    return datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=ticks / 10)
 
 
 def registry_apps(packaged: bool, wanted: Callable[[str], bool], *, strict: bool = False) -> list[MicApp]:
@@ -346,7 +351,7 @@ def teams_calls(table: ProcessTable | None = None, *, strict: bool = False) -> l
     if not using:
         return []
     title = teams_window_title(app_window_titles((TEAMS_EXE,), table))
-    return [Call("teams", f"teams:{app.started}", filetime_age(app.started), title) for app in using]
+    return [Call("teams", f"teams:{app.started}", filetime_age(app.started), title, filetime_datetime(app.started)) for app in using]
 
 
 # Google Meet and Microsoft Teams, in Chrome, Edge or Shift
@@ -445,7 +450,8 @@ class _BrowserSession:
     title: str | None
 
     def call(self) -> Call:
-        return Call(self.provider, f"{self.provider}:{self.browser}:{self.started}", filetime_age(self.started), self.title)
+        session_id = f"{self.provider}:{self.browser}:{self.started}"
+        return Call(self.provider, session_id, filetime_age(self.started), self.title, filetime_datetime(self.started))
 
 
 class CallWatch:

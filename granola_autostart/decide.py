@@ -31,6 +31,8 @@ class Snapshot:
     call_title: str | None  # the meeting's name from the call's windows, when they show one
     events: tuple[CalendarEvent, ...] | list[CalendarEvent]
     granola_running: bool
+    # When the call under way began, when Windows says. Its age was worked out against a later clock than ``now``.
+    call_started: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -443,8 +445,10 @@ def adhoc_title(provider: str | None, began: datetime) -> str:
 
 
 def _call_began(snap: Snapshot, now: datetime) -> datetime:
-    """When the call under way began, or ``now`` when its age isn't known."""
-    return now if snap.call_age_seconds is None else now - timedelta(seconds=snap.call_age_seconds)
+    """When the call under way began, in ``now``'s time zone, or ``now`` when that isn't known. From its start, not from
+    ``now`` less its age: that age was worked out a moment after ``now``, and would put a call that began on the minute
+    in the minute before."""
+    return now if snap.call_started is None else snap.call_started.astimezone(now.tzinfo)
 
 
 def _call_began_before(snap: Snapshot, now: datetime, moment: datetime) -> bool:

@@ -100,7 +100,8 @@ def test_a_zoom_call_with_no_meeting_becomes_an_hour_long_note_of_its_own():
     [("zoom", "Zoom call"), ("teams", "Teams call"), ("meet", "Google Meet call"), ("webex", "Call"), (None, "Call")],
 )
 def test_a_call_whose_windows_name_no_meeting_is_called_after_its_provider_and_when_it_began(provider, name):
-    prompt, _state = decide(snap(call_session_id=f"{provider}:7", call_provider=provider, call_age_seconds=90))
+    began = NOW - timedelta(seconds=90)
+    prompt, _state = decide(snap(call_session_id=f"{provider}:7", call_provider=provider, call_age_seconds=90, call_started=began))
     fallback = f"{name} at 4:58 PM"  # 90 seconds before 5:00 PM
     assert prompt.kind == "call" and prompt.title == fallback and prompt.payload["summary"] == fallback
 
@@ -110,6 +111,15 @@ def test_a_call_whose_windows_name_no_meeting_is_called_after_its_provider_and_w
 )
 def test_an_ad_hoc_call_s_time_is_on_a_twelve_hour_clock(hour, minute, clock):
     assert adhoc_title("zoom", NOW.replace(hour=hour, minute=minute)) == f"Zoom call at {clock}"
+
+
+def test_an_ad_hoc_call_is_named_for_its_start_in_the_local_time_not_now_less_its_age():
+    # The watcher reads the clock, then the call: this one began a moment after that, on the minute, and its age was
+    # worked out later still. Now less its age would be 12:59 PM. Its start comes in UTC, and the card is in local time.
+    local = timezone(timedelta(hours=-4))
+    began = NOW + timedelta(milliseconds=200)
+    prompt, _state = decide(zoom_join(age=0.1, call_started=began), now=NOW.astimezone(local))
+    assert prompt.title == "Zoom call at 1:00 PM"
 
 
 def test_an_ad_hoc_call_of_unknown_age_is_named_for_when_it_was_noticed():

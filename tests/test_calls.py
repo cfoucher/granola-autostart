@@ -231,7 +231,7 @@ def test_a_zoom_meeting_is_its_first_cpthost_and_when_that_started(monkeypatch):
     use_windows(monkeypatch, (2, 300, True, "Roadmap review", MEETING))
     call = calls.zoom_call(TABLE)
     assert asked == [604]
-    assert call.provider == "zoom" and call.title == "Roadmap review"
+    assert call.provider == "zoom" and call.title == "Roadmap review" and call.started == started
     assert call.session_id == f"zoom:604:{int(started.timestamp())}" and 179 < call.age_seconds < 240
 
 
@@ -302,6 +302,8 @@ def test_teams_is_in_a_call_while_it_holds_the_microphone_and_the_call_began_whe
     assert call.provider == "teams" and call.title == "Weekly sync"
     assert call.session_id == f"teams:{values['LastUsedTimeStart']}"
     assert 149 < call.age_seconds < 160
+    assert call.started == calls.filetime_datetime(values["LastUsedTimeStart"])
+    assert timedelta(seconds=149) < datetime.now(timezone.utc) - call.started < timedelta(seconds=160)
 
 
 def test_a_teams_session_is_named_by_its_start(monkeypatch):
@@ -463,6 +465,7 @@ def test_a_browser_holding_the_microphone_in_front_of_a_meet_tab_is_a_meet_call(
     call = CallWatch().current({"meet": True}, TABLE)
     assert call.provider == "meet" and call.title == "Weekly sync"
     assert call.session_id == f"meet:chrome:{values['LastUsedTimeStart']}" and 19 < call.age_seconds < 30
+    assert call.started == calls.filetime_datetime(values["LastUsedTimeStart"])
 
 
 def test_a_meet_call_in_edge_is_recognised_the_same_way(monkeypatch):
