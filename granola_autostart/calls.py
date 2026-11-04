@@ -15,6 +15,11 @@ from datetime import datetime, timedelta, timezone
 
 # Window titles that name the app rather than the meeting.
 GENERIC_ZOOM_TITLES = {"zoom", "zoom meeting", "zoom workplace", "zoom webinar", "meeting chat"}
+# The window classes of Zoom's meeting window, the only one of its windows whose title could be the meeting's (newer Zoom,
+# then older). Its toolbars, panels and popups have titles of their own, such as "ZPToolBarParentWnd" or "Screen sharing
+# meeting controls", which are no meeting's name.
+ZOOM_MEETING_WINDOW_CLASSES = frozenset({"ConfMultiTabContentWndClass", "ZPContentViewWndClass"})
+MAX_CLASS_NAME = 256  # the longest a window class name can be
 # Teams' own pages. A title that names Microsoft Teams is Teams' too (see _teams_meeting_name).
 GENERIC_TEAMS_TITLES = {
     "chat", "activity", "calendar", "calls", "teams", "files", "apps", "communities", "onedrive", "meeting", "meetings",
@@ -85,6 +90,8 @@ user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
 user32.GetWindowTextLengthW.restype = ctypes.c_int
 user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 user32.GetWindowTextW.restype = ctypes.c_int
+user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetClassNameW.restype = ctypes.c_int
 
 ProcessTable = dict[str, list[int]]
 
@@ -147,8 +154,8 @@ def granola_running(table: ProcessTable | None = None) -> bool:
     return bool(pids_named("Granola.exe", table))
 
 
-def window_titles(pids: set[int]) -> list[str]:
-    """The titles of the visible windows these processes own."""
+def window_titles(pids: set[int], classes: frozenset[str] | None = None) -> list[str]:
+    """The titles of the visible windows these processes own. With ``classes``, only of their windows of those classes."""
     if not pids:
         return []
     titles: list[str] = []
@@ -159,6 +166,8 @@ def window_titles(pids: set[int]) -> list[str]:
         window_pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid))
         if window_pid.value not in pids:
+            return True
+        if classes is not None and _class_name(hwnd) not in classes:
             return True
         length = user32.GetWindowTextLengthW(hwnd)
         if length <= 0:
@@ -173,11 +182,19 @@ def window_titles(pids: set[int]) -> list[str]:
     return titles
 
 
-def app_window_titles(image_names: tuple[str, ...], table: ProcessTable | None = None) -> list[str]:
-    """The titles of the visible windows of every process with one of these image names."""
+def _class_name(hwnd) -> str:
+    buffer = ctypes.create_unicode_buffer(MAX_CLASS_NAME)
+    length = user32.GetClassNameW(hwnd, buffer, MAX_CLASS_NAME)
+    return buffer.value if length > 0 else ""
+
+
+def app_window_titles(
+    image_names: tuple[str, ...], table: ProcessTable | None = None, classes: frozenset[str] | None = None
+) -> list[str]:
+    """The titles of the visible windows of every process with one of these image names (see window_titles)."""
     if table is None:
         table = process_table()
-    return window_titles({pid for name in image_names for pid in pids_named(name, table)})
+    return window_titles({pid for name in image_names for pid in pids_named(name, table)}, classes)
 
 
 def _meeting_name(titles: list[str], generic: set[str]) -> str | None:
@@ -189,12 +206,14 @@ def _meeting_name(titles: list[str], generic: set[str]) -> str | None:
 # Zoom
 
 def best_window_title(titles: list[str]) -> str | None:
-    """The meeting's name among Zoom's window titles: the longest one that isn't just Zoom's own name."""
+    """The meeting's name among the titles of Zoom's meeting windows: the longest one that isn't just Zoom's own name."""
     return _meeting_name(titles, GENERIC_ZOOM_TITLES)
 
 
 def zoom_window_title(table: ProcessTable | None = None) -> str | None:
-    return best_window_title(app_window_titles(("CptHost.exe", "Zoom.exe"), table))
+    """The meeting's name from Zoom's meeting window. Zoom Workplace titles that window "Zoom Meeting", whatever the
+    meeting, so this is usually None and the call gets its ad hoc name (see decide.adhoc_title)."""
+    return best_window_title(app_window_titles(("Zoom.exe",), table, ZOOM_MEETING_WINDOW_CLASSES))
 
 
 def zoom_call(table: ProcessTable | None = None) -> Call | None:

@@ -12,8 +12,8 @@ from .status import when
 CALL_HOLD = timedelta(hours=12)
 CRASH_GRACE = timedelta(seconds=10)
 ADHOC_CALL_LENGTH = timedelta(hours=4)
-# What an ad hoc call is called when its windows show no meeting name, by provider.
-ADHOC_CALL_TITLES = {"zoom": "Zoom meeting", "teams": "Teams call", "meet": "Google Meet call"}
+# What an ad hoc call is called when its windows show no meeting name, by provider, before the time it began.
+ADHOC_CALL_TITLES = {"zoom": "Zoom call", "teams": "Teams call", "meet": "Google Meet call"}
 ADHOC_CALL_TITLE = "Call"
 # Longer than a calendar refresh, so an extension that arrives late still finds the decision.
 HANDLED_GRACE = timedelta(minutes=15)
@@ -367,7 +367,7 @@ def _call_prompt(
             call_session=snap.call_session_id,
             choices=_choices(candidates, call_key),
         )
-    title = snap.call_title or ADHOC_CALL_TITLES.get(snap.call_provider, ADHOC_CALL_TITLE)
+    title = snap.call_title or adhoc_title(snap.call_provider, _call_began(snap, now))
     # A call with no calendar meeting goes to Granola as an hour-long meeting of its own.
     adhoc = CalendarEvent(snap.call_session_id.replace(":", "-"), title, now, now + DEFAULT_MEETING_LENGTH)
     return Prompt(
@@ -432,6 +432,19 @@ def _waits_for_the_call(
     if launch is None or event.key() in launch.keys:
         return False
     return _call_began_before(snap, now, event.start - lead - lookahead)
+
+
+def adhoc_title(provider: str | None, began: datetime) -> str:
+    """The name of a call whose windows show none, such as "Zoom call at 3:57 PM": the time it began tells one ad hoc
+    call's notes from the next in Granola."""
+    hour = began.hour % 12 or 12
+    clock = f"{hour}:{began.minute:02d} {'AM' if began.hour < 12 else 'PM'}"
+    return f"{ADHOC_CALL_TITLES.get(provider, ADHOC_CALL_TITLE)} at {clock}"
+
+
+def _call_began(snap: Snapshot, now: datetime) -> datetime:
+    """When the call under way began, or ``now`` when its age isn't known."""
+    return now if snap.call_age_seconds is None else now - timedelta(seconds=snap.call_age_seconds)
 
 
 def _call_began_before(snap: Snapshot, now: datetime, moment: datetime) -> bool:
