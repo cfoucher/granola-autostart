@@ -113,19 +113,35 @@ def test_an_ad_hoc_call_s_time_is_on_a_twelve_hour_clock(hour, minute, clock):
     assert adhoc_title("zoom", NOW.replace(hour=hour, minute=minute)) == f"Zoom call at {clock}"
 
 
-def test_an_ad_hoc_call_is_named_for_its_start_in_the_local_time_not_now_less_its_age():
+def test_an_ad_hoc_call_is_named_for_its_start_not_now_less_its_age():
     # The watcher reads the clock, then the call: this one began a moment after that, on the minute, and its age was
-    # worked out later still. Now less its age would be 12:59 PM. Its start comes in UTC, and the card is in local time.
-    local = timezone(timedelta(hours=-4))
-    began = NOW + timedelta(milliseconds=200)
-    prompt, _state = decide(zoom_join(age=0.1, call_started=began), now=NOW.astimezone(local))
-    assert prompt.title == "Zoom call at 1:00 PM"
+    # worked out later still. Now less its age would be 4:59 PM.
+    prompt, _state = decide(zoom_join(age=0.1, call_started=NOW + timedelta(milliseconds=200)))
+    assert prompt.title == "Zoom call at 5:00 PM"
+
+
+def test_an_ad_hoc_call_s_start_is_shown_in_the_time_zone_it_comes_in_not_now_s():
+    # The watcher gives the start in local time by the rules of that moment: here 40 seconds before the clocks went back
+    # an hour. In now's time zone it would be 12:59 AM.
+    summer, winter = timezone(timedelta(hours=-4)), timezone(timedelta(hours=-5))
+    began = datetime(2026, 11, 1, 1, 59, 30, tzinfo=summer)
+    prompt, _state = decide(zoom_join(age=40, call_started=began), now=datetime(2026, 11, 1, 1, 0, 10, tzinfo=winter))
+    assert prompt.title == "Zoom call at 1:59 AM"
 
 
 def test_an_ad_hoc_call_of_unknown_age_is_named_for_when_it_was_noticed():
     # A Zoom meeting whose start Windows wouldn't give, moving on from another one: a join, so it gets a card.
     _prompt, state = decide(zoom_join("1:100", age=5))
-    prompt, _state = decide(zoom_join("2:200", age=None), state, now=NOW + timedelta(minutes=41))
+    prompt, state = decide(zoom_join("2:200", age=None), state, now=NOW + timedelta(minutes=41))
+    assert prompt.title == "Zoom call at 5:41 PM" and state.call_noticed_at == NOW + timedelta(minutes=41)
+    assert decide(snap(), state, now=NOW + timedelta(minutes=50))[1].call_noticed_at is None  # forgotten when it ends
+
+
+def test_an_unknown_age_call_noticed_while_away_is_named_for_then_not_for_the_return():
+    _prompt, state = decide(zoom_join("1:100", age=5))
+    away = zoom_join("2:200", age=None, present=False)
+    assert decide(away, state, now=NOW + timedelta(minutes=41))[0] is None
+    prompt, _state = decide(replace(away, present=True), state, now=NOW + timedelta(minutes=58))
     assert prompt.title == "Zoom call at 5:41 PM"
 
 

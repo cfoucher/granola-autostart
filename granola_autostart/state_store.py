@@ -26,12 +26,14 @@ def load_state() -> tuple[WatcherState, datetime | None]:
 
 def _parse(raw: dict) -> tuple[WatcherState, datetime | None]:
     decided_at = _either(raw, "call_decided_at", "zoom_decided_at")
+    noticed_at = raw.get("call_noticed_at")
     state = WatcherState(
         handled={str(key): _dt(value) for key, value in (raw.get("handled") or {}).items()},
         call_session_id=_session(_either(raw, "call_session_id", "zoom_session_id")),
         call_needs_decision=bool(_either(raw, "call_needs_decision", "zoom_needs_decision")),
         call_decided_session=_session(_either(raw, "call_decided_session", "zoom_decided_session")),
         call_decided_at=_dt(decided_at) if decided_at else None,
+        call_noticed_at=_dt(noticed_at) if noticed_at else None,
     )
     launch = raw.get("active_launch")
     if isinstance(launch, dict) and launch.get("expires_at") and launch.get("launched_at"):
@@ -77,6 +79,7 @@ def save_state(state: WatcherState, pause_until: datetime | None) -> None:
         "call_needs_decision": state.call_needs_decision,
         "call_decided_session": state.call_decided_session,
         "call_decided_at": state.call_decided_at.isoformat() if state.call_decided_at else None,
+        "call_noticed_at": state.call_noticed_at.isoformat() if state.call_noticed_at else None,
         "pause_until": pause_until.isoformat() if pause_until else None,
         "active_launch": None
         if launch is None

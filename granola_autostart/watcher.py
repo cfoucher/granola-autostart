@@ -304,7 +304,8 @@ def run_loop(settings: Settings, control: Control, state_lock: threading.Lock, s
                         call_title=call.title if call else None,
                         events=events,
                         granola_running=running,
-                        call_started=call.started if call else None,
+                        # Local time by the rules of the call's own start, which a clock change since may differ from.
+                        call_started=call.started.astimezone() if call and call.started else None,
                     ),
                     state,
                     lookahead=timedelta(minutes=settings.zoom_lookahead_minutes),

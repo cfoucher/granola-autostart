@@ -31,7 +31,8 @@ class Snapshot:
     call_title: str | None  # the meeting's name from the call's windows, when they show one
     events: tuple[CalendarEvent, ...] | list[CalendarEvent]
     granola_running: bool
-    # When the call under way began, when Windows says. Its age was worked out against a later clock than ``now``.
+    # When the call under way began, in local time by the rules of that moment, when Windows says. Its age was worked
+    # out against a later clock than ``now``.
     call_started: datetime | None = None
 
 
@@ -144,6 +145,7 @@ class WatcherState:
     active_launch: ActiveLaunch | None = None
     call_decided_session: str | None = None
     call_decided_at: datetime | None = None
+    call_noticed_at: datetime | None = None  # when the call under way was first seen
 
 
 def evaluate(
@@ -260,12 +262,14 @@ def _consider_call(now: datetime, snap: Snapshot, state: WatcherState, fresh_cal
         state.call_needs_decision = False
         state.call_decided_session = None
         state.call_decided_at = None
+        state.call_noticed_at = None
         return False
     if snap.call_session_id == state.call_session_id:
         return False
     age = snap.call_age_seconds
     previous = state.call_session_id
     state.call_session_id = snap.call_session_id
+    state.call_noticed_at = now
     # One call replacing another counts as a join whatever its age when it can't be an older call coming back
     # as the newest ends: its age isn't known, or it is in the same place as the one it replaces, where only one
     # call can run (Zoom moving to another meeting).
@@ -369,7 +373,7 @@ def _call_prompt(
             call_session=snap.call_session_id,
             choices=_choices(candidates, call_key),
         )
-    title = snap.call_title or adhoc_title(snap.call_provider, _call_began(snap, now))
+    title = snap.call_title or adhoc_title(snap.call_provider, _call_began(snap, state, now))
     # A call with no calendar meeting goes to Granola as an hour-long meeting of its own.
     adhoc = CalendarEvent(snap.call_session_id.replace(":", "-"), title, now, now + DEFAULT_MEETING_LENGTH)
     return Prompt(
@@ -444,11 +448,13 @@ def adhoc_title(provider: str | None, began: datetime) -> str:
     return f"{ADHOC_CALL_TITLES.get(provider, ADHOC_CALL_TITLE)} at {clock}"
 
 
-def _call_began(snap: Snapshot, now: datetime) -> datetime:
-    """When the call under way began, in ``now``'s time zone, or ``now`` when that isn't known. From its start, not from
-    ``now`` less its age: that age was worked out a moment after ``now``, and would put a call that began on the minute
-    in the minute before."""
-    return now if snap.call_started is None else snap.call_started.astimezone(now.tzinfo)
+def _call_began(snap: Snapshot, state: WatcherState, now: datetime) -> datetime:
+    """When the call under way began. From its start, not from ``now`` less its age: that age was worked out a moment
+    after ``now``, and would put a call that began on the minute in the minute before. A call whose start isn't known
+    began when it was first seen, which can be well before its card when the user was away."""
+    if snap.call_started is not None:
+        return snap.call_started
+    return state.call_noticed_at or now
 
 
 def _call_began_before(snap: Snapshot, now: datetime, moment: datetime) -> bool:
