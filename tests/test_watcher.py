@@ -74,12 +74,13 @@ def world(monkeypatch):
     ``present`` is a list, one answer per tick. evaluate() records each Snapshot and what else it was
     given, and answers with ``prompts``; handle_prompt() records the prompts that would have shown a card."""
     world = SimpleNamespace(
-        present=[True], call=None, granola=False, events=[], prompts=[], snapshots=[], cards=[], reports=[], asked=[], evaluated=[]
+        present=[True], call=None, granola=False, events=[], prompts=[], snapshots=[], cards=[], reports=[], asked=[], evaluated=[],
+        saved=[],
     )
     world.calendars = Calendars(world)
     world.watch = Watch(world)
     monkeypatch.setattr(watcher, "CalendarCache", lambda: world.calendars)
-    monkeypatch.setattr(watcher, "CallWatch", lambda: world.watch)
+    monkeypatch.setattr(watcher, "CallWatch", lambda saved=(): world.saved.append(list(saved)) or world.watch)
     monkeypatch.setattr(watcher, "process_table", lambda: {"zoom.exe": [300]})
     monkeypatch.setattr(watcher, "is_present", lambda limit: world.present.pop(0))
     monkeypatch.setattr(watcher, "granola_running", lambda table: world.granola)
@@ -105,7 +106,9 @@ class Reporter:
             raise OSError("status.json is open in another program")
 
 
-def run_loop(world, *, ticks: int = 1, settings: Settings | None = None, reporter=None, between=None, control=None) -> list[float]:
+def run_loop(
+    world, *, ticks: int = 1, settings: Settings | None = None, reporter=None, between=None, control=None, state=None
+) -> list[float]:
     """Runs the watcher loop for ``ticks`` ticks; ``between`` runs after each one. Returns each tick's sleep."""
     settings = settings or Settings()
     control = control or watcher.Control(settings)
@@ -119,7 +122,7 @@ def run_loop(world, *, ticks: int = 1, settings: Settings | None = None, reporte
             control.halt()
 
     control.sleep = sleep
-    watcher.run_loop(settings, control, threading.Lock(), WatcherState(), reporter or Reporter(world))
+    watcher.run_loop(settings, control, threading.Lock(), state or WatcherState(), reporter or Reporter(world))
     return slept
 
 
@@ -183,10 +186,25 @@ def test_switching_a_call_on_in_settings_takes_effect_from_the_next_tick(world):
 
 def test_one_call_watch_serves_the_whole_loop(world, monkeypatch):
     made = []
-    monkeypatch.setattr(watcher, "CallWatch", lambda: made.append(1) or world.watch)
+    monkeypatch.setattr(watcher, "CallWatch", lambda saved=(): made.append(1) or world.watch)
     world.present = [True, True, True]
     run_loop(world, ticks=3)
     assert made == [1]
+
+
+def test_the_call_watch_is_given_the_calls_the_saved_state_names_so_a_restart_keeps_a_call_it_was_in(world):
+    launch = ActiveLaunch(
+        title="Weekly sync",
+        payload={},
+        keys=("meet-shift-5", "meet:shift:5"),
+        expires_at=NOW + timedelta(hours=1),
+        seen_running=True,
+        launched_at=NOW,
+        call_session_id="meet:shift:5",
+    )
+    state = WatcherState(call_session_id="meet:shift:5", handled={"teams:9": NOW}, active_launch=launch)
+    run_loop(world, state=state)
+    assert world.saved == [["meet:shift:5", "teams:9", "meet-shift-5"]]
 
 
 def test_calendars_refresh_only_while_someone_is_there_and_at_once_when_they_return(world):

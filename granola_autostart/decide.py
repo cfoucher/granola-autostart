@@ -143,6 +143,16 @@ class WatcherState:
     call_decided_session: str | None = None
     call_decided_at: datetime | None = None
 
+    def call_ids(self) -> list[str]:
+        """Every call session id this state names: the call under way, the one last answered, the launch's calls, and
+        what has been handled. Calendar meetings' keys are among the handled ones, so a reader keeps only the ids it
+        knows. CallWatch uses them to know a call still under way after a restart (see CallWatch)."""
+        launch = self.active_launch
+        ids = [self.call_session_id, self.call_decided_session, *self.handled]
+        if launch is not None:
+            ids += [launch.call_session_id, launch.call_session, *launch.keys]
+        return list(dict.fromkeys(session for session in ids if session))
+
 
 def evaluate(
     now: datetime,

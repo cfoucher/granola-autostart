@@ -1200,3 +1200,24 @@ def test_a_launch_with_no_call_expires_as_before_whatever_the_calls_were():
     assert taking_notes(state.active_launch, just_before) is None  # not taking notes after the end, but not forgotten yet
     decide(snap(events=(weekly,), granola_running=True), state, now=weekly.end + HANDLED_GRACE)
     assert state.active_launch is None
+
+
+def test_the_state_names_every_call_it_knows_once_each_for_a_restart_to_recognise():
+    assert WatcherState().call_ids() == []
+    launch = ActiveLaunch(
+        title="Weekly sync",
+        payload={},
+        keys=("abc123|2026-10-28T17:00:00+00:00", "teams:shift:7"),
+        expires_at=NOW + timedelta(hours=1),
+        seen_running=True,
+        launched_at=NOW,
+        call_session_id="teams:shift:7",
+        call_session="meet:chrome:8",
+    )
+    state = WatcherState(
+        call_session_id="teams:shift:7",
+        call_decided_session="teams:1",
+        handled={"zoom:604:9": NOW, "teams:shift:7": NOW},
+        active_launch=launch,
+    )
+    assert state.call_ids() == ["teams:shift:7", "teams:1", "zoom:604:9", "meet:chrome:8", "abc123|2026-10-28T17:00:00+00:00"]

@@ -265,7 +265,8 @@ class Reporter:
 def run_loop(settings: Settings, control: Control, state_lock: threading.Lock, state, reporter: Reporter) -> None:
     cache = CalendarCache()
     checker = updates.Checker()
-    watch = CallWatch()
+    with state_lock:
+        watch = CallWatch(state.call_ids())  # so a call still under way after a restart is still the same call
     sweep_stale_temporaries()  # once, at start: an update stops the app mid-save now and then
     if not settings.enabled_urls():
         log.warning("No calendar feed is on. Calendar meetings will not start notes. Calls still will.")
