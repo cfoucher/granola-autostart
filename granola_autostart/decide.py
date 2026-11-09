@@ -12,8 +12,8 @@ from .status import when
 CALL_HOLD = timedelta(hours=12)
 CRASH_GRACE = timedelta(seconds=10)
 ADHOC_CALL_LENGTH = timedelta(hours=4)
-# What an ad hoc call is called when its windows show no meeting name, by provider.
-ADHOC_CALL_TITLES = {"zoom": "Zoom meeting", "teams": "Teams call", "meet": "Google Meet call"}
+# What an ad hoc call is called when its windows show no meeting name, by provider, before the time it began.
+ADHOC_CALL_TITLES = {"zoom": "Zoom call", "teams": "Teams call", "meet": "Google Meet call"}
 ADHOC_CALL_TITLE = "Call"
 # Longer than a calendar refresh, so an extension that arrives late still finds the decision.
 HANDLED_GRACE = timedelta(minutes=15)
@@ -34,6 +34,9 @@ class Snapshot:
     call_title: str | None  # the meeting's name from the call's windows, when they show one
     events: tuple[CalendarEvent, ...] | list[CalendarEvent]
     granola_running: bool
+    # When the call under way began, in local time by the rules of that moment, when Windows says. Its age was worked
+    # out against a later clock than ``now``.
+    call_started: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -145,6 +148,7 @@ class WatcherState:
     active_launch: ActiveLaunch | None = None
     call_decided_session: str | None = None
     call_decided_at: datetime | None = None
+    call_noticed_at: datetime | None = None  # when the call under way was first seen
     # Every call on the microphone that was under way at the last tick, the current one or not (CallWatch.under_way),
     # and the minute that was last seen, None with none under way. The watcher sets both each tick; they are only
     # saved, for call_ids after a restart. To the minute, so state.json changes once a minute in a call, not each tick.
@@ -277,12 +281,16 @@ def _consider_call(now: datetime, snap: Snapshot, state: WatcherState, fresh_cal
         state.call_needs_decision = False
         state.call_decided_session = None
         state.call_decided_at = None
+        state.call_noticed_at = None
         return False
     if snap.call_session_id == state.call_session_id:
+        if state.call_noticed_at is None:
+            state.call_noticed_at = now  # a call kept in a state saved before this was, first seen here
         return False
     age = snap.call_age_seconds
     previous = state.call_session_id
     state.call_session_id = snap.call_session_id
+    state.call_noticed_at = now
     # One call replacing another counts as a join whatever its age when it can't be an older call coming back
     # as the newest ends: its age isn't known, or it is in the same place as the one it replaces, where only one
     # call can run (Zoom moving to another meeting).
@@ -386,7 +394,7 @@ def _call_prompt(
             call_session=snap.call_session_id,
             choices=_choices(candidates, call_key),
         )
-    title = snap.call_title or ADHOC_CALL_TITLES.get(snap.call_provider, ADHOC_CALL_TITLE)
+    title = snap.call_title or adhoc_title(snap.call_provider, _call_began(snap, state, now))
     # A call with no calendar meeting goes to Granola as an hour-long meeting of its own.
     adhoc = CalendarEvent(snap.call_session_id.replace(":", "-"), title, now, now + DEFAULT_MEETING_LENGTH)
     return Prompt(
@@ -451,6 +459,23 @@ def _waits_for_the_call(
     if launch is None or event.key() in launch.keys:
         return False
     return _call_began_before(snap, now, event.start - lead - lookahead)
+
+
+def adhoc_title(provider: str | None, began: datetime) -> str:
+    """The name of a call whose windows show none, such as "Zoom call at 3:57 PM": the time it began tells one ad hoc
+    call's notes from the next in Granola."""
+    hour = began.hour % 12 or 12
+    clock = f"{hour}:{began.minute:02d} {'AM' if began.hour < 12 else 'PM'}"
+    return f"{ADHOC_CALL_TITLES.get(provider, ADHOC_CALL_TITLE)} at {clock}"
+
+
+def _call_began(snap: Snapshot, state: WatcherState, now: datetime) -> datetime:
+    """When the call under way began. From its start, not from ``now`` less its age: that age was worked out a moment
+    after ``now``, and would put a call that began on the minute in the minute before. A call whose start isn't known
+    began when it was first seen, which can be well before its card when the user was away."""
+    if snap.call_started is not None:
+        return snap.call_started
+    return state.call_noticed_at or now
 
 
 def _call_began_before(snap: Snapshot, now: datetime, moment: datetime) -> bool:

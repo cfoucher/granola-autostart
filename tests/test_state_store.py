@@ -33,6 +33,7 @@ def test_every_field_survives_a_restart():
         ),
         call_decided_session="teams:77",
         call_decided_at=now - timedelta(minutes=1),
+        call_noticed_at=now - timedelta(minutes=3),
         calls_under_way=["teams:77", "meet:chrome:5"],
         calls_seen_at=now - timedelta(minutes=2),
     )

@@ -150,6 +150,14 @@ def test_each_tick_hands_what_it_sees_to_the_decision_and_its_prompt_to_a_card(w
     assert load_state()[0] == WatcherState()  # saved each tick
 
 
+def test_a_call_s_start_reaches_the_decision_in_local_time(world):
+    started = NOW - timedelta(seconds=12)
+    world.call = Call("zoom", "zoom:604:1761670788", 12.0, None, started)
+    run_loop(world)
+    given = world.snapshots[0].call_started
+    assert given == started and given.utcoffset() == started.astimezone().utcoffset()
+
+
 def test_the_loop_sweeps_the_leftovers_of_unfinished_saves_once_at_the_start(world, monkeypatch):
     swept = []
     monkeypatch.setattr(watcher, "sweep_stale_temporaries", lambda: swept.append(len(world.snapshots)))

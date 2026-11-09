@@ -17,6 +17,11 @@ from datetime import datetime, timedelta, timezone
 
 # Window titles that name the app rather than the meeting.
 GENERIC_ZOOM_TITLES = {"zoom", "zoom meeting", "zoom workplace", "zoom webinar", "meeting chat"}
+# The window classes of Zoom's meeting window, the only one of its windows whose title could be the meeting's (newer Zoom,
+# then older). Its toolbars, panels and popups have titles of their own, such as "ZPToolBarParentWnd" or "Screen sharing
+# meeting controls", which are no meeting's name.
+ZOOM_MEETING_WINDOW_CLASSES = frozenset({"ConfMultiTabContentWndClass", "ZPContentViewWndClass"})
+MAX_CLASS_NAME = 256  # the longest a window class name can be
 # Teams' own pages. A title that names Microsoft Teams is Teams' too (see _teams_meeting_name).
 GENERIC_TEAMS_TITLES = {
     "chat", "activity", "calendar", "calls", "teams", "files", "apps", "communities", "onedrive", "meeting", "meetings",
@@ -120,6 +125,8 @@ user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
 user32.GetWindowTextLengthW.restype = ctypes.c_int
 user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 user32.GetWindowTextW.restype = ctypes.c_int
+user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetClassNameW.restype = ctypes.c_int
 ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
 ole32.CoInitializeEx.restype = ctypes.c_long  # an HRESULT, checked by hand: one failure is fine (RPC_E_CHANGED_MODE)
 ole32.CoCreateInstance.argtypes = [
@@ -147,6 +154,7 @@ class Call:
     session_id: str  # the provider, a colon, then what tells this call from the next
     age_seconds: float | None  # None when Windows wouldn't say when it started
     title: str | None  # the meeting's name, when its windows show one
+    started: datetime | None = None  # when it began (UTC), when Windows says
 
 
 def process_table() -> ProcessTable:
@@ -191,8 +199,7 @@ def process_start(pid: int) -> datetime | None:
             ctypes.byref(ignored),
         ):
             return None
-        ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
-        return datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=ticks / 10)
+        return filetime_datetime((created.dwHighDateTime << 32) | created.dwLowDateTime)
     finally:
         kernel32.CloseHandle(handle)
 
@@ -201,8 +208,8 @@ def granola_running(table: ProcessTable | None = None) -> bool:
     return bool(pids_named("Granola.exe", table))
 
 
-def window_titles(pids: set[int]) -> list[str]:
-    """The titles of the visible windows these processes own."""
+def window_titles(pids: set[int], classes: frozenset[str] | None = None) -> list[str]:
+    """The titles of the visible windows these processes own. With ``classes``, only of their windows of those classes."""
     if not pids:
         return []
     titles: list[str] = []
@@ -213,6 +220,8 @@ def window_titles(pids: set[int]) -> list[str]:
         window_pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid))
         if window_pid.value not in pids:
+            return True
+        if classes is not None and _class_name(hwnd) not in classes:
             return True
         length = user32.GetWindowTextLengthW(hwnd)
         if length <= 0:
@@ -227,11 +236,19 @@ def window_titles(pids: set[int]) -> list[str]:
     return titles
 
 
-def app_window_titles(image_names: tuple[str, ...], table: ProcessTable | None = None) -> list[str]:
-    """The titles of the visible windows of every process with one of these image names."""
+def _class_name(hwnd) -> str:
+    buffer = ctypes.create_unicode_buffer(MAX_CLASS_NAME)
+    length = user32.GetClassNameW(hwnd, buffer, MAX_CLASS_NAME)
+    return buffer.value if length > 0 else ""
+
+
+def app_window_titles(
+    image_names: tuple[str, ...], table: ProcessTable | None = None, classes: frozenset[str] | None = None
+) -> list[str]:
+    """The titles of the visible windows of every process with one of these image names (see window_titles)."""
     if table is None:
         table = process_table()
-    return window_titles({pid for name in image_names for pid in pids_named(name, table)})
+    return window_titles({pid for name in image_names for pid in pids_named(name, table)}, classes)
 
 
 def _meeting_name(titles: list[str], generic: set[str]) -> str | None:
@@ -243,12 +260,14 @@ def _meeting_name(titles: list[str], generic: set[str]) -> str | None:
 # Zoom
 
 def best_window_title(titles: list[str]) -> str | None:
-    """The meeting's name among Zoom's window titles: the longest one that isn't just Zoom's own name."""
+    """The meeting's name among the titles of Zoom's meeting windows: the longest one that isn't just Zoom's own name."""
     return _meeting_name(titles, GENERIC_ZOOM_TITLES)
 
 
 def zoom_window_title(table: ProcessTable | None = None) -> str | None:
-    return best_window_title(app_window_titles(("CptHost.exe", "Zoom.exe"), table))
+    """The meeting's name from Zoom's meeting window. Zoom Workplace titles that window "Zoom Meeting", whatever the
+    meeting, so this is usually None and the call gets its ad hoc name (see decide.adhoc_title)."""
+    return best_window_title(app_window_titles(("Zoom.exe",), table, ZOOM_MEETING_WINDOW_CLASSES))
 
 
 def zoom_call(table: ProcessTable | None = None) -> Call | None:
@@ -262,7 +281,7 @@ def zoom_call(table: ProcessTable | None = None) -> Call | None:
     if started is None:
         return Call("zoom", f"zoom:{pid}", None, title)
     age = (datetime.now(timezone.utc) - started).total_seconds()
-    return Call("zoom", f"zoom:{pid}:{int(started.timestamp())}", max(0.0, age), title)
+    return Call("zoom", f"zoom:{pid}:{int(started.timestamp())}", max(0.0, age), title, started)
 
 
 # The microphone, which Teams and the browsers' calls are noticed from
@@ -270,6 +289,11 @@ def zoom_call(table: ProcessTable | None = None) -> Call | None:
 def filetime_age(ticks: int) -> float:
     """Seconds since a FILETIME, which counts 100 ns from 1601."""
     return max(0.0, time.time() - (ticks / FILETIME_TICKS - FILETIME_UNIX_EPOCH))
+
+
+def filetime_datetime(ticks: int) -> datetime:
+    """A FILETIME as a moment in UTC."""
+    return datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=ticks / 10)
 
 
 def filetime_now() -> int:
@@ -528,8 +552,8 @@ class _MicSession:
     def call(self) -> Call:
         """Its call. A browser's id names the browser ("meet:shift:<start>"), and the Teams app's is "teams:<start>"."""
         place = "" if self.app == "teams" else f"{self.app}:"
-        age = filetime_age(self.started) if self.known else None
-        return Call(self.provider, f"{self.provider}:{place}{self.started}", age, self.title)
+        age, began = (filetime_age(self.started), filetime_datetime(self.started)) if self.known else (None, None)
+        return Call(self.provider, f"{self.provider}:{place}{self.started}", age, self.title, began)
 
 
 def _parse_mic_id(session_id: str) -> tuple[str, str, int] | None:
