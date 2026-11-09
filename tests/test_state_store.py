@@ -33,6 +33,8 @@ def test_every_field_survives_a_restart():
         ),
         call_decided_session="teams:77",
         call_decided_at=now - timedelta(minutes=1),
+        calls_under_way=["teams:77", "meet:chrome:5"],
+        calls_seen_at=now - timedelta(minutes=2),
     )
     # A field added later fails here until it is filled in above, and so saved and loaded.
     assert all(getattr(state, field.name) for field in fields(WatcherState))
@@ -102,6 +104,7 @@ def test_a_state_file_from_before_teams_and_meet_still_loads_with_its_zoom_call_
     assert state.call_decided_session == "zoom:604:1761670800"
     assert state.call_decided_at == datetime(2026, 10, 28, 17, 0, 5, tzinfo=timezone.utc)
     assert "zoom:604:1761670800" in state.handled and len(state.handled) == 2
+    assert state.calls_under_way == [] and state.calls_seen_at is None  # saved before they were
     launch = state.active_launch
     assert launch.call_session_id == "zoom:604:1761670800" and launch.call_session == "zoom:604:1761670800"
 
@@ -156,3 +159,12 @@ def test_session_ids_that_already_name_a_provider_are_left_alone_and_new_names_b
     assert state.call_session_id == "teams:134400000000000000"
     assert state.call_decided_session is None
     assert (state.active_launch.call_session_id, state.active_launch.call_session) == ("meet:chrome:5", "zoom:4:10")
+
+
+def test_a_time_saved_without_its_zone_is_read_as_this_pc_s_local_time(tmp_path):
+    (tmp_path / "state.json").write_text(
+        json.dumps({"calls_under_way": ["teams:7"], "calls_seen_at": "2026-11-09T09:30:00"}), encoding="utf-8"
+    )
+    state, _pause = load_state()
+    assert state.calls_seen_at == datetime(2026, 11, 9, 9, 30).astimezone()
+    assert state.calls_seen_at.tzinfo is not None and state.calls_under_way == ["teams:7"]

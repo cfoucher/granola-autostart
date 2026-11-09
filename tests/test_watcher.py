@@ -51,6 +51,9 @@ class Watch:
     def calls(self, enabled, table=None):
         return [self.world.call] if self.world.call else []
 
+    def under_way(self):
+        return None if self.world.under_way is None else list(self.world.under_way)
+
 
 class Calendars:
     """CalendarCache, serving the world's events and recording how often it was told to refresh."""
@@ -74,12 +77,13 @@ def world(monkeypatch):
     ``present`` is a list, one answer per tick. evaluate() records each Snapshot and what else it was
     given, and answers with ``prompts``; handle_prompt() records the prompts that would have shown a card."""
     world = SimpleNamespace(
-        present=[True], call=None, granola=False, events=[], prompts=[], snapshots=[], cards=[], reports=[], asked=[], evaluated=[]
+        present=[True], call=None, granola=False, events=[], prompts=[], snapshots=[], cards=[], reports=[], asked=[], evaluated=[],
+        saved=[], under_way=[],
     )
     world.calendars = Calendars(world)
     world.watch = Watch(world)
     monkeypatch.setattr(watcher, "CalendarCache", lambda: world.calendars)
-    monkeypatch.setattr(watcher, "CallWatch", lambda: world.watch)
+    monkeypatch.setattr(watcher, "CallWatch", lambda saved=(): world.saved.append(list(saved)) or world.watch)
     monkeypatch.setattr(watcher, "process_table", lambda: {"zoom.exe": [300]})
     monkeypatch.setattr(watcher, "is_present", lambda limit: world.present.pop(0))
     monkeypatch.setattr(watcher, "granola_running", lambda table: world.granola)
@@ -105,7 +109,9 @@ class Reporter:
             raise OSError("status.json is open in another program")
 
 
-def run_loop(world, *, ticks: int = 1, settings: Settings | None = None, reporter=None, between=None, control=None) -> list[float]:
+def run_loop(
+    world, *, ticks: int = 1, settings: Settings | None = None, reporter=None, between=None, control=None, state=None
+) -> list[float]:
     """Runs the watcher loop for ``ticks`` ticks; ``between`` runs after each one. Returns each tick's sleep."""
     settings = settings or Settings()
     control = control or watcher.Control(settings)
@@ -119,7 +125,7 @@ def run_loop(world, *, ticks: int = 1, settings: Settings | None = None, reporte
             control.halt()
 
     control.sleep = sleep
-    watcher.run_loop(settings, control, threading.Lock(), WatcherState(), reporter or Reporter(world))
+    watcher.run_loop(settings, control, threading.Lock(), state or WatcherState(), reporter or Reporter(world))
     return slept
 
 
@@ -183,10 +189,53 @@ def test_switching_a_call_on_in_settings_takes_effect_from_the_next_tick(world):
 
 def test_one_call_watch_serves_the_whole_loop(world, monkeypatch):
     made = []
-    monkeypatch.setattr(watcher, "CallWatch", lambda: made.append(1) or world.watch)
+    monkeypatch.setattr(watcher, "CallWatch", lambda saved=(): made.append(1) or world.watch)
     world.present = [True, True, True]
     run_loop(world, ticks=3)
     assert made == [1]
+
+
+def test_the_call_watch_is_given_the_calls_under_way_when_the_state_was_saved_so_a_restart_keeps_them(world):
+    seen = datetime.now().astimezone() - timedelta(minutes=1)
+    state = WatcherState(
+        call_session_id="meet:shift:5", call_decided_session="teams:1", calls_under_way=["teams:9", "meet:shift:5"], calls_seen_at=seen
+    )
+    run_loop(world, state=state)
+    assert world.saved == [["teams:9", "meet:shift:5"]]
+
+
+def test_after_a_long_stop_the_call_watch_is_given_no_saved_call(world):
+    seen = datetime.now().astimezone() - timedelta(hours=2)
+    state = WatcherState(call_session_id="meet:shift:5", calls_under_way=["meet:shift:5"], calls_seen_at=seen)
+    run_loop(world, state=state)
+    assert world.saved == [[]]
+
+
+def test_each_tick_saves_the_calls_under_way_to_the_minute_and_none_while_off(world):
+    world.under_way = ["teams:9", "meet:shift:5"]
+    state = WatcherState()
+    before = datetime.now().astimezone().replace(second=0, microsecond=0)
+    run_loop(world, state=state)
+    assert state.calls_under_way == ["teams:9", "meet:shift:5"]
+    assert state.calls_seen_at.second == state.calls_seen_at.microsecond == 0
+    assert before <= state.calls_seen_at <= datetime.now().astimezone()
+    world.present = [True]
+    run_loop(world, state=state, settings=Settings(autostart_notes=False))
+    assert state.calls_under_way == [] and state.calls_seen_at is None
+    world.under_way = []
+    world.present = [True]
+    later = WatcherState(calls_under_way=["teams:9"], calls_seen_at=before)
+    run_loop(world, state=later)
+    assert world.saved[-1] == ["teams:9"]  # given to the watch at the start
+    assert later.calls_under_way == [] and later.calls_seen_at is None  # and none under way since
+
+
+def test_a_tick_that_could_not_tell_which_calls_are_under_way_keeps_what_was_saved(world):
+    seen = datetime.now().astimezone().replace(second=0, microsecond=0)
+    state = WatcherState(calls_under_way=["teams:9"], calls_seen_at=seen)
+    world.under_way = None
+    run_loop(world, state=state)
+    assert (state.calls_under_way, state.calls_seen_at) == (["teams:9"], seen)
 
 
 def test_calendars_refresh_only_while_someone_is_there_and_at_once_when_they_return(world):

@@ -265,7 +265,8 @@ class Reporter:
 def run_loop(settings: Settings, control: Control, state_lock: threading.Lock, state, reporter: Reporter) -> None:
     cache = CalendarCache()
     checker = updates.Checker()
-    watch = CallWatch()
+    with state_lock:
+        watch = CallWatch(state.call_ids(datetime.now().astimezone()))  # so a call still under way after a restart is the same call
     sweep_stale_temporaries()  # once, at start: an update stops the app mid-save now and then
     if not settings.enabled_urls():
         log.warning("No calendar feed is on. Calendar meetings will not start notes. Calls still will.")
@@ -291,6 +292,11 @@ def run_loop(settings: Settings, control: Control, state_lock: threading.Lock, s
             was_off = off
             running = granola_running(table)
             with state_lock:
+                # Saved, for the next start (see CallWatch). A look that couldn't read the microphone leaves them as they were.
+                under_way = [] if off else watch.under_way()
+                if under_way is not None:
+                    state.calls_under_way = under_way
+                    state.calls_seen_at = now.replace(second=0, microsecond=0) if under_way else None
                 prompt = evaluate(
                     now,
                     Snapshot(

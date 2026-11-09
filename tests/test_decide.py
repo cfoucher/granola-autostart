@@ -6,6 +6,7 @@ import pytest
 from granola_autostart.calendar_feed import CalendarEvent
 from granola_autostart.decide import (
     CALL_HOLD,
+    CALLS_KEPT_FOR,
     HANDLED_GRACE,
     MAX_CHOICES,
     ActiveLaunch,
@@ -1200,3 +1201,38 @@ def test_a_launch_with_no_call_expires_as_before_whatever_the_calls_were():
     assert taking_notes(state.active_launch, just_before) is None  # not taking notes after the end, but not forgotten yet
     decide(snap(events=(weekly,), granola_running=True), state, now=weekly.end + HANDLED_GRACE)
     assert state.active_launch is None
+
+
+def test_the_state_names_only_the_calls_under_way_when_it_was_saved_once_each_for_a_restart_to_recognise():
+    assert WatcherState().call_ids(NOW) == []
+    launch = ActiveLaunch(
+        title="Weekly sync",
+        payload={},
+        keys=("abc123|2026-10-28T17:00:00+00:00", "meet:shift:3"),
+        expires_at=NOW + timedelta(hours=1),
+        seen_running=True,
+        launched_at=NOW,
+        call_session="meet:shift:3",
+    )
+    # The Meet call answered earlier has ended while Teams went on: none of the ids that still name it are offered.
+    state = WatcherState(
+        call_session_id="teams:7",
+        call_decided_session="meet:shift:3",
+        handled={"meet:shift:3": NOW},
+        active_launch=launch,
+        calls_under_way=["teams:7", "meet:chrome:8"],
+        calls_seen_at=NOW - timedelta(minutes=1),
+    )
+    assert state.call_ids(NOW) == ["teams:7", "meet:chrome:8"]
+    assert WatcherState(calls_under_way=["teams:7", "teams:7"], calls_seen_at=NOW).call_ids(NOW) == ["teams:7"]
+    # A state saved before calls_seen_at was can't say when its call was last seen, so it offers none, however recent.
+    assert WatcherState(call_session_id="teams:shift:7").call_ids(NOW) == []
+
+
+def test_after_a_long_stop_no_saved_call_is_offered_since_another_could_have_begun_in_the_same_app():
+    seen = NOW - timedelta(minutes=20)
+    state = WatcherState(call_session_id="meet:shift:5", calls_under_way=["meet:shift:5", "teams:7"], calls_seen_at=seen)
+    assert state.call_ids(seen + CALLS_KEPT_FOR) == ["meet:shift:5", "teams:7"]
+    assert state.call_ids(seen + CALLS_KEPT_FOR + timedelta(seconds=1)) == []
+    assert state.call_ids(seen) == ["meet:shift:5", "teams:7"]
+    assert state.call_ids(seen - timedelta(seconds=1)) == []  # the clock went back: how long the stop was isn't known
