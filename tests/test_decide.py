@@ -1224,8 +1224,9 @@ def test_the_state_names_only_the_calls_under_way_when_it_was_saved_once_each_fo
         calls_seen_at=NOW - timedelta(minutes=1),
     )
     assert state.call_ids(NOW) == ["teams:7", "meet:chrome:8"]
-    # A state saved before calls_under_way was still offers its current call.
-    assert WatcherState(call_session_id="teams:shift:7").call_ids(NOW) == ["teams:shift:7"]
+    assert WatcherState(calls_under_way=["teams:7", "teams:7"], calls_seen_at=NOW).call_ids(NOW) == ["teams:7"]
+    # A state saved before calls_seen_at was can't say when its call was last seen, so it offers none, however recent.
+    assert WatcherState(call_session_id="teams:shift:7").call_ids(NOW) == []
 
 
 def test_after_a_long_stop_no_saved_call_is_offered_since_another_could_have_begun_in_the_same_app():

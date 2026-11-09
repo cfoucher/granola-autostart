@@ -156,14 +156,10 @@ class WatcherState:
         a restart (see CallWatch). Only those: a call that had ended, such as one answered earlier while another call
         went on, could pass its id to a new call. And only after a restart soon after (CALLS_KEPT_FOR): with the app
         stopped for longer, a call could have ended and another begun in the same app. A state saved before
-        calls_under_way was offers its current call."""
-        if self.calls_seen_at is None:
-            ids = [self.call_session_id]
-        elif now - self.calls_seen_at <= CALLS_KEPT_FOR:
-            ids = [*self.calls_under_way, self.call_session_id]
-        else:
-            ids = []
-        return list(dict.fromkeys(session for session in ids if session))
+        calls_seen_at was says neither, so it offers none."""
+        if self.calls_seen_at is None or now - self.calls_seen_at > CALLS_KEPT_FOR:
+            return []
+        return list(dict.fromkeys(self.calls_under_way))
 
 
 def evaluate(

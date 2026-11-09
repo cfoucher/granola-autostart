@@ -159,3 +159,12 @@ def test_session_ids_that_already_name_a_provider_are_left_alone_and_new_names_b
     assert state.call_session_id == "teams:134400000000000000"
     assert state.call_decided_session is None
     assert (state.active_launch.call_session_id, state.active_launch.call_session) == ("meet:chrome:5", "zoom:4:10")
+
+
+def test_a_time_saved_without_its_zone_is_read_as_this_pc_s_local_time(tmp_path):
+    (tmp_path / "state.json").write_text(
+        json.dumps({"calls_under_way": ["teams:7"], "calls_seen_at": "2026-11-09T09:30:00"}), encoding="utf-8"
+    )
+    state, _pause = load_state()
+    assert state.calls_seen_at == datetime(2026, 11, 9, 9, 30).astimezone()
+    assert state.calls_seen_at.tzinfo is not None and state.calls_under_way == ["teams:7"]
