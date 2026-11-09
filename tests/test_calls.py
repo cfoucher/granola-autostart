@@ -1201,18 +1201,31 @@ def test_the_calls_under_way_to_save_are_every_call_on_the_microphone_whichever_
     began = clock.filetime()
     assert [call.provider for call in watch.calls({"meet": True}, TABLE)] == ["meet"]  # Teams is off, and still saved
     assert watch.under_way() == [f"teams:{began}", f"meet:chrome:{began}"]
-    mic.broken = True  # the calls kept through a read that failed are still under way
-    watch.calls({"meet": True}, TABLE)
-    assert watch.under_way() == [f"teams:{began}", f"meet:chrome:{began}"]
     # Saved and given to the watch after a restart, each is still the same call.
-    mic.broken = False
+    saved = watch.under_way()
     monkeypatch.setattr(calls, "process_start", lambda pid: clock.started(3600))
     clock.advance(30)
-    again = CallWatch(watch.under_way()).calls(BOTH, TABLE)
+    again = CallWatch(saved).calls(BOTH, TABLE)
     assert [(call.session_id, call.age_seconds) for call in again] == [
         (f"teams:{began}", pytest.approx(30, abs=0.01)),
         (f"meet:chrome:{began}", pytest.approx(30, abs=0.01)),
     ]
+
+
+def test_what_is_under_way_is_not_known_after_a_look_that_could_not_read_the_microphone(mic):
+    watch = watching()
+    mic.pids = {TEAMS}
+    watch.calls({"teams": True}, TABLE)
+    known = watch.under_way()
+    assert len(known) == 1
+    mic.broken = True  # the call is kept, but it may have ended
+    assert watch.calls({"teams": True}, TABLE) != [] and watch.under_way() is None
+    assert watch.calls({"teams": True}, {}) != [] and watch.under_way() is None  # nor with no process list
+    mic.broken = False
+    watch.calls({"teams": True}, TABLE)
+    assert watch.under_way() == known
+    watch.calls({"meet": False, "teams": False}, TABLE)  # with Meet and Teams off, none is under way that it knows of
+    assert watch.under_way() == []
 
 
 def test_saved_calls_are_forgotten_after_the_first_look_so_meet_and_teams_back_on_do_not_take_one(monkeypatch, mic, clock):
@@ -1236,6 +1249,33 @@ def test_a_first_look_that_fails_keeps_the_saved_calls_for_the_next(monkeypatch,
     assert watch.calls({"teams": True}, TABLE) == []
     mic.broken = False
     assert watch.current({"teams": True}, TABLE).session_id == saved
+
+
+def test_meet_and_teams_switched_off_after_a_first_look_that_failed_forget_the_saved_calls(monkeypatch, mic, clock):
+    monkeypatch.setattr(calls, "process_start", lambda pid: None)
+    use_windows(monkeypatch)
+    watch = CallWatch([f"teams:{clock.filetime(600)}"])
+    mic.pids = {TEAMS}
+    mic.broken = True
+    assert watch.calls({"teams": True}, TABLE) == []
+    mic.broken = False
+    assert watch.calls({"meet": False, "teams": False}, TABLE) == []
+    call = watch.current({"teams": True}, TABLE)
+    assert call.session_id == f"teams:{clock.filetime()}" and call.age_seconds is None
+
+
+def test_a_first_look_later_than_a_minute_into_the_watch_finds_no_saved_call(monkeypatch, mic, clock):
+    monkeypatch.setattr(calls, "process_start", lambda pid: None)
+    use_windows(monkeypatch)
+    mic.pids = {TEAMS}
+    saved = f"teams:{clock.filetime(600)}"
+    watch = CallWatch([saved])
+    clock.advance(calls.SAVED_FOR)
+    assert watch.current({"teams": True}, TABLE).session_id == saved  # just in time
+    late = CallWatch([saved])
+    clock.advance(calls.SAVED_FOR + 1)  # notes were off at the start, say
+    call = late.current({"teams": True}, TABLE)
+    assert call.session_id == f"teams:{clock.filetime()}" and call.age_seconds is None
 
 
 def test_a_watch_with_no_saved_call_in_that_app_never_asks_when_its_processes_started(monkeypatch, mic):

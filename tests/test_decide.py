@@ -1234,4 +1234,5 @@ def test_after_a_long_stop_no_saved_call_is_offered_since_another_could_have_beg
     state = WatcherState(call_session_id="meet:shift:5", calls_under_way=["meet:shift:5", "teams:7"], calls_seen_at=seen)
     assert state.call_ids(seen + CALLS_KEPT_FOR) == ["meet:shift:5", "teams:7"]
     assert state.call_ids(seen + CALLS_KEPT_FOR + timedelta(seconds=1)) == []
-    assert state.call_ids(seen - timedelta(hours=1)) == ["meet:shift:5", "teams:7"]  # the clock went back: still soon after
+    assert state.call_ids(seen) == ["meet:shift:5", "teams:7"]
+    assert state.call_ids(seen - timedelta(seconds=1)) == []  # the clock went back: how long the stop was isn't known

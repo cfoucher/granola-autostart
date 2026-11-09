@@ -155,9 +155,10 @@ class WatcherState:
         """The ids of the calls under way when this state was saved, for CallWatch to know a call still under way after
         a restart (see CallWatch). Only those: a call that had ended, such as one answered earlier while another call
         went on, could pass its id to a new call. And only after a restart soon after (CALLS_KEPT_FOR): with the app
-        stopped for longer, a call could have ended and another begun in the same app. A state saved before
-        calls_seen_at was says neither, so it offers none."""
-        if self.calls_seen_at is None or now - self.calls_seen_at > CALLS_KEPT_FOR:
+        stopped for longer, a call could have ended and another begun in the same app. A time seen that is later than
+        now (the clock went back) says nothing about how long that was, and a state saved before calls_seen_at was says
+        neither, so they offer none."""
+        if self.calls_seen_at is None or not timedelta(0) <= now - self.calls_seen_at <= CALLS_KEPT_FOR:
             return []
         return list(dict.fromkeys(self.calls_under_way))
 

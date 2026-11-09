@@ -36,6 +36,7 @@ TEAMS_EXE = "ms-teams.exe"
 TEAMS_PREFIX = "ms-teams"  # ms-teams.exe, and the other processes of the Teams app that might record
 WEBVIEW_EXE = "msedgewebview2.exe"  # the web view Teams draws in, which could be where it records
 MAX_GENERATIONS = 8  # how far up from a web view process to look for the Teams process it belongs to
+SAVED_FOR = 60.0  # seconds after it is made that a CallWatch's first look can still find a saved call (see CallWatch)
 BROWSERS = ("chrome.exe", "msedge.exe", "shift.exe")  # the browsers whose Meet and Teams calls are noticed
 FILETIME_TICKS = 10_000_000  # 100 ns ticks per second
 FILETIME_UNIX_EPOCH = 11_644_473_600  # seconds from 1601-01-01 to 1970-01-01
@@ -552,13 +553,17 @@ class CallWatch:
 
     ``saved`` is the call ids the watcher saved before it last stopped. A use of the microphone already under way at
     the first look takes the id of the saved call it can be (see _saved_call), so a restart in the middle of a call
-    doesn't make it a new one. With no such call, when it began isn't known."""
+    doesn't make it a new one. With no such call, when it began isn't known. Only the first look counts, and only in
+    the watch's first SAVED_FOR seconds: a look later than that (with Meet and Teams off, or notes off, at the start)
+    comes long enough after the stop for a saved call to have ended and another begun."""
 
     def __init__(self, saved: Iterable[str] = ()) -> None:
         self._zoom: Call | None = None
         self._mic: dict[str, _MicSession] = {}  # by app (see mic_users)
         self._looked = False  # whether the microphone has been read since Meet or Teams was switched on
+        self._read = False  # whether the last look found out which calls are on the microphone (see under_way)
         self._saved = tuple(saved)
+        self._saved_until = time.time() + SAVED_FOR
 
     def calls(self, enabled: Mapping[str, bool], table: Mapping[str, list[int]] | None = None) -> list[Call]:
         """Every call under way for the providers that are switched on. A provider that is off isn't read, except
@@ -570,6 +575,7 @@ class CallWatch:
         if table is None and any(enabled.values()):
             table = process_table()  # one list for every provider
         known = bool(table)
+        self._read = False
         if enabled.get("zoom"):
             if known:
                 self._zoom = zoom_call(table)
@@ -586,6 +592,8 @@ class CallWatch:
         else:
             self._mic = {}
             self._looked = False
+            self._read = True  # none, as far as it is concerned
+            self._saved = ()  # turned on again, it isn't a restart's first look
         return found
 
     def current(self, enabled: Mapping[str, bool], table: Mapping[str, list[int]] | None = None) -> Call | None:
@@ -593,9 +601,13 @@ class CallWatch:
         found = self.calls(enabled, table)
         return min(found, key=_age) if found else None
 
-    def under_way(self) -> list[str]:
-        """The ids of the calls on the microphone it knows to be under way, the current one or not, whichever switches
-        are on: for the watcher to save, so after a restart each is still the same call (see ``saved``)."""
+    def under_way(self) -> list[str] | None:
+        """The ids of the calls on the microphone under way at the last look, the current one or not, whichever switches
+        are on: for the watcher to save, so after a restart each is still the same call (see ``saved``). None when that
+        look couldn't read the microphone or the process list, so what is under way isn't known: the calls kept may
+        have ended, and what was saved before is still the best there is."""
+        if not self._read:
+            return None
         return [session.call().session_id for session in self._sessions() if session.provider]
 
     def _read_mic(self, enabled: Mapping[str, bool], table: Mapping[str, list[int]]) -> None:
@@ -615,6 +627,7 @@ class CallWatch:
             sessions[app] = session
         self._mic = sessions  # a use that has ended is forgotten
         self._looked = True
+        self._read = True
         self._saved = ()  # only the first look after a restart can find a saved call, not a later one after Meet and Teams were off
 
     def _sessions(self) -> list[_MicSession]:
@@ -637,6 +650,8 @@ class CallWatch:
         """The newest saved call in this app, as its provider and start, that this use of the microphone can be: one
         begun by now, while the processes using the microphone were already running. A process that started since
         can't have been in that call (after the PC restarted, say)."""
+        if time.time() > self._saved_until:
+            return None
         saved = [(provider, started) for provider, place, started in filter(None, map(_parse_mic_id, self._saved)) if place == app]
         candidates = [(provider, started) for provider, started in saved if started <= now]
         if not candidates:

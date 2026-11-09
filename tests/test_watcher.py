@@ -52,7 +52,7 @@ class Watch:
         return [self.world.call] if self.world.call else []
 
     def under_way(self):
-        return list(self.world.under_way)
+        return None if self.world.under_way is None else list(self.world.under_way)
 
 
 class Calendars:
@@ -228,6 +228,14 @@ def test_each_tick_saves_the_calls_under_way_to_the_minute_and_none_while_off(wo
     run_loop(world, state=later)
     assert world.saved[-1] == ["teams:9"]  # given to the watch at the start
     assert later.calls_under_way == [] and later.calls_seen_at is None  # and none under way since
+
+
+def test_a_tick_that_could_not_tell_which_calls_are_under_way_keeps_what_was_saved(world):
+    seen = datetime.now().astimezone().replace(second=0, microsecond=0)
+    state = WatcherState(calls_under_way=["teams:9"], calls_seen_at=seen)
+    world.under_way = None
+    run_loop(world, state=state)
+    assert (state.calls_under_way, state.calls_seen_at) == (["teams:9"], seen)
 
 
 def test_calendars_refresh_only_while_someone_is_there_and_at_once_when_they_return(world):

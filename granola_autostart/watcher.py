@@ -292,8 +292,11 @@ def run_loop(settings: Settings, control: Control, state_lock: threading.Lock, s
             was_off = off
             running = granola_running(table)
             with state_lock:
-                state.calls_under_way = [] if off else watch.under_way()  # saved, for the next start (see CallWatch)
-                state.calls_seen_at = now.replace(second=0, microsecond=0) if state.calls_under_way else None
+                # Saved, for the next start (see CallWatch). A look that couldn't read the microphone leaves them as they were.
+                under_way = [] if off else watch.under_way()
+                if under_way is not None:
+                    state.calls_under_way = under_way
+                    state.calls_seen_at = now.replace(second=0, microsecond=0) if under_way else None
                 prompt = evaluate(
                     now,
                     Snapshot(
