@@ -1193,6 +1193,28 @@ def test_a_saved_call_is_only_taken_at_the_first_look(monkeypatch, mic, clock):
     assert call.session_id == f"teams:{clock.filetime()}" and call.age_seconds == pytest.approx(0, abs=0.01)
 
 
+def test_the_calls_under_way_to_save_are_every_call_on_the_microphone_whichever_switches_are_on(monkeypatch, mic, clock):
+    use_windows(monkeypatch, (1, 50, True, "Meet - Standup - Google Chrome"), (2, 80, True, "(1) WhatsApp - Shift Browser"))
+    watch = watching()
+    assert watch.under_way() == []
+    mic.pids = {TEAMS, CHROME, SHIFT}  # Shift with neither tab in front isn't a call
+    began = clock.filetime()
+    assert [call.provider for call in watch.calls({"meet": True}, TABLE)] == ["meet"]  # Teams is off, and still saved
+    assert watch.under_way() == [f"teams:{began}", f"meet:chrome:{began}"]
+    mic.broken = True  # the calls kept through a read that failed are still under way
+    watch.calls({"meet": True}, TABLE)
+    assert watch.under_way() == [f"teams:{began}", f"meet:chrome:{began}"]
+    # Saved and given to the watch after a restart, each is still the same call.
+    mic.broken = False
+    monkeypatch.setattr(calls, "process_start", lambda pid: clock.started(3600))
+    clock.advance(30)
+    again = CallWatch(watch.under_way()).calls(BOTH, TABLE)
+    assert [(call.session_id, call.age_seconds) for call in again] == [
+        (f"teams:{began}", pytest.approx(30, abs=0.01)),
+        (f"meet:chrome:{began}", pytest.approx(30, abs=0.01)),
+    ]
+
+
 def test_saved_calls_are_forgotten_after_the_first_look_so_meet_and_teams_back_on_do_not_take_one(monkeypatch, mic, clock):
     monkeypatch.setattr(calls, "process_start", lambda pid: None)
     use_windows(monkeypatch)

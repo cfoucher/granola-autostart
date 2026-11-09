@@ -593,6 +593,11 @@ class CallWatch:
         found = self.calls(enabled, table)
         return min(found, key=_age) if found else None
 
+    def under_way(self) -> list[str]:
+        """The ids of the calls on the microphone it knows to be under way, the current one or not, whichever switches
+        are on: for the watcher to save, so after a restart each is still the same call (see ``saved``)."""
+        return [session.call().session_id for session in self._sessions() if session.provider]
+
     def _read_mic(self, enabled: Mapping[str, bool], table: Mapping[str, list[int]]) -> None:
         try:
             using = mic_users(table)

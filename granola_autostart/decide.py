@@ -142,17 +142,16 @@ class WatcherState:
     active_launch: ActiveLaunch | None = None
     call_decided_session: str | None = None
     call_decided_at: datetime | None = None
+    # Every call on the microphone that was under way at the last tick, the current one or not (CallWatch.under_way).
+    # The watcher sets it each tick; it is only saved, for call_ids after a restart.
+    calls_under_way: list[str] = field(default_factory=list)
 
     def call_ids(self) -> list[str]:
-        """The call session ids of calls that may still be under way: the current call, the one last answered, and the
-        running notes' calls. Not what has been handled, which holds calls long over. A calendar meeting's key can be
-        among the notes' keys, so a reader keeps only the ids it knows. CallWatch uses them to know a call still under
-        way after a restart (see CallWatch)."""
-        launch = self.active_launch
-        ids = [self.call_session_id, self.call_decided_session]
-        if launch is not None:
-            ids += [launch.call_session_id, launch.call_session, *launch.keys]
-        return list(dict.fromkeys(session for session in ids if session))
+        """The ids of the calls under way when this state was saved, for CallWatch to know a call still under way after
+        a restart (see CallWatch). Only those: a call that had ended, such as one answered earlier while another call
+        went on, could pass its id to a new call. The current call is among them too, for a state saved before
+        calls_under_way was."""
+        return list(dict.fromkeys(session for session in (*self.calls_under_way, self.call_session_id) if session))
 
 
 def evaluate(

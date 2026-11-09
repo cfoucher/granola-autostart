@@ -292,6 +292,7 @@ def run_loop(settings: Settings, control: Control, state_lock: threading.Lock, s
             was_off = off
             running = granola_running(table)
             with state_lock:
+                state.calls_under_way = [] if off else watch.under_way()  # saved, for the next start (see CallWatch)
                 prompt = evaluate(
                     now,
                     Snapshot(

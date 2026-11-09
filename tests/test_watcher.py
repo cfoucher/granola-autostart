@@ -51,6 +51,9 @@ class Watch:
     def calls(self, enabled, table=None):
         return [self.world.call] if self.world.call else []
 
+    def under_way(self):
+        return list(self.world.under_way)
+
 
 class Calendars:
     """CalendarCache, serving the world's events and recording how often it was told to refresh."""
@@ -75,7 +78,7 @@ def world(monkeypatch):
     given, and answers with ``prompts``; handle_prompt() records the prompts that would have shown a card."""
     world = SimpleNamespace(
         present=[True], call=None, granola=False, events=[], prompts=[], snapshots=[], cards=[], reports=[], asked=[], evaluated=[],
-        saved=[],
+        saved=[], under_way=[],
     )
     world.calendars = Calendars(world)
     world.watch = Watch(world)
@@ -192,19 +195,20 @@ def test_one_call_watch_serves_the_whole_loop(world, monkeypatch):
     assert made == [1]
 
 
-def test_the_call_watch_is_given_the_calls_the_saved_state_names_so_a_restart_keeps_a_call_it_was_in(world):
-    launch = ActiveLaunch(
-        title="Weekly sync",
-        payload={},
-        keys=("meet-shift-5", "meet:shift:5"),
-        expires_at=NOW + timedelta(hours=1),
-        seen_running=True,
-        launched_at=NOW,
-        call_session_id="meet:shift:5",
-    )
-    state = WatcherState(call_session_id="meet:shift:5", handled={"teams:9": NOW}, active_launch=launch)
+def test_the_call_watch_is_given_the_calls_under_way_when_the_state_was_saved_so_a_restart_keeps_them(world):
+    state = WatcherState(call_session_id="meet:shift:5", call_decided_session="teams:1", calls_under_way=["teams:9", "meet:shift:5"])
     run_loop(world, state=state)
-    assert world.saved == [["meet:shift:5", "meet-shift-5"]]
+    assert world.saved == [["teams:9", "meet:shift:5"]]
+
+
+def test_each_tick_saves_the_calls_under_way_and_none_while_off(world):
+    world.under_way = ["teams:9", "meet:shift:5"]
+    state = WatcherState()
+    run_loop(world, state=state)
+    assert state.calls_under_way == ["teams:9", "meet:shift:5"]
+    world.present = [True]
+    run_loop(world, state=state, settings=Settings(autostart_notes=False))
+    assert state.calls_under_way == []
 
 
 def test_calendars_refresh_only_while_someone_is_there_and_at_once_when_they_return(world):

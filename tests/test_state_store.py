@@ -33,6 +33,7 @@ def test_every_field_survives_a_restart():
         ),
         call_decided_session="teams:77",
         call_decided_at=now - timedelta(minutes=1),
+        calls_under_way=["teams:77", "meet:chrome:5"],
     )
     # A field added later fails here until it is filled in above, and so saved and loaded.
     assert all(getattr(state, field.name) for field in fields(WatcherState))
@@ -102,6 +103,7 @@ def test_a_state_file_from_before_teams_and_meet_still_loads_with_its_zoom_call_
     assert state.call_decided_session == "zoom:604:1761670800"
     assert state.call_decided_at == datetime(2026, 10, 28, 17, 0, 5, tzinfo=timezone.utc)
     assert "zoom:604:1761670800" in state.handled and len(state.handled) == 2
+    assert state.calls_under_way == []  # saved before it was
     launch = state.active_launch
     assert launch.call_session_id == "zoom:604:1761670800" and launch.call_session == "zoom:604:1761670800"
 

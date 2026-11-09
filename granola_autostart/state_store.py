@@ -32,6 +32,7 @@ def _parse(raw: dict) -> tuple[WatcherState, datetime | None]:
         call_needs_decision=bool(_either(raw, "call_needs_decision", "zoom_needs_decision")),
         call_decided_session=_session(_either(raw, "call_decided_session", "zoom_decided_session")),
         call_decided_at=_dt(decided_at) if decided_at else None,
+        calls_under_way=[str(session) for session in raw.get("calls_under_way") or () if session],
     )
     launch = raw.get("active_launch")
     if isinstance(launch, dict) and launch.get("expires_at") and launch.get("launched_at"):
@@ -77,6 +78,7 @@ def save_state(state: WatcherState, pause_until: datetime | None) -> None:
         "call_needs_decision": state.call_needs_decision,
         "call_decided_session": state.call_decided_session,
         "call_decided_at": state.call_decided_at.isoformat() if state.call_decided_at else None,
+        "calls_under_way": list(state.calls_under_way),
         "pause_until": pause_until.isoformat() if pause_until else None,
         "active_launch": None
         if launch is None

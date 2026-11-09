@@ -1202,22 +1202,25 @@ def test_a_launch_with_no_call_expires_as_before_whatever_the_calls_were():
     assert state.active_launch is None
 
 
-def test_the_state_names_the_calls_that_may_still_be_under_way_once_each_for_a_restart_to_recognise():
+def test_the_state_names_only_the_calls_under_way_when_it_was_saved_once_each_for_a_restart_to_recognise():
     assert WatcherState().call_ids() == []
     launch = ActiveLaunch(
         title="Weekly sync",
         payload={},
-        keys=("abc123|2026-10-28T17:00:00+00:00", "teams:shift:7"),
+        keys=("abc123|2026-10-28T17:00:00+00:00", "meet:shift:3"),
         expires_at=NOW + timedelta(hours=1),
         seen_running=True,
         launched_at=NOW,
-        call_session_id="teams:shift:7",
-        call_session="meet:chrome:8",
+        call_session="meet:shift:3",
     )
+    # The Meet call answered earlier has ended while Teams went on: none of the ids that still name it are offered.
     state = WatcherState(
-        call_session_id="teams:shift:7",
-        call_decided_session="teams:1",
-        handled={"meet:shift:3": NOW, "teams:shift:7": NOW},  # handled calls can be long over: not named
+        call_session_id="teams:7",
+        call_decided_session="meet:shift:3",
+        handled={"meet:shift:3": NOW},
         active_launch=launch,
+        calls_under_way=["teams:7", "meet:chrome:8"],
     )
-    assert state.call_ids() == ["teams:shift:7", "teams:1", "meet:chrome:8", "abc123|2026-10-28T17:00:00+00:00"]
+    assert state.call_ids() == ["teams:7", "meet:chrome:8"]
+    # A state saved before calls_under_way was still offers its current call.
+    assert WatcherState(call_session_id="teams:shift:7").call_ids() == ["teams:shift:7"]
