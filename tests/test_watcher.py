@@ -204,7 +204,7 @@ def test_the_call_watch_is_given_the_calls_the_saved_state_names_so_a_restart_ke
     )
     state = WatcherState(call_session_id="meet:shift:5", handled={"teams:9": NOW}, active_launch=launch)
     run_loop(world, state=state)
-    assert world.saved == [["meet:shift:5", "teams:9", "meet-shift-5"]]
+    assert world.saved == [["meet:shift:5", "meet-shift-5"]]
 
 
 def test_calendars_refresh_only_while_someone_is_there_and_at_once_when_they_return(world):

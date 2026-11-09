@@ -1193,6 +1193,29 @@ def test_a_saved_call_is_only_taken_at_the_first_look(monkeypatch, mic, clock):
     assert call.session_id == f"teams:{clock.filetime()}" and call.age_seconds == pytest.approx(0, abs=0.01)
 
 
+def test_saved_calls_are_forgotten_after_the_first_look_so_meet_and_teams_back_on_do_not_take_one(monkeypatch, mic, clock):
+    monkeypatch.setattr(calls, "process_start", lambda pid: None)
+    use_windows(monkeypatch)
+    watch = CallWatch([f"teams:{clock.filetime(600)}"])
+    assert watch.calls(BOTH, TABLE) == []  # the first look, with no one recording
+    assert watch.calls({"meet": False, "teams": False}, TABLE) == []
+    mic.pids = {TEAMS}
+    call = watch.current({"teams": True}, TABLE)  # a first look again, but not after a restart
+    assert call.session_id == f"teams:{clock.filetime()}" and call.age_seconds is None
+
+
+def test_a_first_look_that_fails_keeps_the_saved_calls_for_the_next(monkeypatch, mic, clock):
+    monkeypatch.setattr(calls, "process_start", lambda pid: None)
+    use_windows(monkeypatch)
+    saved = f"teams:{clock.filetime(600)}"
+    watch = CallWatch([saved])
+    mic.pids = {TEAMS}
+    mic.broken = True
+    assert watch.calls({"teams": True}, TABLE) == []
+    mic.broken = False
+    assert watch.current({"teams": True}, TABLE).session_id == saved
+
+
 def test_a_watch_with_no_saved_call_in_that_app_never_asks_when_its_processes_started(monkeypatch, mic):
     monkeypatch.setattr(calls, "process_start", lambda pid: pytest.fail("asked when a process started"))
     use_windows(monkeypatch)

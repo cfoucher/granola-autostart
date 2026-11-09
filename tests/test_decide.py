@@ -1202,7 +1202,7 @@ def test_a_launch_with_no_call_expires_as_before_whatever_the_calls_were():
     assert state.active_launch is None
 
 
-def test_the_state_names_every_call_it_knows_once_each_for_a_restart_to_recognise():
+def test_the_state_names_the_calls_that_may_still_be_under_way_once_each_for_a_restart_to_recognise():
     assert WatcherState().call_ids() == []
     launch = ActiveLaunch(
         title="Weekly sync",
@@ -1217,7 +1217,7 @@ def test_the_state_names_every_call_it_knows_once_each_for_a_restart_to_recognis
     state = WatcherState(
         call_session_id="teams:shift:7",
         call_decided_session="teams:1",
-        handled={"zoom:604:9": NOW, "teams:shift:7": NOW},
+        handled={"meet:shift:3": NOW, "teams:shift:7": NOW},  # handled calls can be long over: not named
         active_launch=launch,
     )
-    assert state.call_ids() == ["teams:shift:7", "teams:1", "zoom:604:9", "meet:chrome:8", "abc123|2026-10-28T17:00:00+00:00"]
+    assert state.call_ids() == ["teams:shift:7", "teams:1", "meet:chrome:8", "abc123|2026-10-28T17:00:00+00:00"]

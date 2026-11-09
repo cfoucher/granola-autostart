@@ -610,6 +610,7 @@ class CallWatch:
             sessions[app] = session
         self._mic = sessions  # a use that has ended is forgotten
         self._looked = True
+        self._saved = ()  # only the first look after a restart can find a saved call, not a later one after Meet and Teams were off
 
     def _sessions(self) -> list[_MicSession]:
         """The Teams app's use of the microphone first, then the browsers', each in the order they began."""
