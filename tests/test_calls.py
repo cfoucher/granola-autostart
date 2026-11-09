@@ -325,10 +325,12 @@ def test_teams_is_in_a_call_while_it_records_and_the_call_began_when_it_was_firs
     began = clock.filetime()
     call = watch.current({"teams": True}, TABLE)
     assert (call.provider, call.session_id, call.title) == ("teams", f"teams:{began}", "Weekly sync")
-    assert call.age_seconds == pytest.approx(0, abs=0.01) and call.started == calls.filetime_datetime(began)
+    assert call.age_seconds == pytest.approx(0, abs=0.01)
+    assert call.started == calls.filetime_datetime(began)
     clock.advance(150)
     later = watch.current({"teams": True}, TABLE)
     assert later.session_id == call.session_id and later.age_seconds == pytest.approx(150, abs=0.01)
+    assert later.started == call.started
 
 
 def test_teams_no_longer_recording_is_not_a_call(monkeypatch, mic):
@@ -345,7 +347,7 @@ def test_a_call_already_under_way_at_the_first_look_began_when_no_one_can_say(mo
     use_windows(monkeypatch)
     mic.pids = {TEAMS}
     call = CallWatch().current({"teams": True}, TABLE)
-    # Its id still has a start, when it was first seen, which tells it from the next call.
+    # Its id still has a start, when it was first seen, which tells it from the next call. That isn't when it began.
     assert call.session_id == f"teams:{clock.filetime()}" and call.age_seconds is None and call.started is None
     clock.advance(60)
     assert CallWatch().current({"teams": True}, TABLE).age_seconds is None
@@ -466,6 +468,7 @@ def test_a_browser_recording_in_front_of_a_meet_tab_is_a_meet_call(monkeypatch, 
     call = watch.current({"meet": True}, TABLE)
     assert (call.provider, call.title) == ("meet", "Weekly sync")
     assert call.session_id == f"meet:chrome:{clock.filetime()}" and call.age_seconds == pytest.approx(0, abs=0.01)
+    assert call.started == calls.filetime_datetime(clock.filetime())
     clock.advance(20)
     assert watch.current({"meet": True}, TABLE).age_seconds == pytest.approx(20, abs=0.01)
 
