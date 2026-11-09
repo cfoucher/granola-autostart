@@ -196,19 +196,38 @@ def test_one_call_watch_serves_the_whole_loop(world, monkeypatch):
 
 
 def test_the_call_watch_is_given_the_calls_under_way_when_the_state_was_saved_so_a_restart_keeps_them(world):
-    state = WatcherState(call_session_id="meet:shift:5", call_decided_session="teams:1", calls_under_way=["teams:9", "meet:shift:5"])
+    seen = datetime.now().astimezone() - timedelta(minutes=1)
+    state = WatcherState(
+        call_session_id="meet:shift:5", call_decided_session="teams:1", calls_under_way=["teams:9", "meet:shift:5"], calls_seen_at=seen
+    )
     run_loop(world, state=state)
     assert world.saved == [["teams:9", "meet:shift:5"]]
 
 
-def test_each_tick_saves_the_calls_under_way_and_none_while_off(world):
+def test_after_a_long_stop_the_call_watch_is_given_no_saved_call(world):
+    seen = datetime.now().astimezone() - timedelta(hours=2)
+    state = WatcherState(call_session_id="meet:shift:5", calls_under_way=["meet:shift:5"], calls_seen_at=seen)
+    run_loop(world, state=state)
+    assert world.saved == [[]]
+
+
+def test_each_tick_saves_the_calls_under_way_to_the_minute_and_none_while_off(world):
     world.under_way = ["teams:9", "meet:shift:5"]
     state = WatcherState()
+    before = datetime.now().astimezone().replace(second=0, microsecond=0)
     run_loop(world, state=state)
     assert state.calls_under_way == ["teams:9", "meet:shift:5"]
+    assert state.calls_seen_at.second == state.calls_seen_at.microsecond == 0
+    assert before <= state.calls_seen_at <= datetime.now().astimezone()
     world.present = [True]
     run_loop(world, state=state, settings=Settings(autostart_notes=False))
-    assert state.calls_under_way == []
+    assert state.calls_under_way == [] and state.calls_seen_at is None
+    world.under_way = []
+    world.present = [True]
+    later = WatcherState(calls_under_way=["teams:9"], calls_seen_at=before)
+    run_loop(world, state=later)
+    assert world.saved[-1] == ["teams:9"]  # given to the watch at the start
+    assert later.calls_under_way == [] and later.calls_seen_at is None  # and none under way since
 
 
 def test_calendars_refresh_only_while_someone_is_there_and_at_once_when_they_return(world):

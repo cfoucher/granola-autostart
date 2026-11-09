@@ -6,6 +6,7 @@ import pytest
 from granola_autostart.calendar_feed import CalendarEvent
 from granola_autostart.decide import (
     CALL_HOLD,
+    CALLS_KEPT_FOR,
     HANDLED_GRACE,
     MAX_CHOICES,
     ActiveLaunch,
@@ -1203,7 +1204,7 @@ def test_a_launch_with_no_call_expires_as_before_whatever_the_calls_were():
 
 
 def test_the_state_names_only_the_calls_under_way_when_it_was_saved_once_each_for_a_restart_to_recognise():
-    assert WatcherState().call_ids() == []
+    assert WatcherState().call_ids(NOW) == []
     launch = ActiveLaunch(
         title="Weekly sync",
         payload={},
@@ -1220,7 +1221,16 @@ def test_the_state_names_only_the_calls_under_way_when_it_was_saved_once_each_fo
         handled={"meet:shift:3": NOW},
         active_launch=launch,
         calls_under_way=["teams:7", "meet:chrome:8"],
+        calls_seen_at=NOW - timedelta(minutes=1),
     )
-    assert state.call_ids() == ["teams:7", "meet:chrome:8"]
+    assert state.call_ids(NOW) == ["teams:7", "meet:chrome:8"]
     # A state saved before calls_under_way was still offers its current call.
-    assert WatcherState(call_session_id="teams:shift:7").call_ids() == ["teams:shift:7"]
+    assert WatcherState(call_session_id="teams:shift:7").call_ids(NOW) == ["teams:shift:7"]
+
+
+def test_after_a_long_stop_no_saved_call_is_offered_since_another_could_have_begun_in_the_same_app():
+    seen = NOW - timedelta(minutes=20)
+    state = WatcherState(call_session_id="meet:shift:5", calls_under_way=["meet:shift:5", "teams:7"], calls_seen_at=seen)
+    assert state.call_ids(seen + CALLS_KEPT_FOR) == ["meet:shift:5", "teams:7"]
+    assert state.call_ids(seen + CALLS_KEPT_FOR + timedelta(seconds=1)) == []
+    assert state.call_ids(seen - timedelta(hours=1)) == ["meet:shift:5", "teams:7"]  # the clock went back: still soon after
