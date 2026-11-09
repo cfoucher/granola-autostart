@@ -154,14 +154,15 @@ def granola_running(table: ProcessTable | None = None) -> bool:
     return bool(pids_named("Granola.exe", table))
 
 
-def window_titles(pids: set[int], classes: frozenset[str] | None = None) -> list[str]:
-    """The titles of the visible windows these processes own. With ``classes``, only of their windows of those classes."""
+def window_handles(pids: set[int], classes: frozenset[str] | None = None, *, visible_only: bool = True) -> list[int]:
+    """The top-level windows these processes own, visible ones only unless ``visible_only`` is false. With ``classes``,
+    only their windows of those classes."""
     if not pids:
         return []
-    titles: list[str] = []
+    handles: list[int] = []
 
     def callback(hwnd, _lparam):
-        if not user32.IsWindowVisible(hwnd):
+        if visible_only and not user32.IsWindowVisible(hwnd):
             return True
         window_pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid))
@@ -169,16 +170,24 @@ def window_titles(pids: set[int], classes: frozenset[str] | None = None) -> list
             return True
         if classes is not None and _class_name(hwnd) not in classes:
             return True
-        length = user32.GetWindowTextLengthW(hwnd)
-        if length <= 0:
-            return True
-        buffer = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, buffer, length + 1)
-        titles.append(buffer.value)
+        handles.append(hwnd)
         return True
 
     enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     user32.EnumWindows(enum_proc(callback), 0)
+    return handles
+
+
+def window_titles(pids: set[int], classes: frozenset[str] | None = None) -> list[str]:
+    """The titles of the visible windows these processes own. With ``classes``, only of their windows of those classes."""
+    titles: list[str] = []
+    for hwnd in window_handles(pids, classes):
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            continue
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buffer, length + 1)
+        titles.append(buffer.value)
     return titles
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -209,6 +210,25 @@ def apply_result(state: WatcherState, prompt: Prompt, accepted: bool, now: datet
         call_session_id=prompt.call_session_id,
         call_session=prompt.call_session,
     )
+
+
+def _same_title_form(title: str) -> str:
+    """A title as compared with Granola's: compatibility-normalised, with runs of whitespace as one space, trimmed, and
+    without case."""
+    return " ".join(unicodedata.normalize("NFKC", title).split()).casefold()
+
+
+def recorded_choice(prompt: Prompt, title: str | None) -> int | None:
+    """Which meeting of the prompt Granola is already taking notes for, as its place in ``prompt.choices`` (0 when the
+    prompt lists none), given the title of the note Granola shows as recording. None when ``title`` is missing or blank,
+    when no meeting has that title, and when more than one does: only an unambiguous match counts, so the card still
+    shows whenever there is doubt."""
+    wanted = _same_title_form(title or "")
+    if not wanted:
+        return None
+    candidates = [choice.title for choice in prompt.choices] or [prompt.title]
+    matches = [index for index, candidate in enumerate(candidates) if _same_title_form(candidate) == wanted]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _prune(state: WatcherState, snap: Snapshot, now: datetime) -> None:

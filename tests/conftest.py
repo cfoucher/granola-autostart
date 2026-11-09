@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from granola_autostart import calendar_feed, commands, granola_launch, notice, notify, processes, settings_app, updates, watcher
+from granola_autostart import calendar_feed, commands, granola_launch, granola_window, notice, notify, processes, settings_app, updates, watcher
 
 
 def _refuse(*_args, **_kwargs):
@@ -37,11 +37,14 @@ def isolated(tmp_path, monkeypatch):
         (watcher.pystray, "Icon"),  # a real tray icon
         (notify.Notifier, "show"),
         (os, "startfile"),
+        (granola_window, "granola_windows"),  # the real Granola's windows, which UI Automation would read
     ):
         monkeypatch.setattr(module, name, _refuse)
     # The countdown card, the supervisor's watcher, schtasks and PowerShell, and calendar and update downloads.
     # A test that needs one replaces these with its own fake.
-    monkeypatch.setattr(watcher, "subprocess", SimpleNamespace(run=_refuse, TimeoutExpired=subprocess.TimeoutExpired))
+    monkeypatch.setattr(watcher, "subprocess", SimpleNamespace(run=_refuse, Popen=_refuse, TimeoutExpired=subprocess.TimeoutExpired))
+    # What Granola's window shows is unknown unless a test says otherwise: the watcher reads it through this.
+    monkeypatch.setattr(watcher, "granola_window", SimpleNamespace(recording_title=lambda *_args, **_kwargs: None))
     monkeypatch.setattr(
         processes,
         "subprocess",

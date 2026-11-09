@@ -6,6 +6,8 @@ Starts [Granola](https://granola.ai) when a meeting begins on this PC, or when y
 
 **Cancel** leaves Granola alone. **Start now** or doing nothing opens that meeting's note and starts transcription. It does not join the call. The card never takes keyboard focus, so typing in another app is not interrupted (and Esc is not used). If the card itself can't open, notes for a meeting start anyway, as if nobody had answered it, and the tray says the card is broken. Notes aren't restarted after Granola closes without a card to cancel.
 
+If Granola is already taking notes for the meeting, for example because you started them from Granola's own meeting popup, the card doesn't appear, or closes if it's already up. The app tells by reading Granola's window the way a screen reader does: the note open in it has the meeting's exact title, and its **Stop** button is showing. It reads only the note's title and those buttons, never the notes or the transcript. When it can't tell, because Granola's window is closed, another note is open, or a Granola update changed its window, the card appears as usual. An earlier note of a recurring meeting, resumed in Granola, has the same title, so it counts too.
+
 It runs in the background, so this still works when Granola was quit or crashed. The same card is used for a calendar meeting (including one where you are in the room and not on a call), a call you join, and Granola closing mid-meeting (for notes started from a call, while that call is still going).
 
 When several meetings start together, the card lists them, up to four, and you tick the one to take notes for. One with guests is ticked first, then the one on the calendar higher in your list, then the later start. Its notes answer the others, and **Cancel** answers them all. A call you join while several meetings are under way lists them the same way.
@@ -107,6 +109,8 @@ Addresses never appear in the logs, `status.json` (feeds there are named by a ha
 
 **Updates.** The update check and the installer download use HTTPS only, and a redirect to plain HTTP is refused. The installer must come from this repository's release downloads, and the download is capped in size and time. The saved file's size and SHA-256 must match what GitHub lists for the release before the installer runs, and a mismatch deletes the file. The check tells GitHub only the app's name and version, never a calendar address.
 
+**Granola's window.** To tell that Granola is already taking notes, the app reads Granola's window through Windows UI Automation, as a screen reader does. It reads the open note's title and whether its **Stop** button is showing, and only compares the title with the meeting's. It reads nothing else of Granola, writes nothing to it, and doesn't keep the title.
+
 **What this does not protect against:**
 
 - **Other programs running as you.** DPAPI ties the data to your Windows account, so any program running under it can decrypt the address. The app also mixes in a fixed extra string, but it is in the source code, so it only stops programs that don't know it. It is not a second secret. Microsoft's pages don't cover this case, so don't read them as saying DPAPI defends against it.
@@ -162,6 +166,7 @@ The ruleset also needs one approval, which comes from CodeRabbit (`.coderabbit.y
   - `calendar_feed.py` reads a calendar, and `calendar_cache.py` keeps them all downloaded. `calls.py` and `presence.py`: calls (Zoom, Teams, and Meet), and whether you are at the PC.
   - `updates.py`: the daily check against GitHub releases, and downloading and starting the installer. `net.py`: the https-only way the update check and download, and the calendar downloads, open an address.
   - `granola_launch.py`: opens the meeting's note in Granola.
+  - `granola_window.py`: reads, through UI Automation, which note Granola's window shows as being transcribed.
   - `notice.py`: the countdown card. `settings_app.py`: Settings and setup, a WebView2 window showing the page in `web/`.
   - `processes.py`: starting each mode, one of each at a time, the sign-in entry, and the supervisor that restarts the watcher.
   - `status.py`, `notify.py`, `icon.py`, `winui.py`, `commands.py`: what the tray and Settings show, notifications, the icon, the app theme (Appearance, or Windows') and window colours, and Settings' Pause, Resume, and Quit.

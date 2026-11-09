@@ -861,7 +861,7 @@ def test_the_card_mutex_is_held_from_before_the_card_starts_to_after_it_closes_a
     control = watcher.Control()
     control.on_view = lambda view: seen.append(("menu", processes.card_showing()))
 
-    def ask(title, seconds, kind, choices):
+    def ask(title, seconds, kind, choices, granola_has):
         seen.append(("card", processes.card_showing()))
         return watcher.CardAnswer(False)
 
@@ -875,12 +875,12 @@ def test_the_card_mutex_is_held_from_before_the_card_starts_to_after_it_closes_a
 
 def test_a_card_that_cannot_run_or_breaks_still_lets_the_watcher_go_of_the_card_mutex(monkeypatch):
     control = watcher.Control()
-    monkeypatch.setattr(watcher, "ask_notice", lambda *_args: watcher.CardAnswer(None))
+    monkeypatch.setattr(watcher, "ask_notice", lambda *_args, **_kwargs: watcher.CardAnswer(None))
     monkeypatch.setattr(watcher, "still_present", lambda settings: False)
     watcher.handle_prompt(prompt(), Settings(), control, threading.Lock(), WatcherState())
     assert not processes.card_showing()
 
-    def broken(*_args):
+    def broken(*_args, **_kwargs):
         raise RuntimeError("the card could not be started")
 
     monkeypatch.setattr(watcher, "ask_notice", broken)
@@ -893,7 +893,7 @@ def test_a_card_that_is_up_keeps_the_card_mutex_after_the_watcher_lets_go_of_its
     seen = []
     card_lets_go = held_elsewhere(processes.CARD_MUTEX)  # the card's own process, which took it as it came up
 
-    def ask(title, seconds, kind, choices):
+    def ask(title, seconds, kind, choices, granola_has):
         seen.append(processes.card_showing())
         return watcher.CardAnswer(False)
 

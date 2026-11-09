@@ -17,6 +17,7 @@ from granola_autostart.decide import (
     adhoc_title,
     apply_result,
     evaluate,
+    recorded_choice,
 )
 from granola_autostart.status import taking_notes
 
@@ -1251,3 +1252,48 @@ def test_a_launch_with_no_call_expires_as_before_whatever_the_calls_were():
     assert taking_notes(state.active_launch, just_before) is None  # not taking notes after the end, but not forgotten yet
     decide(snap(events=(weekly,), granola_running=True), state, now=weekly.end + HANDLED_GRACE)
     assert state.active_launch is None
+
+
+def titled(*titles) -> Prompt:
+    """A prompt for a calendar meeting that lists these meetings on its card (none, with one title)."""
+    choices = tuple(Choice(title, {}, (f"event:{n}",), NOW, NOW, NOW + timedelta(minutes=15), 0, "") for n, title in enumerate(titles))
+    return Prompt("calendar", titles[0], {}, ("event:0",), NOW, choices=choices if len(titles) > 1 else ())
+
+
+@pytest.mark.parametrize(
+    "recorded",
+    ["Design review", "design review", "DESIGN REVIEW", "  Design   review\t", "Design review", "Design\nreview", "Ｄesign review"],
+)
+def test_the_recording_note_is_the_meeting_s_whatever_its_case_spacing_or_width_forms(recorded):
+    assert recorded_choice(titled("Design review"), recorded) == 0
+
+
+@pytest.mark.parametrize("recorded", [None, "", "   ", " \t\n"])
+def test_no_title_or_a_blank_one_is_no_match_even_for_a_blank_meeting(recorded):
+    assert recorded_choice(titled("Design review"), recorded) is None
+    assert recorded_choice(titled("  "), recorded) is None
+
+
+@pytest.mark.parametrize("recorded", ["Design", "Design review 2", "Design reviews", "Roadmap review", "Design-review"])
+def test_a_title_that_is_not_the_meeting_s_is_no_match(recorded):
+    assert recorded_choice(titled("Design review"), recorded) is None
+
+
+def test_with_a_list_the_match_is_the_place_of_the_meeting_in_it_and_the_prompt_s_own_title_is_not_used():
+    prompt = replace(titled("Team stand-up", "Renew parking permit", "Dentist"), title="Something else")
+    assert recorded_choice(prompt, "Team stand-up") == 0
+    assert recorded_choice(prompt, " renew parking PERMIT") == 1
+    assert recorded_choice(prompt, "dentist") == 2
+    assert recorded_choice(prompt, "Something else") is None
+
+
+def test_two_meetings_with_the_recording_title_are_ambiguous_and_match_none():
+    prompt = titled("Team stand-up", "team  STAND-UP", "Dentist")
+    assert recorded_choice(prompt, "Team stand-up") is None
+    assert recorded_choice(prompt, "Dentist") == 2
+
+
+def test_a_call_with_no_calendar_meeting_matches_its_own_name():
+    prompt = Prompt("call", "Zoom call at 3:57 PM", {}, ("zoom:9:100",), NOW, call_session_id="zoom:9:100")
+    assert recorded_choice(prompt, "zoom call at 3:57 pm") == 0
+    assert recorded_choice(prompt, "Zoom call at 3:58 PM") is None

@@ -11,6 +11,7 @@ import logging
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -18,11 +19,11 @@ from typing import NamedTuple
 
 import pystray
 
-from . import __version__, commands, processes, updates
+from . import __version__, commands, granola_window, processes, updates
 from .calendar_cache import CalendarCache, load_feeds
 from .calendar_feed import merge_events
 from .calls import Call, CallWatch, granola_running, process_table
-from .decide import Prompt, Snapshot, evaluate, apply_result
+from .decide import Prompt, Snapshot, apply_result, evaluate, recorded_choice
 from .granola_launch import build_url, launch
 from .icon import draw_icon
 from .notify import Notifier, register_app_id
@@ -63,6 +64,8 @@ from .winui import per_monitor_dpi
 
 log = logging.getLogger("granola_autostart")
 LAUNCH_CHECK_SECONDS = 30
+CARD_POLL_SECONDS = 1.0  # how often Granola is looked at while the countdown card is up
+CARD_END_SECONDS = 5  # how long a card told to close is given before it is killed
 # SetPreferredAppMode's modes for each Appearance: AllowDark follows Windows, then ForceDark and ForceLight.
 MENU_MODES = {"auto": 1, "dark": 2, "light": 3}
 
@@ -157,23 +160,46 @@ class Control:
 class CardAnswer(NamedTuple):
     """What the countdown card said. ``accepted`` is True when the countdown ran out or Start now was clicked, False on
     Cancel, and None when the card couldn't run. ``picked`` is the meeting to start, as its place in the card's list: 0 is
-    the first, and the only one when the card listed none."""
+    the first, and the only one when the card listed none. ``granola`` is True when the card was closed because Granola
+    started taking notes for ``picked`` itself during the countdown, which is no answer of the card's own."""
 
     accepted: bool | None
     picked: int = 0
+    granola: bool = False
 
 
-def ask_notice(title: str, seconds: int, kind: str, choices: Sequence[tuple[str, str]] = ()) -> CardAnswer:
-    """Show the card, listing the meetings in ``choices`` (title and line each) when there are any."""
+def ask_notice(
+    title: str,
+    seconds: int,
+    kind: str,
+    choices: Sequence[tuple[str, str]] = (),
+    granola_has: Callable[[], int | None] | None = None,
+) -> CardAnswer:
+    """Show the card, listing the meetings in ``choices`` (title and line each) when there are any.
+
+    About once a second ``granola_has`` is asked whether Granola is already taking notes for one of the meetings (its
+    place in the list, or None). If so, the card is closed and the answer says so."""
     try:
-        completed = subprocess.run(processes.notice_command(title, seconds, kind, choices), timeout=max(1, seconds) + 60)
-    except subprocess.TimeoutExpired:
-        log.error("countdown window did not close")
-        return CardAnswer(None)
+        card = subprocess.Popen(processes.notice_command(title, seconds, kind, choices))
     except Exception:
         log.exception("countdown window failed to open")
         return CardAnswer(None)
-    code = completed.returncode
+    deadline = time.monotonic() + max(1, seconds) + 60
+    while True:
+        try:
+            code = card.wait(timeout=CARD_POLL_SECONDS)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        if time.monotonic() >= deadline:
+            _end_card(card, kill=True)
+            log.error("countdown window did not close")
+            return CardAnswer(None)
+        place = granola_has() if granola_has is not None else None
+        if place is not None:
+            _end_card(card)
+            log.info("Granola started notes for %s during the countdown; closed the card", choices[place][0] if choices else title)
+            return CardAnswer(True, place, granola=True)
     if code in (0, 1):
         return CardAnswer(code == 0)
     place = code - processes.CHOICE_EXIT_CODE
@@ -181,6 +207,19 @@ def ask_notice(title: str, seconds: int, kind: str, choices: Sequence[tuple[str,
         return CardAnswer(True, place)
     log.error("countdown window exited %s", code)
     return CardAnswer(None)
+
+
+def _end_card(card: subprocess.Popen, *, kill: bool = False) -> None:
+    """Close the card's process, and wait for it. One that doesn't close when told to is killed."""
+    if kill:
+        card.kill()
+    else:
+        card.terminate()
+    try:
+        card.wait(timeout=CARD_END_SECONDS)
+    except subprocess.TimeoutExpired:
+        card.kill()
+        card.wait()
 
 
 def config_stamp() -> tuple[int, int] | None:
@@ -338,7 +377,30 @@ def still_present(settings: Settings) -> bool:
     return is_unlocked() and idle_seconds() <= settings.idle_seconds + settings.countdown_seconds + 5
 
 
+def noted_by_granola(prompt: Prompt) -> int | None:
+    """Which of the prompt's meetings Granola is already taking notes for, if it is, for sure (see recorded_choice)."""
+    return recorded_choice(prompt, granola_window.recording_title())
+
+
+def note_granola_has(prompt: Prompt, index: int, control: Control, state_lock: threading.Lock, state) -> None:
+    """Record that Granola is already taking notes for meeting ``index`` of the prompt, as a start that has opened. It
+    opens nothing, and is no start of this app's own (General's Last start). It is a fact, not a start, so a dry run, a
+    pause, Autostart notes being off, and presence don't change it."""
+    chosen = prompt.picked(index)
+    at = datetime.now().astimezone()
+    with state_lock:
+        apply_result(state, chosen, True, at)
+        state.active_launch.seen_running = True
+        _save_state(state, control)
+
+
 def handle_prompt(prompt: Prompt, settings: Settings, control: Control, state_lock: threading.Lock, state) -> None:
+    already = noted_by_granola(prompt)
+    if already is not None:
+        log.info("Granola is already taking notes for %s; no card", prompt.picked(already).title)
+        if not control.stop.is_set():
+            note_granola_has(prompt, already, control, state_lock, state)
+        return
     if prompt.choices:
         log.info("countdown for %s (%s), %s meetings", prompt.title, prompt.kind, len(prompt.choices))
     else:
@@ -350,10 +412,15 @@ def handle_prompt(prompt: Prompt, settings: Settings, control: Control, state_lo
     processes.hold_mutex(processes.CARD_MUTEX, shared=True)
     control.set_card(True)
     try:
-        answer = ask_notice(prompt.title, settings.countdown_seconds, prompt.kind, listed)
+        answer = ask_notice(prompt.title, settings.countdown_seconds, prompt.kind, listed, granola_has=lambda: noted_by_granola(prompt))
     finally:
         processes.release_mutex(processes.CARD_MUTEX)  # first: the tray menu rebuilt next asks whether a card is up
         control.set_card(False)
+    if answer.granola:
+        control.card_failed = False
+        if not control.stop.is_set():
+            note_granola_has(prompt, answer.picked, control, state_lock, state)
+        return
     control.card_failed = answer.accepted is None
     # A card that couldn't run counts as nobody answering, which starts notes, so a broken card never
     # quietly skips meetings. Not for restarting notes after Granola closed, though: the user may have
@@ -378,6 +445,13 @@ def handle_prompt(prompt: Prompt, settings: Settings, control: Control, state_lo
         return
     if answer.accepted is False:
         log.info("cancelled Granola for %s", prompt.title)
+    if accepted:
+        # Once more just before opening it, for a click on Granola's own button in the countdown's last second.
+        late = noted_by_granola(prompt)
+        if late is not None:
+            log.info("Granola started notes for %s as the countdown ended; not opening it", prompt.picked(late).title)
+            note_granola_has(prompt, late, control, state_lock, state)
+            return
     opened = accepted and open_granola(chosen.payload, chosen.title, dry_run=settings.dry_run)
     at = datetime.now().astimezone()
     with state_lock:
