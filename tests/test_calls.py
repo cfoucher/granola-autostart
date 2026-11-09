@@ -43,6 +43,38 @@ def test_of_several_meeting_names_the_longest_wins_without_its_spaces():
     assert best_window_title(["Roadmap", "  Roadmap review  ", "Zoom"]) == "Roadmap review"
 
 
+def test_zoom_s_meeting_toolbar_never_names_the_meeting():
+    # The toolbar shows for the whole meeting, titled with its internal name, beside the meeting's own window.
+    assert best_window_title(["Zoom Meeting", "ZPToolBarParentWnd"]) is None
+    assert best_window_title(["ZPToolBarParentWnd", "Roadmap review"]) == "Roadmap review"
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "ZPToolBarParentWnd",
+        " ZPToolBarParentWnd ",
+        "ZPFloatControlPanelMgrWnd",
+        "ZPCustomizedMenu",
+        "ZPVideoScrollBtnClass",
+        "zFloatContentParentWndCls",
+        "zFloatSizableParentWndCls",
+        "VideoFrameWnd",
+        "ZPToolBarParentWndClass",
+        "ConfPopupTop",
+        "TransparentOverlay",
+        "cptmsg",
+    ],
+)
+def test_the_internal_names_zoom_gives_its_windows_are_never_a_meeting_name(title):
+    assert best_window_title([title]) is None
+
+
+@pytest.mark.parametrize("title", ["ZPR", "ZPlanning", "zebra", "MasterClass", "ZP Toolbar review", "Wnd"])
+def test_a_meeting_name_that_only_starts_or_ends_like_an_internal_one_is_kept(title):
+    assert best_window_title([title]) == title
+
+
 def test_processes_are_found_by_name_whatever_its_case():
     assert calls.pids_named("CptHost.exe", TABLE) == [912, 604]
     assert calls.pids_named("Teams.exe", TABLE) == []

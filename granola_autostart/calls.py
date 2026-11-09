@@ -188,9 +188,24 @@ def _meeting_name(titles: list[str], generic: set[str]) -> str | None:
 
 # Zoom
 
+# Zoom titles some of its windows with an internal name, written like a Win32 window class: ZPToolBarParentWnd (its
+# meeting toolbar, which shows for the whole meeting), ZPCustomizedMenu, zFloatContentParentWndCls, VideoFrameWnd.
+# Such a title is one word: Zoom's ZP or z prefix and then a capitalized word, or ending in Wnd, WndCls or WndClass.
+ZOOM_WINDOW_NAME = re.compile(r"(?:ZP|z)[A-Z][a-z]\w*|\w+Wnd(?:Cls|Class)?", re.ASCII)
+# Zoom's other internal window names, seen alongside those, that don't look like that.
+ZOOM_OTHER_WINDOW_NAMES = {"confpopuptop", "transparentoverlay", "cptmsg"}
+
+
+def zoom_window_name(title: str) -> bool:
+    """Whether a title is an internal name Zoom gave one of its windows, never a meeting's name."""
+    title = title.strip()
+    return bool(ZOOM_WINDOW_NAME.fullmatch(title)) or title.casefold() in ZOOM_OTHER_WINDOW_NAMES
+
+
 def best_window_title(titles: list[str]) -> str | None:
-    """The meeting's name among Zoom's window titles: the longest one that isn't just Zoom's own name."""
-    return _meeting_name(titles, GENERIC_ZOOM_TITLES)
+    """The meeting's name among Zoom's window titles: the longest one that isn't just Zoom's own name, or the internal
+    name of one of its windows."""
+    return _meeting_name([title for title in titles if not zoom_window_name(title)], GENERIC_ZOOM_TITLES)
 
 
 def zoom_window_title(table: ProcessTable | None = None) -> str | None:
