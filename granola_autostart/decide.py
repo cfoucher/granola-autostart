@@ -18,6 +18,9 @@ ADHOC_CALL_TITLES = {"zoom": "Zoom call", "teams": "Teams call", "meet": "Google
 ADHOC_CALL_TITLE = "Call"
 # Longer than a calendar refresh, so an extension that arrives late still finds the decision.
 HANDLED_GRACE = timedelta(minutes=15)
+# How long after it last saw them a restart can take the calls under way for the same calls (WatcherState.call_ids):
+# enough for an update to install, or for the supervisor to start the app again after a crash or two.
+CALLS_KEPT_FOR = timedelta(minutes=5)
 # The most meetings the countdown card lists (notice.MAX_CHOICES, which can't import this module, is the same number).
 MAX_CHOICES = 4
 
@@ -147,6 +150,22 @@ class WatcherState:
     call_decided_session: str | None = None
     call_decided_at: datetime | None = None
     call_noticed_at: datetime | None = None  # when the call under way was first seen
+    # Every call on the microphone that was under way at the last tick, the current one or not (CallWatch.under_way),
+    # and the minute that was last seen, None with none under way. The watcher sets both each tick; they are only
+    # saved, for call_ids after a restart. To the minute, so state.json changes once a minute in a call, not each tick.
+    calls_under_way: list[str] = field(default_factory=list)
+    calls_seen_at: datetime | None = None
+
+    def call_ids(self, now: datetime) -> list[str]:
+        """The ids of the calls under way when this state was saved, for CallWatch to know a call still under way after
+        a restart (see CallWatch). Only those: a call that had ended, such as one answered earlier while another call
+        went on, could pass its id to a new call. And only after a restart soon after (CALLS_KEPT_FOR): with the app
+        stopped for longer, a call could have ended and another begun in the same app. A time seen that is later than
+        now (the clock went back) says nothing about how long that was, and a state saved before calls_seen_at was says
+        neither, so they offer none."""
+        if self.calls_seen_at is None or not timedelta(0) <= now - self.calls_seen_at <= CALLS_KEPT_FOR:
+            return []
+        return list(dict.fromkeys(self.calls_under_way))
 
 
 def evaluate(
