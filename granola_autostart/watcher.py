@@ -452,9 +452,11 @@ def handle_prompt(prompt: Prompt, settings: Settings, control: Control, state_lo
     if answer.accepted is False:
         log.info("cancelled Granola for %s", prompt.title)
     if accepted:
-        # Once more just before opening it, for a click on Granola's own button in the countdown's last second.
+        # Once more just before opening it, for a click on Granola's own button in the countdown's last second. A meeting
+        # ticked on the card other than the first, the one ticked to start with, is the user's choice, so Granola's notes
+        # for another meeting don't stand in for it.
         late = noted_by_granola(prompt)
-        if late is not None:
+        if late is not None and answer.picked in (0, late):
             log.info("Granola started notes for %s as the countdown ended; not opening it", prompt.picked(late).title)
             note_granola_has(prompt, late, control, state_lock, state)
             return

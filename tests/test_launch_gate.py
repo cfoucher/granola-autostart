@@ -889,6 +889,24 @@ def test_a_click_as_the_countdown_ends_beats_start_now_and_covers_the_meeting_ti
     assert launches == [] and state.active_launch.title == "Renew parking permit" and state.active_launch.opened
 
 
+def test_a_meeting_ticked_on_the_card_is_started_even_if_granola_has_notes_for_another_by_then(gate, caplog):
+    world, launches, run = gate
+    world["picked"] = 1
+    world["recordings"] = [None, "Team stand-up"]
+    with caplog.at_level(logging.INFO, logger="granola_autostart"):
+        state = run(shown=together())
+    assert len(launches) == 1 and world["looks"] == 2
+    assert state.active_launch.title == "Renew parking permit" and not state.active_launch.opened
+    assert "as the countdown ended" not in caplog.text
+
+
+def test_with_the_first_meeting_still_ticked_granola_s_notes_for_another_stand(gate):
+    world, launches, run = gate
+    world["recordings"] = [None, "Renew parking permit"]
+    state = run(shown=together())
+    assert launches == [] and state.active_launch.title == "Renew parking permit" and state.active_launch.opened
+
+
 def test_a_card_cancelled_is_cancelled_even_if_granola_has_notes_by_then(gate):
     world, launches, run = gate
     world["accepted"] = False
