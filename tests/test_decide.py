@@ -19,6 +19,7 @@ from granola_autostart.decide import (
     apply_result,
     evaluate,
     recorded_choice,
+    recorded_elsewhere,
 )
 from granola_autostart.status import taking_notes
 
@@ -1253,6 +1254,58 @@ def test_a_launch_with_no_call_expires_as_before_whatever_the_calls_were():
     assert taking_notes(state.active_launch, just_before) is None  # not taking notes after the end, but not forgotten yet
     decide(snap(events=(weekly,), granola_running=True), state, now=weekly.end + HANDLED_GRACE)
     assert state.active_launch is None
+
+
+def test_a_calendar_card_says_whether_the_user_is_in_a_call_that_began_before_its_meetings_were_due():
+    review = event("Design review", start=NOW + timedelta(minutes=30), event_id="review")
+    at = review.start - timedelta(seconds=10)
+    lead = timedelta(seconds=10)
+
+    def card(*events, **call):
+        prompt, _state = decide(snap(events=events or (review,), **call), now=at, lead=lead)
+        return prompt
+
+    assert not card().in_earlier_call  # no call
+    for age, earlier in ((600, False), (601, True), (None, True)):  # measured from the card time, less the lookahead
+        assert card(call_session_id="zoom:1:1", call_provider="zoom", call_age_seconds=age).in_earlier_call is earlier
+    # With two meetings listed, the call must have begun before the earlier one was due: it could be the other's.
+    standup = event("Standup", start=at - timedelta(minutes=8), event_id="standup")
+    assert not card(review, standup, call_session_id="zoom:1:1", call_provider="zoom", call_age_seconds=900).in_earlier_call
+    assert card(review, standup, call_session_id="zoom:1:1", call_provider="zoom", call_age_seconds=1200).in_earlier_call
+
+
+def test_a_call_that_looks_new_after_its_meeting_ended_still_says_the_next_card_is_in_an_earlier_call():
+    # This morning: notes for Standup ran in its Zoom call past its end, and Zoom started its process again in that call
+    # two minutes after, so the call looked like a new one that began after Standup ended. The launch was forgotten at the
+    # end of its grace period, and the next meeting's card came up while the user was still in Standup's call.
+    standup = event("Standup", minutes=15, event_id="standup")
+    weekly = event("Weekly", start=NOW + timedelta(minutes=30), event_id="weekly")
+    state = answered(snap(events=(standup, weekly)), accepted=True)
+    restarted = zoom_join("2:2", age=13 * 60, events=(standup, weekly), granola_running=True)  # since NOW + 17 min
+    prompt, state = decide(restarted, state, now=weekly.start)
+    assert state.active_launch is None and (prompt.kind, prompt.title) == ("calendar", "Weekly")
+    assert prompt.in_earlier_call  # so the card waits while Granola is still taking Standup's notes
+    assert recorded_elsewhere(prompt, "Standup") and not recorded_elsewhere(prompt, "Weekly")
+
+
+def in_earlier_call(*titles) -> Prompt:
+    return replace(titled(*titles), in_earlier_call=True)
+
+
+@pytest.mark.parametrize("recorded", ["Standup", "  standup ", "Weekly sync"])
+def test_notes_for_a_note_that_is_none_of_the_card_s_meetings_hold_the_card_in_an_earlier_call(recorded):
+    assert recorded_elsewhere(in_earlier_call("Design review"), recorded)
+    assert recorded_elsewhere(in_earlier_call("Design review", "Planning"), recorded)
+
+
+@pytest.mark.parametrize("recorded", [None, "", "  ", "Design review", " design REVIEW", "Planning"])
+def test_no_notes_or_notes_for_one_of_the_card_s_meetings_never_hold_it(recorded):
+    assert not recorded_elsewhere(in_earlier_call("Design review", "Planning"), recorded)
+
+
+def test_notes_for_another_meeting_hold_no_card_outside_an_earlier_call_nor_one_with_two_meetings_of_that_title():
+    assert not recorded_elsewhere(titled("Design review"), "Standup")
+    assert not recorded_elsewhere(in_earlier_call("Team stand-up", "team stand-up"), "Team stand-up")
 
 
 def titled(*titles) -> Prompt:

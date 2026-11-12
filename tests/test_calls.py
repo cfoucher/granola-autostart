@@ -2,6 +2,7 @@ import ctypes
 import os
 import threading
 import uuid
+from dataclasses import replace
 from ctypes import wintypes
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -261,6 +262,116 @@ def test_a_zoom_meeting_is_its_first_cpthost_and_when_that_started(monkeypatch):
     assert call.session_id == f"zoom:604:{int(started.timestamp())}" and 179 < call.age_seconds < 240
 
 
+def zoom_meeting(*cpthosts, parents=None) -> calls.ProcessTable:
+    """Zoom Workplace in a meeting: the main Zoom.exe (500, started by Explorer, 4) has started the meeting's Zoom.exe
+    (520), which has started CptHost.exe (``cpthosts``, 620 by default)."""
+    cpthosts = cpthosts or (620,)
+    family = {500: 4, 520: 500, **{pid: 520 for pid in cpthosts}}
+    return calls.ProcessTable({"zoom.exe": [500, 520], "cpthost.exe": list(cpthosts)}, parents={**family, **(parents or {})})
+
+
+def starts(monkeypatch, **minutes_ago):
+    """process_start for processes that started that many minutes ago, by id (``p520=30``), and None for any other."""
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    known = {int(name[1:]): now - timedelta(minutes=ago) for name, ago in minutes_ago.items()}
+    monkeypatch.setattr(calls, "process_start", known.get)
+    return known
+
+
+def test_a_zoom_meeting_is_told_by_the_zoom_process_it_runs_in_and_began_when_its_cpthost_did(monkeypatch):
+    # Zoom starts the next meeting's process as one ends, so that one can have been running since long before the join.
+    known = starts(monkeypatch, p520=30, p620=2)
+    use_windows(monkeypatch)
+    call = calls.zoom_call(zoom_meeting())
+    assert call.session_id == f"zoom:520:{int(known[520].timestamp())}" and call.started == known[620]
+    assert 119 < call.age_seconds < 130
+
+
+def test_a_zoom_meeting_whose_cpthost_has_no_known_start_has_no_age(monkeypatch):
+    known = starts(monkeypatch, p520=30)
+    use_windows(monkeypatch)
+    assert calls.zoom_call(zoom_meeting()) == Call("zoom", f"zoom:520:{int(known[520].timestamp())}", None, None)
+    starts(monkeypatch, p620=2)  # nor the meeting process's: its id has no start
+    assert calls.zoom_call(zoom_meeting()).session_id == "zoom:520"
+
+
+def test_zoom_starting_cpthost_again_during_a_meeting_is_the_same_call_and_began_with_the_first(monkeypatch):
+    # Seen on 2026-11-12: two CptHost.exe started 11 seconds apart in one meeting, and another ten minutes later.
+    known = starts(monkeypatch, p520=40, p620=20, p610=19, p640=9)
+    use_windows(monkeypatch)
+    watch = CallWatch()
+    seen = [watch.current({"zoom": True}, zoom_meeting(*cpthosts)) for cpthosts in ((620,), (620, 610), (640,))]
+    assert {call.session_id for call in seen} == {f"zoom:520:{int(known[520].timestamp())}"}
+    assert [call.started for call in seen] == [known[620]] * 3 and 1199 < seen[-1].age_seconds < 1210
+    assert CallWatch().current({"zoom": True}, zoom_meeting(640)).started == known[640]  # what a restart sees
+
+
+def test_a_zoom_meeting_stays_under_way_while_its_process_runs_with_no_cpthost(monkeypatch):
+    known = starts(monkeypatch, p520=40, p620=20)
+    use_windows(monkeypatch)
+    watch = CallWatch()
+    first = watch.current({"zoom": True}, zoom_meeting())
+    gap = calls.ProcessTable({"zoom.exe": [500, 520]}, parents={500: 4, 520: 500})
+    kept = watch.current({"zoom": True}, gap)
+    assert (kept.session_id, kept.started) == (first.session_id, known[620]) and kept.age_seconds >= first.age_seconds
+    assert watch.current({"zoom": True}, zoom_meeting(640)).session_id == first.session_id  # its CptHost.exe back
+    ended = calls.ProcessTable({"zoom.exe": [500, 530]}, parents={500: 4, 530: 500})  # and the next one's process
+    assert watch.current({"zoom": True}, ended) is None
+
+
+@pytest.mark.parametrize(
+    ("table", "reused"),
+    [
+        (calls.ProcessTable({"zoom.exe": [500, 520]}, parents={500: 4, 520: 4}), False),  # now no meeting process
+        (calls.ProcessTable({"zoom.exe": [500]}, parents={500: 4}), False),
+        (calls.ProcessTable({"zoom.exe": [500, 520]}, parents={500: 4, 520: 500}), True),  # its id now another's
+    ],
+)
+def test_a_zoom_meeting_whose_process_has_gone_has_ended(table, reused, monkeypatch):
+    starts(monkeypatch, p520=40, p620=20)
+    use_windows(monkeypatch)
+    watch = CallWatch()
+    watch.current({"zoom": True}, zoom_meeting())
+    if reused:
+        starts(monkeypatch, p520=1)
+    assert watch.current({"zoom": True}, table) is None
+
+
+def test_a_call_whose_id_names_no_meeting_process_and_its_start_is_never_taken_for_an_open_meeting(monkeypatch):
+    known = starts(monkeypatch, p520=40)
+    running = calls.ProcessTable({"zoom.exe": [500, 520]}, parents={500: 4, 520: 500})
+    assert calls.zoom_meeting_open(Call("zoom", f"zoom:520:{int(known[520].timestamp())}", None, None), running)
+    for session_id in ("zoom:520", "zoom:520:soon", "zoom:me:1", f"teams:520:{int(known[520].timestamp())}"):
+        assert not calls.zoom_meeting_open(Call(session_id.split(":")[0], session_id, None, None), running)
+
+
+def test_a_zoom_meeting_that_a_cpthost_stands_in_for_ends_with_it(monkeypatch):
+    starts(monkeypatch, p604=20)
+    use_windows(monkeypatch)
+    watch = CallWatch()
+    assert watch.current({"zoom": True}, TABLE).session_id.startswith("zoom:604:")
+    assert watch.current({"zoom": True}, {**TABLE, "cpthost.exe": [], "zoom.exe": [604]}) is None
+
+
+@pytest.mark.parametrize(
+    "parents",
+    [
+        {500: 4, 620: 500},  # CptHost.exe started by the main Zoom.exe, as by a Zoom that runs meetings in it
+        {620: 4},  # by something else
+        {620: 9999},  # by a process that has gone
+        {520: 9999},  # by a Zoom.exe whose own parent has gone
+    ],
+)
+def test_where_cpthost_s_parent_is_no_meeting_process_of_zoom_s_cpthost_stands_in_for_the_meeting(parents, monkeypatch):
+    monkeypatch.setattr(calls, "process_start", lambda pid: None)
+    use_windows(monkeypatch)
+    assert calls.zoom_call(zoom_meeting(parents=parents)).session_id == "zoom:620"
+    assert calls.zoom_call(zoom_meeting(630, 620, parents={**parents, 630: 4})).session_id == "zoom:620"  # the first
+    known = starts(monkeypatch, p620=5, p630=1)
+    call = calls.zoom_call(zoom_meeting(630, 620, parents={**parents, 630: 4}))
+    assert call.session_id == f"zoom:620:{int(known[620].timestamp())}" and call.started == known[620]
+
+
 def test_without_cpthost_there_is_no_meeting_and_without_its_start_no_age(monkeypatch):
     assert calls.zoom_call({"zoom.exe": [300]}) is None
     monkeypatch.setattr(calls, "process_start", lambda pid: None)
@@ -309,7 +420,7 @@ def test_zoom_s_toolbars_and_panels_never_name_the_meeting(monkeypatch):
 def test_without_zoom_running_no_window_is_looked_at(monkeypatch):
     monkeypatch.setattr(calls, "process_table", lambda: {"granola.exe": [77]})
     monkeypatch.setattr(calls, "user32", SimpleNamespace())  # any window call would fail
-    assert calls.zoom_window_title() is None
+    assert calls.zoom_window_title() is None and calls.zoom_call() is None
     assert calls.granola_running()
 
 
@@ -626,10 +737,14 @@ def test_a_teams_call_kept_through_a_failed_read_goes_on_growing_older(monkeypat
     assert watch.current({"teams": True}, table).age_seconds == pytest.approx(700, abs=0.01)
 
 
-def test_only_a_zoom_call_kept_has_its_age_worked_out_again_from_its_id():
-    for session_id in ("zoom:604", "zoom:604:soon", "teams:1", "teams:soon", "teams", "meet:chrome:1", "teams:shift:1"):
+def test_only_a_zoom_call_kept_with_a_known_start_has_its_age_worked_out_again(clock):
+    started = clock.started(300)
+    for session_id in ("zoom:604", "zoom:604:1794501451", "teams:1", "meet:chrome:1", "teams:shift:1"):
         call = Call(session_id.split(":")[0], session_id, 12.0, None)
         assert calls._reaged(call) is call
+        if not session_id.startswith("zoom"):
+            assert calls._reaged(replace(call, started=started)).age_seconds == 12.0
+    assert calls._reaged(Call("zoom", "zoom:520:1", 12.0, None, started)).age_seconds == pytest.approx(300)  # not from its id
 
 
 def test_an_audio_engine_that_cannot_be_asked_knows_no_call_that_was_never_seen(monkeypatch, mic):

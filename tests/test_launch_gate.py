@@ -900,6 +900,48 @@ def test_a_meeting_ticked_on_the_card_is_started_even_if_granola_has_notes_for_a
     assert "as the countdown ended" not in caplog.text
 
 
+# Granola still taking notes for another meeting, in a call that began before this one
+
+def test_a_card_in_an_earlier_call_waits_while_granola_takes_notes_for_another_meeting_and_says_so_once(gate, caplog):
+    world, launches, run = gate
+    world["recordings"] = ["Standup", "Standup"]
+    control = watcher.Control()
+    shown = dataclasses.replace(prompt(), in_earlier_call=True)
+    state = WatcherState()
+    with caplog.at_level(logging.INFO, logger="granola_autostart"):
+        for _tick in range(2):
+            run(control, state=state, shown=shown)
+    assert world["asked"] == [] and launches == [] and state.handled == {} and state.active_launch is None
+    assert caplog.text.count("Granola is still taking notes for Standup in an earlier call; the card for Design review waits") == 1
+    run(control, state=state, shown=shown)  # Granola has stopped those notes: the card comes up
+    assert len(world["asked"]) == 1 and len(launches) == 1 and "event:abc" in state.handled and control.held is None
+
+
+def test_a_card_held_again_later_says_so_again(gate, caplog):
+    world, _launches, run = gate
+    control = watcher.Control()
+    shown = dataclasses.replace(prompt(), in_earlier_call=True)
+    with caplog.at_level(logging.INFO, logger="granola_autostart"):
+        for recording in ("Standup", "Weekly sync", "Weekly sync"):
+            world["recordings"] = [recording]
+            run(control, shown=shown)
+    assert world["asked"] == [] and caplog.text.count("Granola is still taking notes for") == 2
+
+
+def test_a_card_outside_an_earlier_call_does_not_wait_for_granola_s_notes_for_another_meeting(gate):
+    world, launches, run = gate
+    world["recordings"] = ["Standup"]
+    state = run()
+    assert len(world["asked"]) == 1 and len(launches) == 1 and "event:abc" in state.handled
+
+
+def test_a_card_in_an_earlier_call_with_granola_taking_its_own_notes_is_answered_by_them(gate):
+    world, launches, run = gate
+    world["recordings"] = ["Design review"]
+    state = run(shown=dataclasses.replace(prompt(), in_earlier_call=True))
+    assert world["asked"] == [] and launches == [] and state.active_launch.opened and "event:abc" in state.handled
+
+
 def test_with_the_first_meeting_still_ticked_granola_s_notes_for_another_stand(gate):
     world, launches, run = gate
     world["recordings"] = [None, "Renew parking permit"]

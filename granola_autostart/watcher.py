@@ -23,7 +23,7 @@ from . import __version__, commands, granola_window, processes, updates
 from .calendar_cache import CalendarCache, load_feeds
 from .calendar_feed import merge_events
 from .calls import Call, CallWatch, granola_running, process_table
-from .decide import Prompt, Snapshot, apply_result, evaluate, recorded_choice
+from .decide import Prompt, Snapshot, apply_result, evaluate, recorded_choice, recorded_elsewhere
 from .granola_launch import build_url, launch
 from .icon import draw_icon
 from .notify import Notifier, register_app_id
@@ -84,6 +84,9 @@ class Control:
         self.last_start: LastStart | None = None
         self.card_failed = False  # the last countdown card couldn't run
         self.card_open = False  # a countdown card is on screen, and the watcher is waiting on it
+        # The card waiting for Granola's notes for another meeting (see handle_prompt), as its meetings and those notes,
+        # so the log says so once, not every tick.
+        self.held: tuple[tuple[str, ...], str] | None = None
         self.installing: str | None = None  # the version being installed
         self.view = TrayView("watching", "Watching for meetings", False)
         self.on_view: Callable[[TrayView], None] | None = None
@@ -401,12 +404,22 @@ def note_granola_has(prompt: Prompt, index: int, control: Control, state_lock: t
 
 
 def handle_prompt(prompt: Prompt, settings: Settings, control: Control, state_lock: threading.Lock, state) -> None:
-    already = noted_by_granola(prompt)
+    recording = granola_window.recording_title()
+    already = recorded_choice(prompt, recording)
     if already is not None:
+        control.held = None
         log.info("Granola is already taking notes for %s; no card", prompt.picked(already).title)
         if not control.stop.is_set():
             note_granola_has(prompt, already, control, state_lock, state)
         return
+    if recorded_elsewhere(prompt, recording):
+        # Nothing is recorded, so the next tick asks again, and the card comes up once those notes or the call end.
+        held = (prompt.keys + tuple(key for choice in prompt.choices for key in choice.keys), recording)
+        if control.held != held:
+            log.info("Granola is still taking notes for %s in an earlier call; the card for %s waits", recording, prompt.title)
+        control.held = held
+        return
+    control.held = None
     if prompt.choices:
         log.info("countdown for %s (%s), %s meetings", prompt.title, prompt.kind, len(prompt.choices))
     else:
