@@ -900,6 +900,74 @@ def test_a_meeting_ticked_on_the_card_is_started_even_if_granola_has_notes_for_a
     assert "as the countdown ended" not in caplog.text
 
 
+# Granola still taking notes for another meeting, in a call that began before this one
+
+def earlier(shown: Prompt | None = None) -> Prompt:
+    return dataclasses.replace(shown or prompt(), in_earlier_call=True)
+
+
+def test_a_card_in_an_earlier_call_waits_while_granola_takes_notes_for_another_meeting_and_says_so_once(gate, caplog):
+    world, launches, run = gate
+    world["recordings"] = ["Standup", "Standup"]
+    control = watcher.Control()
+    state = WatcherState()
+    with caplog.at_level(logging.INFO, logger="granola_autostart"):
+        for _tick in range(2):
+            run(control, state=state, shown=earlier())
+    assert world["asked"] == [] and launches == [] and state.handled == {} and state.active_launch is None
+    waits = "Granola is still taking notes for another meeting in an earlier call; the card for Design review waits"
+    assert caplog.text.count(waits) == 1
+    assert "Standup" not in caplog.text  # the note's own title isn't kept, in the log either
+    run(control, state=state, shown=earlier())  # Granola has stopped those notes: the card comes up
+    assert len(world["asked"]) == 1 and len(launches) == 1 and "event:abc" in state.handled and control.held is None
+
+
+def test_a_card_held_again_after_it_came_up_says_so_again(gate, caplog):
+    world, _launches, run = gate
+    control = watcher.Control()
+    with caplog.at_level(logging.INFO, logger="granola_autostart"):
+        for recordings in (["Standup"], [None, None], ["Standup"]):  # held, then shown (two looks), then held
+            world["recordings"] = recordings
+            run(control, shown=earlier())
+    assert len(world["asked"]) == 1 and caplog.text.count("in an earlier call; the card for Design review waits") == 2
+
+
+def test_a_card_outside_an_earlier_call_does_not_wait_for_granola_s_notes_for_another_meeting(gate):
+    world, launches, run = gate
+    world["recordings"] = ["Standup", "Standup"]
+    state = run()
+    assert len(world["asked"]) == 1 and len(launches) == 1 and "event:abc" in state.handled
+
+
+def test_a_card_in_an_earlier_call_with_granola_taking_its_own_notes_is_answered_by_them(gate):
+    world, launches, run = gate
+    world["recordings"] = ["Design review"]
+    state = run(shown=earlier())
+    assert world["asked"] == [] and launches == [] and state.active_launch.opened and "event:abc" in state.handled
+
+
+def test_notes_granola_starts_for_another_meeting_during_the_countdown_hold_the_card_s_meeting(gate, caplog):
+    world, launches, run = gate
+    world["recordings"] = [None, "Standup", "Standup"]  # before the card, as the countdown ends, and the next tick
+    control = watcher.Control()
+    state = WatcherState()
+    with caplog.at_level(logging.INFO, logger="granola_autostart"):
+        run(control, state=state, shown=earlier())
+        assert len(world["asked"]) == 1 and launches == [] and state.handled == {} and state.active_launch is None
+        run(control, state=state, shown=earlier())  # the next tick holds it, and says so no more
+    assert len(world["asked"]) == 1 and launches == []
+    assert caplog.text.count("Granola started notes for another meeting in an earlier call during the countdown") == 1
+    assert caplog.text.count("the card for Design review waits") == 1 and "Standup" not in caplog.text
+
+
+def test_a_meeting_ticked_on_the_card_is_started_even_if_granola_has_started_notes_for_another_meeting_by_then(gate):
+    world, launches, run = gate
+    world["picked"] = 1
+    world["recordings"] = [None, "Weekly sync"]
+    state = run(shown=earlier(together()))
+    assert len(launches) == 1 and state.active_launch.title == "Renew parking permit"
+
+
 def test_with_the_first_meeting_still_ticked_granola_s_notes_for_another_stand(gate):
     world, launches, run = gate
     world["recordings"] = [None, "Renew parking permit"]

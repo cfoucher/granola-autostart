@@ -14,7 +14,7 @@ When several meetings start together, the card lists them, up to four, and you t
 
 ![The countdown card listing two meetings starting together: Design review ticked, with 5 guests, and Pay the invoices, with none, with Start now and Cancel buttons](assets/countdown-choose.png)
 
-A meeting that runs long keeps its notes: while you're still in its call, the next meeting's card waits until you leave that call. Joining the next meeting's call brings its card straight away. Back-to-back meetings on one Zoom link, such as a personal room, share the first one's notes.
+A meeting that runs long keeps its notes: while you're still in its call, the next meeting's card waits until you leave that call. The card also waits while Granola's window shows it's still taking notes for another meeting and you're in a call you joined before this meeting was about to start, even when you started those notes in Granola itself. Joining the next meeting's call brings its card straight away. Back-to-back meetings on one Zoom link, such as a personal room, share the first one's notes.
 
 Notes start only when the Windows session is unlocked and you have used the mouse or keyboard in the last few minutes. A locked or idle laptop does not start a recording. If you sit down after the start time, the card appears then, until the meeting's scheduled end.
 

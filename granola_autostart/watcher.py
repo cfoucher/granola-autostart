@@ -23,7 +23,7 @@ from . import __version__, commands, granola_window, processes, updates
 from .calendar_cache import CalendarCache, load_feeds
 from .calendar_feed import merge_events
 from .calls import Call, CallWatch, granola_running, process_table
-from .decide import Prompt, Snapshot, apply_result, evaluate, recorded_choice
+from .decide import Prompt, Snapshot, apply_result, evaluate, recorded_choice, recorded_elsewhere
 from .granola_launch import build_url, launch
 from .icon import draw_icon
 from .notify import Notifier, register_app_id
@@ -84,6 +84,9 @@ class Control:
         self.last_start: LastStart | None = None
         self.card_failed = False  # the last countdown card couldn't run
         self.card_open = False  # a countdown card is on screen, and the watcher is waiting on it
+        # The meetings of the card waiting for Granola's notes for another meeting (see hold_card), so the log says so
+        # once, not every tick.
+        self.held: tuple[str, ...] | None = None
         self.installing: str | None = None  # the version being installed
         self.view = TrayView("watching", "Watching for meetings", False)
         self.on_view: Callable[[TrayView], None] | None = None
@@ -400,13 +403,29 @@ def note_granola_has(prompt: Prompt, index: int, control: Control, state_lock: t
         _save_state(state, control)
 
 
+def hold_card(prompt: Prompt, control: Control, why: str) -> None:
+    """Leave the prompt unanswered while Granola takes notes for another meeting (see decide.recorded_elsewhere), so the
+    next tick asks again and its card comes up once those notes or the call end. The log says so once for each prompt,
+    with the meeting's title but never the title of Granola's note, which the app doesn't keep."""
+    held = prompt.keys + tuple(key for choice in prompt.choices for key in choice.keys)
+    if control.held != held:
+        log.info("%s; the card for %s waits", why, prompt.title)
+    control.held = held
+
+
 def handle_prompt(prompt: Prompt, settings: Settings, control: Control, state_lock: threading.Lock, state) -> None:
-    already = noted_by_granola(prompt)
+    recording = granola_window.recording_title()
+    already = recorded_choice(prompt, recording)
     if already is not None:
+        control.held = None
         log.info("Granola is already taking notes for %s; no card", prompt.picked(already).title)
         if not control.stop.is_set():
             note_granola_has(prompt, already, control, state_lock, state)
         return
+    if recorded_elsewhere(prompt, recording):
+        hold_card(prompt, control, "Granola is still taking notes for another meeting in an earlier call")
+        return
+    control.held = None
     if prompt.choices:
         log.info("countdown for %s (%s), %s meetings", prompt.title, prompt.kind, len(prompt.choices))
     else:
@@ -454,11 +473,15 @@ def handle_prompt(prompt: Prompt, settings: Settings, control: Control, state_lo
     if accepted:
         # Once more just before opening it, for a click on Granola's own button in the countdown's last second. A meeting
         # ticked on the card other than the first, the one ticked to start with, is the user's choice, so Granola's notes
-        # for another meeting don't stand in for it.
-        late = noted_by_granola(prompt)
+        # for another meeting don't stand in for it, nor hold it back.
+        recording = granola_window.recording_title()
+        late = recorded_choice(prompt, recording)
         if late is not None and answer.picked in (0, late):
             log.info("Granola started notes for %s as the countdown ended; not opening it", prompt.picked(late).title)
             note_granola_has(prompt, late, control, state_lock, state)
+            return
+        if answer.picked == 0 and recorded_elsewhere(prompt, recording):
+            hold_card(prompt, control, "Granola started notes for another meeting in an earlier call during the countdown")
             return
     opened = accepted and open_granola(chosen.payload, chosen.title, dry_run=settings.dry_run)
     at = datetime.now().astimezone()

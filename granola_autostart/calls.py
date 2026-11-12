@@ -38,6 +38,8 @@ INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 CONSENT_KEY = r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone"
 TEAMS_PACKAGE_PREFIX = "msteams_"
 TEAMS_EXE = "ms-teams.exe"
+ZOOM_EXE = "Zoom.exe"
+CPTHOST_EXE = "CptHost.exe"  # runs only while a Zoom meeting is open (see zoom_call)
 TEAMS_PREFIX = "ms-teams"  # ms-teams.exe, and the other processes of the Teams app that might record
 WEBVIEW_EXE = "msedgewebview2.exe"  # the web view Teams draws in, which could be where it records
 MAX_GENERATIONS = 8  # how far up from a web view process to look for the Teams process it belongs to
@@ -276,21 +278,67 @@ def best_window_title(titles: list[str]) -> str | None:
 def zoom_window_title(table: ProcessTable | None = None) -> str | None:
     """The meeting's name from Zoom's meeting window. Zoom Workplace titles that window "Zoom Meeting", whatever the
     meeting, so this is usually None and the call gets its ad hoc name (see decide.adhoc_title)."""
-    return best_window_title(app_window_titles(("Zoom.exe",), table, ZOOM_MEETING_WINDOW_CLASSES))
+    return best_window_title(app_window_titles((ZOOM_EXE,), table, ZOOM_MEETING_WINDOW_CLASSES))
 
 
 def zoom_call(table: ProcessTable | None = None) -> Call | None:
-    """The Zoom meeting under way: CptHost.exe runs only while one is open, and its start is the meeting's."""
-    pids = pids_named("CptHost.exe", table)
-    if not pids:
+    """The Zoom meeting under way. CptHost.exe runs only while one is open, and starts as it is joined, so the first
+    one's start is the meeting's. Which meeting it is comes from the process it runs in (see zoom_meeting_process); with
+    none known, the first CptHost.exe stands in for it, start and all, as it always has."""
+    if table is None:
+        table = process_table()
+    cpthosts = pids_named(CPTHOST_EXE, table)
+    if not cpthosts:
         return None
-    pid = min(pids)
-    started = process_start(pid)
     title = zoom_window_title(table)
+    meeting = zoom_meeting_process(cpthosts, table)
+    if meeting is None:
+        first = min(cpthosts)
+        started = process_start(first)
+        return _zoom(_tagged(first, started), started, title)
+    parents = getattr(table, "parents", {})
+    starts = [start for pid in cpthosts if parents.get(pid) == meeting and (start := process_start(pid)) is not None]
+    return _zoom(_tagged(meeting, process_start(meeting)), min(starts, default=None), title)
+
+
+def zoom_meeting_process(cpthosts: list[int], table: ProcessTable | dict[str, list[int]]) -> int | None:
+    """The process that tells this meeting from the next, from CptHost.exe's processes ``cpthosts``.
+
+    Zoom Workplace runs each meeting in a Zoom.exe of its own, which starts CptHost.exe as the meeting is joined. The
+    main Zoom.exe starts it, and when a meeting ends it starts the next one's ahead of time (--action=preload), so that
+    process's own start says nothing of when a meeting began. Zoom can start CptHost.exe again during a meeting, or have
+    none for a while (seen on 2026-11-12), so the meeting's process is what tells one meeting from the next. None when
+    CptHost.exe's parent isn't such a Zoom.exe, or isn't known (an older Zoom, a list with no parents)."""
+    zoom = set(pids_named(ZOOM_EXE, table))
+    parents = getattr(table, "parents", {})
+    meetings = {parents[pid] for pid in cpthosts if parents.get(pid) in zoom and parents.get(parents[pid]) in zoom}
+    return min(meetings) if meetings else None
+
+
+def zoom_meeting_open(call: Call, table: ProcessTable | dict[str, list[int]]) -> bool:
+    """Whether the meeting process a Zoom call is told by (see zoom_meeting_process) is still running as one, and is
+    still that process, since Windows reuses ids: the meeting is still open, whether or not CptHost.exe is. Never for a
+    call that a CptHost.exe stands in for. Zoom ends that process as the meeting ends."""
+    provider, _, rest = call.session_id.partition(":")
+    pid, _, start = rest.partition(":")
+    if provider != "zoom" or not pid.isdigit() or not start.isdigit():
+        return False
+    zoom = set(pids_named(ZOOM_EXE, table))
+    if int(pid) not in zoom or getattr(table, "parents", {}).get(int(pid)) not in zoom:
+        return False
+    started = process_start(int(pid))
+    return started is not None and int(started.timestamp()) == int(start)
+
+
+def _tagged(pid: int, started: datetime | None) -> str:
+    """A Zoom call's id: its process, and that process's start (Unix seconds) when Windows says, since ids are reused."""
+    return f"zoom:{pid}" if started is None else f"zoom:{pid}:{int(started.timestamp())}"
+
+
+def _zoom(session_id: str, started: datetime | None, title: str | None) -> Call:
     if started is None:
-        return Call("zoom", f"zoom:{pid}", None, title)
-    age = (datetime.now(timezone.utc) - started).total_seconds()
-    return Call("zoom", f"zoom:{pid}:{int(started.timestamp())}", max(0.0, age), title, started)
+        return Call("zoom", session_id, None, title)
+    return Call("zoom", session_id, max(0.0, (datetime.now(timezone.utc) - started).total_seconds()), title, started)
 
 
 # The microphone, which Teams and the browsers' calls are noticed from
@@ -611,7 +659,7 @@ class CallWatch:
         self._read = False
         if enabled.get("zoom"):
             if known:
-                self._zoom = zoom_call(table)
+                self._zoom = self._zoom_call(table)
             elif self._zoom is not None:
                 self._zoom = _reaged(self._zoom)
             if self._zoom is not None:
@@ -642,6 +690,19 @@ class CallWatch:
         if not self._read:
             return None
         return [session.call().session_id for session in self._sessions() if session.provider]
+
+    def _zoom_call(self, table: Mapping[str, list[int]]) -> Call | None:
+        """zoom_call, with what this watch knows of the meeting from earlier looks: it began when the first CptHost.exe
+        seen in it did, and it is under way for as long as its process runs, with a CptHost.exe or not."""
+        found = zoom_call(table)
+        kept = self._zoom
+        if kept is None or (found is not None and found.session_id != kept.session_id):
+            return found
+        if found is None:
+            return _zoom(kept.session_id, kept.started, kept.title) if zoom_meeting_open(kept, table) else None
+        if kept.started is not None and (found.started is None or kept.started < found.started):
+            return _zoom(found.session_id, kept.started, found.title)
+        return found
 
     def _read_mic(self, enabled: Mapping[str, bool], table: Mapping[str, list[int]]) -> None:
         try:
@@ -712,13 +773,12 @@ def _age(call: Call) -> float:
 
 
 def _reaged(call: Call) -> Call:
-    """A Zoom call kept through a process list that couldn't be read, with its age worked out again from the start at
-    the end of its id (Unix seconds), so it goes on growing older instead of keeping the age it had. One with no start
-    in its id keeps what it had. A call on the microphone works out its own age each time."""
-    parts = call.session_id.split(":")
-    if call.provider != "zoom" or len(parts) != 3 or not parts[2].isdigit():
+    """A Zoom call kept through a process list that couldn't be read, with its age worked out again from its start, so
+    it goes on growing older instead of keeping the age it had. One whose start isn't known keeps what it had. A call on
+    the microphone works out its own age each time."""
+    if call.provider != "zoom" or call.started is None:
         return call
-    return replace(call, age_seconds=max(0.0, time.time() - int(parts[2])))
+    return replace(call, age_seconds=max(0.0, time.time() - call.started.timestamp()))
 
 
 def installed(provider: str) -> bool | None:

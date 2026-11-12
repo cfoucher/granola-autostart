@@ -82,6 +82,10 @@ class Prompt:
     # When two or more meetings are equally candidates, each of them (up to MAX_CHOICES), the likeliest first, for the
     # card to list. The first is the meeting this prompt is for. Empty when there is nothing to choose.
     choices: tuple[Choice, ...] = ()
+    # A calendar card's: the user is in a call that began before any meeting it lists was due, less the call lookahead,
+    # so the call isn't one of theirs (see _waits_for_the_call). While Granola shows it is taking notes for something
+    # else meanwhile, the card waits (see recorded_elsewhere).
+    in_earlier_call: bool = False
 
     def picked(self, index: int) -> Prompt:
         """The prompt for meeting ``index`` of ``choices``, once the card has ticked it (0 is this prompt's own).
@@ -248,6 +252,22 @@ def recorded_choice(prompt: Prompt, title: str | None) -> int | None:
     candidates = [choice.title for choice in prompt.choices] or [prompt.title]
     matches = [index for index, candidate in enumerate(candidates) if _same_title_form(candidate) == wanted]
     return matches[0] if len(matches) == 1 else None
+
+
+def recorded_elsewhere(prompt: Prompt, title: str | None) -> bool:
+    """Whether the card for a calendar prompt waits, given the title of the note Granola shows as recording: Granola is
+    taking notes for a note that is none of the prompt's meetings, while the user is in a call that began before them
+    (``in_earlier_call``). That is notes for a meeting that runs long, in its call, which the app may not know of: its
+    own start can have been forgotten, Granola's notes may have been started in Granola, and a call can look new when
+    the app it runs in starts a process again. Whatever the reason, starting this meeting's notes would end those.
+
+    Waiting records nothing, so the card comes up as soon as Granola stops taking those notes or the call ends, if the
+    meeting is still on. Joining this meeting's own call meanwhile gives it a call card, as always."""
+    wanted = _same_title_form(title or "")
+    if not prompt.in_earlier_call or not wanted:
+        return False
+    candidates = [choice.title for choice in prompt.choices] or [prompt.title]
+    return all(_same_title_form(candidate) != wanted for candidate in candidates)
 
 
 def _prune(state: WatcherState, snap: Snapshot, now: datetime) -> None:
@@ -449,6 +469,7 @@ def _calendar_prompt(now: datetime, snap: Snapshot, state: WatcherState, lead: t
         expires_at=event.end,
         covers=_covers(ongoing, event),
         choices=_choices(ranked),
+        in_earlier_call=_call_began_before(snap, now, min(other.start for other in ongoing) - lead - lookahead),
     )
 
 
