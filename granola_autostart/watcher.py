@@ -84,9 +84,9 @@ class Control:
         self.last_start: LastStart | None = None
         self.card_failed = False  # the last countdown card couldn't run
         self.card_open = False  # a countdown card is on screen, and the watcher is waiting on it
-        # The card waiting for Granola's notes for another meeting (see handle_prompt), as its meetings and those notes,
-        # so the log says so once, not every tick.
-        self.held: tuple[tuple[str, ...], str] | None = None
+        # The meetings of the card waiting for Granola's notes for another meeting (see hold_card), so the log says so
+        # once, not every tick.
+        self.held: tuple[str, ...] | None = None
         self.installing: str | None = None  # the version being installed
         self.view = TrayView("watching", "Watching for meetings", False)
         self.on_view: Callable[[TrayView], None] | None = None
@@ -403,6 +403,16 @@ def note_granola_has(prompt: Prompt, index: int, control: Control, state_lock: t
         _save_state(state, control)
 
 
+def hold_card(prompt: Prompt, control: Control, why: str) -> None:
+    """Leave the prompt unanswered while Granola takes notes for another meeting (see decide.recorded_elsewhere), so the
+    next tick asks again and its card comes up once those notes or the call end. The log says so once for each prompt,
+    with the meeting's title but never the title of Granola's note, which the app doesn't keep."""
+    held = prompt.keys + tuple(key for choice in prompt.choices for key in choice.keys)
+    if control.held != held:
+        log.info("%s; the card for %s waits", why, prompt.title)
+    control.held = held
+
+
 def handle_prompt(prompt: Prompt, settings: Settings, control: Control, state_lock: threading.Lock, state) -> None:
     recording = granola_window.recording_title()
     already = recorded_choice(prompt, recording)
@@ -413,11 +423,7 @@ def handle_prompt(prompt: Prompt, settings: Settings, control: Control, state_lo
             note_granola_has(prompt, already, control, state_lock, state)
         return
     if recorded_elsewhere(prompt, recording):
-        # Nothing is recorded, so the next tick asks again, and the card comes up once those notes or the call end.
-        held = (prompt.keys + tuple(key for choice in prompt.choices for key in choice.keys), recording)
-        if control.held != held:
-            log.info("Granola is still taking notes for %s in an earlier call; the card for %s waits", recording, prompt.title)
-        control.held = held
+        hold_card(prompt, control, "Granola is still taking notes for another meeting in an earlier call")
         return
     control.held = None
     if prompt.choices:
@@ -467,11 +473,15 @@ def handle_prompt(prompt: Prompt, settings: Settings, control: Control, state_lo
     if accepted:
         # Once more just before opening it, for a click on Granola's own button in the countdown's last second. A meeting
         # ticked on the card other than the first, the one ticked to start with, is the user's choice, so Granola's notes
-        # for another meeting don't stand in for it.
-        late = noted_by_granola(prompt)
+        # for another meeting don't stand in for it, nor hold it back.
+        recording = granola_window.recording_title()
+        late = recorded_choice(prompt, recording)
         if late is not None and answer.picked in (0, late):
             log.info("Granola started notes for %s as the countdown ended; not opening it", prompt.picked(late).title)
             note_granola_has(prompt, late, control, state_lock, state)
+            return
+        if answer.picked == 0 and recorded_elsewhere(prompt, recording):
+            hold_card(prompt, control, "Granola started notes for another meeting in an earlier call during the countdown")
             return
     opened = accepted and open_granola(chosen.payload, chosen.title, dry_run=settings.dry_run)
     at = datetime.now().astimezone()
