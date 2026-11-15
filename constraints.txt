@@ -9,7 +9,7 @@ altgraph==0.17.5
 bottle==0.13.4
 cffi==2.1.1
 chardet==7.7.0
-click==8.5.0
+click==8.5.1
 clr_loader==0.3.1
 colorama==0.4.6
 coverage==7.17.2
@@ -26,7 +26,7 @@ proxy_tools==0.1.0
 pycparser==3.12
 Pygments==2.21.0
 pyinstaller==6.22.3
-pyinstaller-hooks-contrib==2026.9
+pyinstaller-hooks-contrib==2026.10
 pystray==0.19.5
 pytest==9.2.0
 python-dateutil==2.9.0.post0
@@ -34,7 +34,7 @@ pythonnet==3.2.1
 pywebview==6.2.1
 pywin32-ctypes==0.2.3
 recurring-ical-events==3.8.2
-ruff==0.17.3
+ruff==0.17.4
 setuptools==84.2.1
 six==1.17.0
 typing_extensions==4.16.0
